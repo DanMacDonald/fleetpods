@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="56" height="56" viewBox="0 0 56 56" fill="currentColor">
+  <title>Open charging case with right AirPod only</title>
+  <path d="M4 24V18C4 11.4 8.4 7 15 7h26c6.6 0 11 4.4 11 11v6h-4V18c0-4.5-2.5-8-7-8H15c-4.5 0-7 3.5-7 8v6Z"/>
+  <path d="M26.5 9h3v8h-3Z"/>
+  <path d="M46 24l-1.5-5.5c-.8-3-3-4.5-5.5-3.5c-2.3.9-3.6 2.7-4.5 4.5c-2.5-.6-4 .6-4 2.5v2Z"/>
+  <path d="M4 27h48v14c0 5.523-4.477 10-10 10H14C8.477 51 4 46.523 4 41Z"/>
+</svg>

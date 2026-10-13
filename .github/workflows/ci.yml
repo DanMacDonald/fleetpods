@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libavcodec-dev libavutil-dev libpipewire-0.3-dev libdbus-1-dev libpulse-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy -p fleetpods --all-targets --features accept -- -D warnings
+      - run: cargo clippy -p xtask --all-targets -- -D warnings
+      - run: cargo test -p fleetpods --lib --bins
+      - run: cargo build --release --bins --locked
+
+  accept:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libavcodec-dev libavutil-dev libpipewire-0.3-dev libdbus-1-dev libpulse-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo xtask test
+
+
+  plugin-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno run --allow-read plugin/tests/model.test.js
+      - run: deno run --allow-read plugin/tests/replay.test.js
+      - run: bash -n setup
+
+  plugin-qml:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    timeout-minutes: 15
+    env:
+      QT_QPA_PLATFORM: offscreen
+      QT_QUICK_BACKEND: software
+    steps:
+      - name: Install Qt test dependencies
+        run: pacman -Syu --noconfirm --needed git qt6-declarative qt6-5compat qt6-svg ttf-dejavu
+      - uses: actions/checkout@v4
+      - name: Run QML tests
+        run: /usr/lib/qt6/bin/qmltestrunner -input plugin/tests -import plugin/tests/imports

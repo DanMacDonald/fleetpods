@@ -1,0 +1,268 @@
+{
+  "drop": [
+    {
+      "t": 1791426162409,
+      "message": "priority_connection_lost",
+      "why": "Apple Reconnect intentionally dropped the local link to free a slot; this native audio failure is expected during that operation."
+    },
+    {
+      "t": 1791425958524,
+      "message": "Audio moved to the Apple fleet: iPhone. omarchy-xps keeps the Omarchy seat.",
+      "why": "The shell had just started: the iPhone was already playing, so seeing it is discovery, not a move (2026-10-07 20:05 report)."
+    },
+    {
+      "t": 1791426099866,
+      "message": "Audio moved to the Apple fleet: iPhone.",
+      "why": "The iPhone played throughout; a sound on this laptop's speakers held nothing, so this was not a take (2026-10-07 20:22 report)."
+    },
+    {
+      "t": 1791426108433,
+      "message": "Audio moved to the Omarchy fleet: omarchy-xps.",
+      "why": "A reroute bounce through the speakers while this laptop held the AirPods, the same duplicate as the 2026-10-07 20:22:47 report."
+    },
+    {
+      "t": 1791426114284,
+      "message": "Audio moved to the Apple fleet: iPhone.",
+      "why": "The iPhone paused and resumed while a sound played on another output here; a resume is not a take."
+    },
+    {
+      "t": 1791426176293,
+      "message": "AirPods connection unavailable (Local AirPods reconnect timed out). Waiting for desktop activity.",
+      "why": "A failure is logged once, as its red reason line, which follows here (2026-10-07 20:33 report)."
+    },
+    {
+      "t": 1791426285909,
+      "message": "Local AirPods reconnect timed out",
+      "why": "An error already shown while errors stood is not shown again (2026-10-07 20:33 report)."
+    },
+    {
+      "t": 1791426287582,
+      "message": "error: fleet routing in progress",
+      "why": "An error already shown while errors stood is not shown again (2026-10-07 20:33 report)."
+    },
+    {
+      "t": 1791426289751,
+      "message": "Local AirPods reconnect timed out",
+      "why": "An error already shown while errors stood is not shown again (2026-10-07 20:33 report)."
+    },
+    {
+      "t": 1791426307426,
+      "message": "error: fleet routing in progress",
+      "why": "An error already shown while errors stood is not shown again (2026-10-07 20:33 report)."
+    },
+    {
+      "t": 1791426309620,
+      "message": "Local AirPods reconnect timed out",
+      "why": "An error already shown while errors stood is not shown again (2026-10-07 20:33 report)."
+    },
+    {
+      "t": 1791426102745,
+      "message": "Audio ready on omarchy-xps.",
+      "why": "A paused owner's roster bit is a pod broadcast, not a state change; the seats already show it (2026-10-07 log warts)."
+    },
+    {
+      "t": 1791426143694,
+      "message": "Audio ready on lg-gram.",
+      "why": "A paused owner's roster bit is a pod broadcast, not a state change; the seats already show it (2026-10-07 log warts)."
+    },
+    {
+      "t": 1791426144043,
+      "message": "Omarchy Fleet connection switched to omarchy-xps.",
+      "why": "The joining laptop adds the retained peer to its existing success row instead of logging a second fleet join."
+    },
+    {
+      "t": 1791426393466,
+      "message": "Connecting to AirPods... (Retrying)",
+      "why": "Control retries inside the closed case do not create a visible attempt."
+    }
+  ],
+  "rewrite": [
+    {
+      "pattern": "^Audio moved to the (?:Apple|Omarchy) fleet: ([^.]+)\\..*$",
+      "with": "AirPods audio moved to $1.",
+      "why": "A switch names only where the audio went; the seats show who stays (2026-10-07 wording, reworded 2026-10-12)."
+    },
+    {
+      "pattern": "^Audio moved within the Omarchy fleet to ([^.]+)\\.$",
+      "with": "AirPods audio moved to $1.",
+      "why": "The same wording for a move between laptops."
+    },
+    {
+      "pattern": "^profile_error:org\\.bluez\\.Error\\.InProgress$",
+      "with": "Audio connection is still busy.",
+      "why": "Name the audio connection separately; this recorded event did not have a ready control link."
+    },
+    {
+      "pattern": "^Not connected to (.+)\\.$",
+      "with": "$1 is not connected to the AirPods.",
+      "why": "Name the local laptop and the AirPods explicitly, rather than implying a failed connection to another laptop."
+    },
+    {
+      "pattern": "^Connecting to AirPods\\.\\.\\.(?! Connected!)",
+      "why": "Name the laptop initiating the connection (2026-10-13).",
+      "with": "Connecting omarchy-xps to AirPods..."
+    }
+  ],
+  "replace": [
+    {
+      "t": 1791426401991,
+      "message": "AirPods connection unavailable (BlueZ did not report the device as connected). Waiting for desktop activity.",
+      "with": "BlueZ did not report the device as connected",
+      "kind": "error",
+      "why": "A failure with no other error is logged as its red reason line."
+    },
+    {
+      "t": 1791426073589,
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "An early route outcome starts the transition; only a confirmed seat finishes it.",
+      "with": "Switching Omarchy Fleet connection to lg-gram\u2026"
+    },
+    {
+      "t": 1791426127767,
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "An early route outcome starts the transition; only a confirmed seat finishes it.",
+      "with": "Switching Omarchy Fleet connection to lg-gram\u2026"
+    },
+    {
+      "t": 1791426275930,
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "An early route outcome starts the transition; only a confirmed seat finishes it.",
+      "with": "Switching Omarchy Fleet connection to lg-gram\u2026"
+    },
+    {
+      "t": 1791426301590,
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "An early route outcome starts the transition; only a confirmed seat finishes it.",
+      "with": "Switching Omarchy Fleet connection to lg-gram\u2026"
+    }
+  ],
+  "clear": [
+    {
+      "t": 1791426393465,
+      "why": "Case guidance replaces the log once the actual link is down, without waiting for the stale roster to expire."
+    }
+  ],
+  "add": [
+    {
+      "t": 1791426177000,
+      "kind": "connection",
+      "message": "Trying to connect again...",
+      "why": "A fresh attempt after the reconnect timeout announces recovery before its progress row."
+    },
+    {
+      "t": 1791426403701,
+      "kind": "connection",
+      "message": "Trying to connect again...",
+      "why": "A fresh attempt after BlueZ recovery failed announces recovery before its progress row."
+    },
+    {
+      "t": 1791426401238,
+      "kind": "connection",
+      "message": "Connecting to AirPods... (Retrying)",
+      "why": "The case opened while the daemon still retried, so the attempt shows from here rather than from the closed case (2026-10-07 log warts).",
+      "live": true
+    },
+    {
+      "t": 1791426076722,
+      "kind": "status",
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "Report completion when the confirmed roster is presented."
+    },
+    {
+      "t": 1791426130469,
+      "kind": "status",
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "Report completion when the confirmed roster is presented."
+    },
+    {
+      "t": 1791426279989,
+      "kind": "status",
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "Report completion when the confirmed roster is presented."
+    },
+    {
+      "t": 1791426303795,
+      "kind": "status",
+      "message": "Omarchy Fleet connection switched to lg-gram.",
+      "why": "Report completion when the confirmed roster is presented."
+    },
+    {
+      "t": 1791426379795,
+      "kind": "status",
+      "message": "Case closed",
+      "why": "Closing the lid is visible immediately; guidance waits for disconnection."
+    },
+    {
+      "t": 1791426177312,
+      "kind": "status",
+      "message": "Connected elsewhere. The AirPods are available.",
+      "why": "Expired handoff evidence no longer masks a disconnected local link."
+    },
+    {
+      "t": 1791426278558,
+      "kind": "status",
+      "message": "Connected elsewhere. The AirPods are available.",
+      "why": "Expired handoff evidence no longer masks a disconnected local link."
+    }
+  ],
+  "amend": [
+    {
+      "t": 1791426144043,
+      "message": "Connecting to AirPods... Connected!",
+      "with": "Connected to AirPods alongside lg-gram.",
+      "kind": "success",
+      "why": "The late fleet confirmation identifies the retained laptop and completes the existing success message."
+    },
+    {
+      "t": 1791426080787,
+      "message": "Waiting for lg-gram to disconnect...",
+      "live": true,
+      "why": "Admission advances the existing row before the next control snapshot.",
+      "with": "Connecting omarchy-xps to AirPods..."
+    },
+    {
+      "t": 1791426285741,
+      "message": "Waiting for lg-gram to disconnect...",
+      "live": true,
+      "why": "Admission advances the existing row before the next control snapshot.",
+      "with": "Connecting omarchy-xps to AirPods..."
+    },
+    {
+      "t": 1791426309961,
+      "message": "Waiting for lg-gram to disconnect...",
+      "live": true,
+      "why": "Admission advances the existing row before the next control snapshot.",
+      "with": "Connecting omarchy-xps to AirPods..."
+    },
+    {
+      "t": 1791426401982,
+      "message": "Connecting omarchy-xps to AirPods... (Retrying)",
+      "live": false,
+      "why": "The visible attempt ends when BlueZ reports failure.",
+      "with": "Connecting omarchy-xps to AirPods... (Retrying)"
+    }
+  ],
+  "start": [
+    {
+      "t": 1791426080796,
+      "message": "Connecting to AirPods...",
+      "at": 1791426078013,
+      "why": "The same connection row starts at fleet admission, before the local socket attempt.",
+      "with": "Waiting for lg-gram to disconnect..."
+    },
+    {
+      "t": 1791426285753,
+      "message": "Connecting to AirPods...",
+      "at": 1791426282884,
+      "why": "The same connection row starts at fleet admission, before the local socket attempt.",
+      "with": "Waiting for lg-gram to disconnect..."
+    },
+    {
+      "t": 1791426309971,
+      "message": "Connecting to AirPods...",
+      "at": 1791426307117,
+      "why": "The same connection row starts at fleet admission, before the local socket attempt.",
+      "with": "Waiting for lg-gram to disconnect..."
+    }
+  ]
+}

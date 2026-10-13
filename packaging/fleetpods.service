@@ -1,0 +1,13 @@
+[Unit]
+Description=FleetPods AirPods daemon
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/fleetpodsd
+UMask=0077
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

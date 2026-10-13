@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.danmacdonald.fleetpods",
+  "name": "FleetPods",
+  "version": "0.1.0",
+  "author": "DMac",
+  "license": "MIT OR Apache-2.0",
+  "description": "AirPods that hop across your machines: two seats, Linux-held or Apple-held, plus battery, listening mode, and ear detection in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "FleetPods",
+    "description": "AirPods across Linux, iPhone, and Mac: seats, ownership, battery, and listening controls.",
+    "category": "Audio",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "hideWhenDisconnected": true,
+      "ctlPath": "",
+      "connectionSpinMs": 13000
+    },
+    "schema": [
+      {
+        "key": "hideWhenDisconnected",
+        "type": "boolean",
+        "label": "Hide the icon when no AirPods are connected",
+        "defaultValue": true
+      },
+      {
+        "key": "ctlPath",
+        "type": "path",
+        "label": "Path to fleetpods",
+        "description": "Leave empty to find fleetpods on PATH.",
+        "defaultValue": ""
+      },
+      {
+        "key": "connectionSpinMs",
+        "type": "integer",
+        "label": "Connection spinner duration (ms)",
+        "description": "Time for one ring around the icon during a connection attempt. Audio timing is unchanged.",
+        "min": 3000,
+        "max": 20000,
+        "step": 500,
+        "defaultValue": 13000
+      }
+    ]
+  }
+}

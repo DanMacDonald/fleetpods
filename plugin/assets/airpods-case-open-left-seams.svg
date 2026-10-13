@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="2048" viewBox="0 0 56 56">
+  <title>Dark edge around the left pod</title>
+  <g fill="none" stroke="#14161e" stroke-width="1.35" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M4.14 25.25C4.73 22.28 5.66 19.94 6.94 17.82C8.23 15.8 10.22 14.95 12.43 15.27C14.89 15.58 16.99 17.07 18.86 19.3C18.27 21.11 18.39 23.23 18.98 25.25Z"/>
+    <path d="M19.79 25.25C19.09 23.34 18.98 21.43 19.44 20.05C19.79 18.99 20.73 18.45 22.14 18.45L22.83 18.45C24.7 18.45 25.75 19.3 25.64 20.89L25.17 25.25Z"/>
+  </g>
+</svg>

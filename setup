@@ -1,0 +1,92 @@
+#!/bin/bash
+# Install FleetPods for the current Omarchy user.
+
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")" && pwd)
+data="${XDG_DATA_HOME:-$HOME/.local/share}"
+config="${XDG_CONFIG_HOME:-$HOME/.config}"
+bin_dir=""
+
+case "${1:-}" in
+  "") ;;
+  --bin-dir)
+    [[ $# == 2 && -d $2 ]] || { echo "Usage: ./setup [--bin-dir DIRECTORY]" >&2; exit 1; }
+    bin_dir=$(cd "$2" && pwd)
+    ;;
+  -h|--help)
+    echo "Usage: ./setup [--bin-dir DIRECTORY]"
+    echo "Build and install FleetPods, or install binaries from DIRECTORY."
+    exit 0
+    ;;
+  *) echo "Usage: ./setup [--bin-dir DIRECTORY]" >&2; exit 1 ;;
+esac
+
+for command in systemctl omarchy omarchy-shell install; do
+  command -v "$command" >/dev/null || { echo "Required command missing: $command" >&2; exit 1; }
+done
+systemctl --user show-environment >/dev/null
+omarchy plugin validate "$root"
+
+if [[ -z $bin_dir ]]; then
+  command -v cargo >/dev/null || { echo "Install Rust and Cargo to build FleetPods." >&2; exit 1; }
+  command -v pkg-config >/dev/null || { echo "Install pkgconf to build FleetPods." >&2; exit 1; }
+  for library in libavcodec libavutil libpipewire-0.3 dbus-1 libpulse; do
+    pkg-config --exists "$library" || { echo "Build dependency missing: $library" >&2; exit 1; }
+  done
+  cargo build --manifest-path "$root/Cargo.toml" --release --bins --locked
+  bin_dir="${CARGO_TARGET_DIR:-$root/target}/release"
+fi
+for binary in fleetpods fleetpodsd; do
+  [[ -x $bin_dir/$binary ]] || { echo "Missing executable: $bin_dir/$binary" >&2; exit 1; }
+  "$bin_dir/$binary" --version
+done
+
+# Rename into place so an upgrade does not overwrite a running executable.
+mkdir -p "$HOME/.local/bin"
+for binary in fleetpods fleetpodsd; do
+  install -m755 "$bin_dir/$binary" "$HOME/.local/bin/$binary.new"
+  mv -f "$HOME/.local/bin/$binary.new" "$HOME/.local/bin/$binary"
+done
+install -Dm644 "$root/packaging/fleetpods.service" "$config/systemd/user/fleetpods.service"
+
+plugin_dir="$config/omarchy/plugins/io.github.danmacdonald.fleetpods"
+mkdir -p "$plugin_dir"
+if [[ $(realpath "$root") != $(realpath "$plugin_dir") ]]; then
+  cp -a "$root/plugin" "$plugin_dir/"
+  install -m644 "$root/manifest.json" "$root/preview.png" "$root/LICENSE" \
+    "$root/LICENSE-MIT" "$root/LICENSE-APACHE" "$plugin_dir/"
+fi
+
+microphone_changed=false
+cmp -s "$root/wireplumber/fleetpods-microphone.lua" "$data/wireplumber/scripts/fleetpods-microphone.lua" || microphone_changed=true
+cmp -s "$root/wireplumber/90-fleetpods-microphone.conf" "$config/wireplumber/wireplumber.conf.d/90-fleetpods-microphone.conf" || microphone_changed=true
+install -Dm644 "$root/wireplumber/fleetpods-microphone.lua" \
+  "$data/wireplumber/scripts/fleetpods-microphone.lua"
+install -Dm644 "$root/wireplumber/90-fleetpods-microphone.conf" \
+  "$config/wireplumber/wireplumber.conf.d/90-fleetpods-microphone.conf"
+if $microphone_changed; then
+  echo "Restarting WirePlumber to load AirPods microphone support."
+  systemctl --user restart wireplumber
+fi
+
+systemctl --user daemon-reload
+systemctl --user enable fleetpods.service
+systemctl --user restart fleetpods.service
+systemctl --user is-active --quiet fleetpods.service
+ready=false
+for attempt in {1..25}; do
+  if "$HOME/.local/bin/fleetpods" status >/dev/null 2>&1; then
+    ready=true
+    break
+  fi
+  sleep 0.2
+done
+if ! $ready; then
+  echo "FleetPods did not become ready. Check: journalctl --user -u fleetpods.service" >&2
+  exit 1
+fi
+omarchy-shell shell rescanPlugins >/dev/null
+omarchy plugin enable io.github.danmacdonald.fleetpods
+
+echo "FleetPods is installed and running. Open its icon in the Omarchy bar to get started."
