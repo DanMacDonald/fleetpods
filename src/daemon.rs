@@ -526,7 +526,13 @@ impl Daemon {
             && !self.hold_stowed_connection()
             && !self.radio_quiet()
         {
-            self.connection.on_tick(now.mono, intent_valid);
+            // A previously ready, idle connection may have rejoined at the
+            // Bluetooth layer during wake. Restore its control session after
+            // the grace without requiring a playback claim or peer admission.
+            let resume_existing = self.connection.bluez() == Some(true)
+                && self.connection.stage() == Stage::Interrupted
+                && matches!(self.connection.reason(), "suspend" | "bluez" | "adapter");
+            self.connection.on_tick(now.mono, intent_valid || resume_existing);
         }
         if self.connection.stage() == Stage::Failed {
             self.background_requested = false;
@@ -3895,6 +3901,38 @@ mod tests {
         assert!(back.effects.iter().any(|effect| matches!(effect, Effect::FollowLink)));
         let quiet = idle.step(Input::Tick, Clock::new(20_000, now.unix.0 + 20_000));
         assert!(quiet.effects.iter().all(|effect| !matches!(effect, Effect::OpenLink { .. })));
+    }
+
+    #[test]
+    fn an_idle_seated_laptop_restores_control_when_bluetooth_rejoins_after_wake() {
+        use crate::step::{Effect, Input};
+        let mut daemon = Daemon::new("gram");
+        daemon.set_local_address(Some(addr(1)));
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.note_ownership(true, now.mono);
+        daemon.note_source(true, 2, now.mono);
+        assert!(!daemon.output.want);
+        let old = daemon.connection.generation();
+        daemon.step(Input::Suspend, now);
+        // The adapter's local close carries the old generation. It must not
+        // replace suspend with link_lost or yield the laptop's playback state.
+        let closed = daemon.step(Input::ControlSocket { up: false, generation: old }, now);
+        assert_eq!(daemon.connection.reason(), "suspend");
+        assert!(!daemon.audio.yielded());
+        assert!(closed.effects.iter().all(|e| !matches!(e, Effect::PausePlayers(_))));
+        daemon.step(Input::Bluez(false), now);
+        daemon.step(Input::Resume, now);
+        daemon.step(Input::Bluez(true), now);
+        let early = daemon.step(Input::Tick, Clock::new(2_999, now.unix.0 + 1_999));
+        assert!(early.effects.iter().all(|e| !matches!(e, Effect::OpenLink { .. })));
+        let restored = daemon.step(Input::Tick, Clock::new(3_000, now.unix.0 + 2_000));
+        assert!(restored.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+        assert_eq!(daemon.connection.stage(), Stage::Connecting);
+        assert!(!daemon.output.want, "restoring control is not a playback claim");
+        assert!(restored.effects.iter().all(
+            |e| !matches!(e, Effect::WriteControl { bytes, .. } if bytes == &crate::pods::setup::ownership(true))
+        ));
     }
 
     #[test]

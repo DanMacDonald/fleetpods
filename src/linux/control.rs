@@ -46,6 +46,12 @@ impl ControlLink {
         Self::default()
     }
 
+    #[cfg(test)]
+    pub(super) fn from_test_fd(fd: std::os::fd::OwnedFd) -> Self {
+        use std::os::fd::IntoRawFd;
+        Self { fd: Some(fd.into_raw_fd()), ..Self::default() }
+    }
+
     pub fn is_open(&self) -> bool {
         self.fd.is_some() && !self.connecting
     }

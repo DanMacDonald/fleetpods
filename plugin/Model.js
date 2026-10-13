@@ -952,8 +952,8 @@ function domainEvent(linuxHeld, appleDevices, omarchyDevices, holdingOmarchySeat
   var omarchy = (omarchyDevices && omarchyDevices[0] && omarchyDevices[0].label) || "this machine"
   if (takingSeat) return { kind: "claiming", device: omarchy }
   if (holdingOmarchySeat) return { kind: "reclaiming" }
-  // The control link can still be down after BlueZ has the ACL. That ACL is this computer.
-  if (disconnected) return { kind: bluezConnected ? "connectedHere" : "notConnected", device: omarchy }
+  // A Bluetooth ACL alone does not confirm the seat's control connection.
+  if (disconnected) return { kind: bluezConnected ? "controlPending" : "notConnected", device: omarchy }
   if (ownershipUnknown) return null
   if (linuxHeld) return { kind: "audioOn", device: omarchy }
   if (omarchyDevices && omarchyDevices.length) return { kind: "appleHasAudio", device: omarchy, seated: omarchyDevices[0].onAcl === true }
@@ -1672,7 +1672,10 @@ function statusLogPanel(s, now) {
   }
   if (changed("want", pods.wantOmarchySeat) && !pods.wantOmarchySeat) settle()
   if (changed("live", live)) settle()
-  var taking = !live && (s.claimHold || (pods.wantOmarchySeat && pods.ownershipIntent === "claim" && !appleOwnsAudio(pods)))
+  // A seated laptop may retain playback intent while another fleet member
+  // owns audio. That intent is not an unfinished connection attempt.
+  var taking = !live && (s.claimHold || (!pods.connected && pods.wantOmarchySeat
+    && pods.ownershipIntent === "claim" && !appleOwnsAudio(pods)))
   var heldNow = taking || (pods.connected && live)
   if (seen.heldNow === undefined) s.linuxHeld = heldNow
   else if (heldNow) { s.linuxHeld = true; s.leaveAt = 0 }
@@ -1736,6 +1739,7 @@ function statusText(event) {
     case "claiming": return event.device + " claims ownership."
     case "reclaiming": return "Reclaiming Omarchy seat. Apple keeps audio."
     case "connectedHere": return "Connected to " + event.device + "."
+    case "controlPending": return "Bluetooth connected. Waiting for " + event.device + " to finish AirPods setup."
     case "notConnected": return event.device + " is not connected to the AirPods."
     case "appleHasAudio": return "Apple fleet has the audio. " + (!event.device ? "No Omarchy seat connection is confirmed."
       : event.device + (event.seated ? " keeps the Omarchy seat." : " is not confirmed in the Omarchy seat."))

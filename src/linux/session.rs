@@ -1115,13 +1115,7 @@ fn on_notice(
             }
             let _ = reports.send(Input::BluezBack);
         }
-        Notice::Sleep(sleeping) => {
-            if sleeping {
-                live.defer_attach = true;
-                close_control(live, reports);
-            }
-            let _ = reports.send(if sleeping { Input::Suspend } else { Input::Resume });
-        }
+        Notice::Sleep(sleeping) => report_sleep(reports, live, sleeping),
         Notice::AdapterPower { path, up } => {
             let ours = live.adapter_path.as_deref() == Some(path.as_str());
             if ours {
@@ -1499,6 +1493,16 @@ fn announce_socket(live: &mut Live, reports: &Sender<Input>) {
         eprintln!("fleetpodsd: control socket ready generation={}", live.generation.0);
         let _ = reports.send(Input::ControlSocket { up: true, generation: live.generation });
         live.socket_for = Some(live.generation);
+    }
+}
+
+fn report_sleep(reports: &Sender<Input>, live: &mut Live, sleeping: bool) {
+    // Retire the daemon generation before the locally closed socket reports
+    // down. Otherwise the close looks like lost ownership and clears wake intent.
+    let _ = reports.send(if sleeping { Input::Suspend } else { Input::Resume });
+    if sleeping {
+        live.defer_attach = true;
+        close_control(live, reports);
     }
 }
 
@@ -2386,4 +2390,27 @@ mod advertisement_tests {
         let response = advertisement_reply(&[1], &request).expect("every call gets a reply");
         assert_eq!(response.msg_type(), dbus::message::MessageType::Error);
     }
+}
+#[test]
+fn sleep_is_reported_before_the_locally_closed_control_socket() {
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut live = Live {
+        link: ControlLink::from_test_fd(socket.into()),
+        generation: Generation(7),
+        socket_for: Some(Generation(7)),
+        ..Live::default()
+    };
+    let (tx, rx) = mpsc::channel();
+    report_sleep(&tx, &mut live, true);
+    assert!(matches!(rx.try_recv().unwrap(), Input::Suspend));
+    assert!(matches!(
+        rx.try_recv().unwrap(),
+        Input::ControlSocket { up: false, generation: Generation(7) }
+    ));
+    assert!(rx.try_recv().is_err());
+    assert!(live.link.fd().is_none());
+    assert!(live.defer_attach);
+    report_sleep(&tx, &mut live, false);
+    assert!(matches!(rx.try_recv().unwrap(), Input::Resume));
+    assert!(rx.try_recv().is_err());
 }

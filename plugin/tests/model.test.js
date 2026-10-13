@@ -27,6 +27,25 @@ function check(name, actual, expected) {
 const LOCAL = { holder: "local", playing: false }, LOCAL_PLAYING = { holder: "local", playing: true }
 const REMOTE = { holder: "remote", playing: false }, REMOTE_PLAYING = { holder: "remote", playing: true }
 const UNKNOWN = { holder: "", playing: false }
+
+// A peer returning from sleep can own audio while this connected laptop still
+// has playback intent from an earlier play. The header follows the confirmed owner.
+{
+  const local = 'D0:C6:37:2F:D0:9F', xps = 'A8:72:4D:0C:7C:EE'
+  const ready = { ...Model.defaultStatus(), ok: true, connected: true, bluezConnected: true,
+    bluetoothPaired: true, pairingKeysReady: true, localAddress: local, localName: 'lg-gram',
+    controlConnection: { stage: 'ready' }, ownershipIntent: 'claim', wantOmarchySeat: true,
+    audioOwner: REMOTE_PLAYING, remoteSourceAddress: xps, rosterAudioOwner: xps,
+    connectedPeers: [local, xps], peerListUpdated: 1000,
+    devices: { [local]: { label: 'lg-gram', kind: 'omarchy' }, [xps]: { label: 'omarchy-xps', kind: 'omarchy' } },
+    nativeHandoff: { connecting: false, attempting: false, phase: 'idle', playing: false, audio_state: 'unavailable' } }
+  let state = Model.statusLog(Model.statusLogState(), { t: 1000, ev: 'status', status: ready })
+  check('a ready Gram with old playback intent is not taking a connection', state.taking, false)
+  check('a returned XPS owner replaces Connecting in Gram header', state.subtitle, 'Omarchy fleet · omarchy-xps · Playing')
+  state = Model.statusLog(state, { t: 2000, ev: 'status', status: { ...ready, audioOwner: REMOTE } })
+  check('an idle returned XPS owner keeps its fleet name', state.subtitle, 'Omarchy fleet · omarchy-xps')
+}
+
 check("local ownership", Model.ownershipText({ connected: true, audioOwner: LOCAL }), "Bluetooth connected · Audio owned by Linux")
 check("remote ownership", Model.ownershipText({ connected: true, audioOwner: REMOTE_PLAYING }), "Bluetooth connected · Audio owned by another device")
 check("unknown ownership", Model.ownershipText({ connected: true, audioOwner: UNKNOWN }), "Bluetooth connected · Audio ownership unknown")
@@ -462,9 +481,9 @@ check("explicit claim replaces the neutral caption",
   domainCaption(false, [], [{ label: "Linux laptop" }], false, false, true, true),
   "Linux laptop claims ownership.")
 
-check("a BlueZ link is this computer even before the control link",
+check("a BlueZ link without control setup does not claim a confirmed seat",
   domainCaption(false, [{ label: "iPhone" }], [{ label: "Linux laptop" }], false, true, false, false, true),
-  "Connected to Linux laptop.")
+  "Bluetooth connected. Waiting for Linux laptop to finish AirPods setup.")
 check("unknown disconnected owner does not imply a Gram connection",
   domainCaption(false, [{ label: "MacBook Pro" }], [{ label: "Linux laptop" }], false, true, false, true),
   "Linux laptop is not connected to the AirPods.")
