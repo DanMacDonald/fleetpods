@@ -53,23 +53,29 @@ impl Daemon {
                 }
             }
             Letter::Ack { id } => {
-                if self.enrollment.mark_delivered(id) {
+                if self.from_enrolled_peer(from, id) && self.enrollment.mark_delivered(id) {
                     self.send_offer();
                 }
             }
             Letter::Offer { id, attempt, public } => {
-                if self.enrollment.offer(id, attempt) {
+                if self.from_enrolled_peer(from, id) && self.enrollment.offer(id, attempt) {
                     self.offer = Some(public);
                 }
             }
             Letter::Response { id, attempt, public, confirm } => {
-                self.on_response(id, attempt, &public, confirm);
+                if self.from_enrolled_peer(from, id) {
+                    self.on_response(id, attempt, &public, confirm);
+                }
             }
-            Letter::Grant { id, confirm, proposal } => self.on_grant(from, id, confirm, proposal),
+            Letter::Grant { id, confirm, proposal } => {
+                if self.from_enrolled_peer(from, id) {
+                    self.on_grant(from, id, confirm, proposal);
+                }
+            }
             Letter::Saved { id, .. } => {
                 // The joiner has stored the key and is waiting for commit.
                 if self.enrollment.initiator()
-                    && self.enrollment.id() == Some(id)
+                    && self.from_enrolled_peer(from, id)
                     && self.enrollment.phase() == crate::fleet::enroll::Phase::WaitingDone
                 {
                     self.send(from, Letter::Commit { id });
@@ -77,7 +83,7 @@ impl Daemon {
             }
             Letter::Commit { id } => {
                 if !self.enrollment.initiator()
-                    && self.enrollment.id() == Some(id)
+                    && self.from_enrolled_peer(from, id)
                     && self.enrollment.phase() == crate::fleet::enroll::Phase::WaitingCommit
                 {
                     self.send(from, Letter::Done { id });
@@ -85,7 +91,9 @@ impl Daemon {
                 }
             }
             Letter::Done { id } => {
-                self.enrollment.note_confirmed(id);
+                if self.from_enrolled_peer(from, id) {
+                    self.enrollment.note_confirmed(id);
+                }
             }
             Letter::Cancel { id } => {
                 if self.enrollment.id() != Some(id)
@@ -113,11 +121,22 @@ impl Daemon {
                 self.offer = None;
             }
             Letter::Rejected { id, attempt } => {
-                self.enrollment.code_rejected(id, attempt);
-                self.pake = None;
-                self.offer = None;
+                if self.from_enrolled_peer(from, id) {
+                    self.enrollment.code_rejected(id, attempt);
+                    self.pake = None;
+                    self.offer = None;
+                }
             }
         }
+    }
+
+    /// Phase letters only mean anything from the peer this enrollment is
+    /// with. The radio source is self-asserted, so this does not
+    /// authenticate anyone — it keeps a letter for one enrollment (or a
+    /// bystander's stray fragment) from moving another enrollment's phase.
+    fn from_enrolled_peer(&self, from: Address, id: InvitationId) -> bool {
+        self.enrollment.id() == Some(id)
+            && self.enrollment.peer().map(|(peer, _)| peer) == Some(from)
     }
 
     pub(crate) fn answer_submit(&mut self) {
@@ -339,6 +358,23 @@ mod tests {
         inviter.send(to, Letter::Grant { id, confirm, proposal });
         transfer(&mut inviter, &mut joiner, now);
         (inviter, joiner, now)
+    }
+
+    #[test]
+    fn a_phase_letter_from_a_third_party_cannot_move_the_enrollment() {
+        let now = Clock::new(1000, 1000);
+        let mut joiner = Daemon::new("gram");
+        joiner.set_local_address(Some(address(2)));
+        let id = InvitationId::new([5; 16]);
+        assert!(joiner.receive_invite(address(1), "xps", id, now));
+        // A bystander who sniffed the invitation id offers its own SPAKE
+        // public. The enrollment is with the inviter, not with whoever
+        // transmits, so this must not create an offer to answer.
+        joiner.deliver(address(3), Letter::Offer { id, attempt: 0, public: vec![0x42; 32] }, now);
+        assert_eq!(joiner.enrollment.phase(), Phase::WaitingOffer);
+        assert!(joiner.offer.is_none());
+        joiner.deliver(address(3), Letter::Done { id }, now);
+        assert_eq!(joiner.enrollment.phase(), Phase::WaitingOffer);
     }
 
     #[test]

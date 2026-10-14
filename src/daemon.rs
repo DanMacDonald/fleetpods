@@ -154,6 +154,7 @@ pub struct Daemon {
     route_air_at: Option<MonoMs>,
     route_wait_from: Option<MonoMs>,
     route_water: Vec<RouteMark>,
+    route_seen: Vec<SeenRoute>,
     route_reply: Option<SavedRoute>,
     /// Admission waits for the pair reservation or confirmed local link release.
     pending_admission: Option<PendingAdmission>,
@@ -174,6 +175,15 @@ struct PendingAdmission {
 struct RouteMark {
     source: Address,
     session: [u8; 16],
+    sequence: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SeenRoute {
+    source: Address,
+    session: [u8; 16],
+    tx: u64,
+    kind: crate::fleet::route_air::Kind,
     sequence: u64,
 }
 
@@ -319,6 +329,7 @@ impl Daemon {
             route_air_at: None,
             route_wait_from: None,
             route_water: Vec::new(),
+            route_seen: Vec::new(),
             route_reply: None,
             pending_admission: None,
             route_packet: None,
@@ -1638,6 +1649,27 @@ impl Daemon {
         if self.routing.tx() != tx || self.routing.peer() != Some(message.source) {
             return;
         }
+        // Admissions, connections, and completions get no replay
+        // protection from the request watermark, so remember each one
+        // exactly: a captured sealed frame replayed verbatim inside its
+        // freshness window must not flip an admitted handoff back to
+        // failed. This is exact-frame dedupe, not a sequence watermark —
+        // BLE advertisements genuinely reorder, and an older admission
+        // can legitimately arrive after a newer busy answer.
+        let seen = SeenRoute {
+            source: message.source,
+            session: message.source_session,
+            tx,
+            kind: message.kind,
+            sequence: message.sequence,
+        };
+        if self.route_seen.contains(&seen) {
+            return;
+        }
+        self.route_seen.push(seen);
+        if self.route_seen.len() > 128 {
+            self.route_seen.remove(0);
+        }
         match (message.kind, message.result) {
             (Kind::Admission, Answer::Ok | Answer::VerifyConnection) => {
                 eprintln!(
@@ -2235,6 +2267,7 @@ impl Daemon {
         self.route_air_at = None;
         self.route_wait_from = None;
         self.route_water.clear();
+        self.route_seen.clear();
         self.route_reply = None;
         self.pending_admission = None;
         self.route_packet = None;
@@ -2353,6 +2386,14 @@ impl Daemon {
         let keys = self.membership.accessory_keys();
         let irk_known = keys.is_some();
         let irk_match = keys.is_some_and(|keys| crate::pods::air::resolves(&keys.irk, address));
+        // The placement, lid, and case fields are plaintext. Until the
+        // stored IRK can resolve the advertiser, only the configured
+        // accessory's own address may speak for it — otherwise any nearby
+        // radio with a recognized model byte could drive this accessory's
+        // lid, placement, and stowed-connection decisions.
+        if !irk_match && self.config.accessory != Some(address) {
+            return;
+        }
         let recognized = sight.model != Model::Unknown;
         let model = if recognized { sight.model } else { self.accessory.model };
         let Some(decision) =
@@ -7653,6 +7694,46 @@ mod tests {
     }
 
     #[test]
+    fn a_plaintext_letter_cannot_confirm_or_grant_an_enrollment() {
+        use crate::fleet::enroll::Phase;
+        use crate::step::Input;
+
+        let now = clock();
+        let mut daemon = Daemon::new("gram");
+        daemon.set_local_address(Some(addr(1)));
+        let id = InvitationId::new([7; 16]);
+        assert!(daemon.receive_invite(addr(2), "xps", id, now));
+        daemon.take_letters();
+        // A forged grant would hand us an attacker fleet key; a forged done
+        // would mark the enrollment confirmed. Neither may move anything.
+        for body in [
+            format!(
+                "{{\"t\":\"grant\",\"id\":\"{}\",\"confirm\":\"{}\",\"proposal\":{{\"id\":\"{}\",\"key\":\"{}\",\"members\":[{{\"address\":\"{}\",\"label\":\"xps\"}}]}}}}",
+                id.hex(),
+                "11".repeat(32),
+                "22".repeat(16),
+                "33".repeat(32),
+                addr(2).display(),
+            ),
+            format!("{{\"t\":\"done\",\"id\":\"{}\"}}", id.hex()),
+            format!("{{\"t\":\"commit\",\"id\":\"{}\"}}", id.hex()),
+        ] {
+            let frame = format!(
+                "pf1\n{{\"k\":\"letter\",\"from\":\"{}\",\"to\":\"{}\",\"body\":{body}}}",
+                addr(2).display(),
+                addr(1).display(),
+            );
+            let result = daemon.step(Input::Radio(frame.into_bytes()), now);
+            assert_eq!(daemon.enrollment.phase(), Phase::WaitingOffer);
+            assert!(daemon.saved_fleet().is_none());
+            assert!(!result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, crate::step::Effect::WriteKeyring(_))));
+        }
+    }
+
+    #[test]
     fn a_withdrawal_clears_the_roster_the_other_laptop_learned() {
         use crate::fleet::members::{Fleet, GroupKey, Member};
         use crate::fleet::presence::{self, FleetKeys};
@@ -7926,6 +8007,12 @@ mod tests {
             assert_eq!(gram.routing.retry_deadline(), deadline);
 
             let joined = gram.step(
+                Input::Advertisement(route_frame(&admission, &keys)),
+                advance_clock(&mut now, 500),
+            );
+            assert_eq!(gram.routing.phase(), Phase::WaitingCompletion);
+            // A verbatim replay of that admission changes nothing.
+            gram.step(
                 Input::Advertisement(route_frame(&admission, &keys)),
                 advance_clock(&mut now, 500),
             );
