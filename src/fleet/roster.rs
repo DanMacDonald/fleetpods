@@ -106,7 +106,9 @@ impl Peers {
             if report.wire_session.is_some() {
                 super::roster_air::fresh(report.sent, now.unix)
             } else {
-                now.mono.saturating_since(report.at) <= self.ttl_ms
+                // A report dated after the receiving clock is not fresh;
+                // otherwise a forged future timestamp never expires.
+                report.at <= now.mono && now.mono.saturating_since(report.at) <= self.ttl_ms
             }
         })
     }
@@ -124,7 +126,7 @@ impl Peers {
                 && if report.wire_session.is_some() {
                     super::roster_air::fresh(report.sent, now.unix)
                 } else {
-                    now.mono.saturating_since(report.at) <= self.ttl_ms
+                    report.at <= now.mono && now.mono.saturating_since(report.at) <= self.ttl_ms
                 }
         })
     }
@@ -277,6 +279,19 @@ mod tests {
         assert!(peers.fresh(now, other).is_none());
         peers.invalidate();
         assert!(peers.fresh(now, pods).is_none());
+    }
+
+    #[test]
+    fn a_report_dated_in_the_future_is_never_fresh() {
+        let pods = Address::parse("AA:AA:AA:AA:AA:AA").unwrap();
+        let mut peers = Peers::new();
+        let mut future = report(1, pods);
+        future.at = MonoMs(60_000);
+        let reporter = future.reporter_address;
+        assert_eq!(peers.ingest(future, Some(pods)), Ingest::Stored);
+        let now = Clock::new(0, 0);
+        assert!(peers.fresh(now, pods).is_none());
+        assert!(peers.fresh_from(now, pods, reporter).is_none());
     }
 
     #[test]

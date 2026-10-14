@@ -5,7 +5,6 @@ use crate::audio::play::{PlayerSeen, Profile, StreamSnap};
 use crate::audio::route::{Graph, Move, StreamTarget};
 use crate::fleet::members::Fleet;
 use crate::fleet::postcard::{self, Postcard};
-use crate::fleet::roster::RosterReport;
 use crate::panel::ipc::Command;
 use crate::pods::link::{FailReason, Stage};
 use crate::pods::reports::Pod;
@@ -741,8 +740,8 @@ impl Daemon {
                 self.note_letter_peer(from, name, now);
                 self.deliver(from, body, now);
             }
-            Some(Postcard::Announce { from, name, seated, roster }) => {
-                self.hear_announce(from, name, seated, roster, now);
+            Some(Postcard::Announce { from, name, seated, .. }) => {
+                self.hear_announce(from, name, seated, now);
             }
             None => {
                 if let (Some(from), Some(letter)) =
@@ -758,17 +757,13 @@ impl Daemon {
         }
     }
 
-    fn hear_announce(
-        &mut self,
-        from: Address,
-        name: String,
-        seated: bool,
-        roster: Option<RosterReport>,
-        now: Clock,
-    ) {
+    fn hear_announce(&mut self, from: Address, name: String, seated: bool, now: Clock) {
         if self.local_address == Some(from) {
             return;
         }
+        // A plaintext announcement is only a nearby hint. It carries no
+        // fleet-key proof, so its embedded roster is never ingested;
+        // rosters are accepted only from the authenticated roster path.
         self.observe_nearby(host_id(Some(from)), from, name, now.unix, false, None);
         if seated {
             if !self.peers_seated.contains(&from) {
@@ -776,9 +771,6 @@ impl Daemon {
             }
         } else {
             self.peers_seated.retain(|peer| *peer != from);
-        }
-        if let Some(roster) = roster {
-            self.note_roster(roster);
         }
     }
 

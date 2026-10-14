@@ -7608,6 +7608,46 @@ mod tests {
     }
 
     #[test]
+    fn a_plaintext_announcement_cannot_supply_a_roster() {
+        use crate::fleet::members::{Fleet, GroupKey, Member};
+        use crate::fleet::postcard;
+        use crate::step::Input;
+
+        let now = clock();
+        let pods = Address::parse("A0:00:00:00:00:03").unwrap();
+        let mut daemon = Daemon::new("xps");
+        daemon.set_local_address(Some(addr(1)));
+        daemon.select_accessory(Some(pods));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: addr(1), label: "xps".into() },
+                Member { address: addr(2), label: "gram".into() },
+            ],
+        });
+        let forged = RosterReport {
+            reporter: host_id(Some(addr(2))),
+            reporter_address: addr(2),
+            accessory: pods,
+            session: crate::types::SessionId(99),
+            seq: 999,
+            at: crate::types::MonoMs(u64::MAX / 2),
+            sent: now.unix,
+            peers: vec![addr(2)],
+            audio_source: Some(addr(2)),
+            pending: false,
+            audio_idle: false,
+            wire_session: None,
+            last_use: UnixMs(0),
+        };
+        let frame = postcard::encode_announce(addr(2), "gram", true, Some(&forged));
+        daemon.step(Input::Radio(frame), now);
+        assert!(daemon.peers.fresh(now, pods).is_none());
+        assert!(daemon.status_value(now)["fleet"]["roster"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
     fn a_withdrawal_clears_the_roster_the_other_laptop_learned() {
         use crate::fleet::members::{Fleet, GroupKey, Member};
         use crate::fleet::presence::{self, FleetKeys};
