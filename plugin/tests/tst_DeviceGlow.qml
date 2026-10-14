@@ -16,7 +16,7 @@ TestCase {
 
   // 2026-10-07: the breathing animation was dropped; the glow holds steady while the device plays.
   function test_playingShowsASteadyGlow() {
-    var item = createTemporaryObject(icon, this, { selected: true, playing: true })
+    var item = createTemporaryObject(icon, this, { level: 2, playing: true })
     var halo = findChild(item, "halo")
     var notes = findChild(item, "musicNotes")
     verify(notes !== null, "playing devices emit music notes")
@@ -36,7 +36,7 @@ TestCase {
   }
 
   function test_notesRestartAtIcon(data) {
-    var item = createTemporaryObject(icon, this, { selected: true, playing: true })
+    var item = createTemporaryObject(icon, this, { level: 2, playing: true })
     var streams = findChild(item, "musicStreams")
     wait(1100)
     verify(streams.itemAt(0).progress > 0.3)
@@ -52,7 +52,7 @@ TestCase {
 
   // A paused owner shows no glow; the glow means playback.
   function test_pausedDeviceHasNoGlow() {
-    var item = createTemporaryObject(icon, this, { selected: true, playing: false })
+    var item = createTemporaryObject(icon, this, { level: 2, playing: false })
     wait(fadeMs + 200)
     compare(findChild(item, "halo").opacity, 0)
     compare(findChild(item, "musicNotes").opacity, 0)

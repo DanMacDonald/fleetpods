@@ -4,16 +4,20 @@ import Qt5Compat.GraphicalEffects
 Item {
   id: root
   property bool phone: false
-  property bool selected: false
-  // The glow means playback: a lit device shows it while its owner plays and none when paused.
+  /// Brightness tier: 0 dim/disabled, 1 active without ownership, 2 owner.
+  property int level: 0
+  /// Ownership brightness (tier 2). Playing is told apart by the effect
+  /// alone: the glow and notes play while an owner plays, its brightness
+  /// stays at tier 2 when paused.
+  readonly property bool selected: level >= 2
   property bool playing: false
   readonly property int glowFadeMs: 400
   required property color lineColor
   required property color screenFill
-  // Unselected strokes blend toward the screen but stay opaque, so the ellipse never shows through.
+  // Strokes blend toward the screen but stay opaque, so the ellipse never shows through.
   readonly property color strokeColor: selected ? lineColor : Qt.tint(
     Qt.rgba(screenFill.r, screenFill.g, screenFill.b, 1),
-    Qt.rgba(lineColor.r, lineColor.g, lineColor.b, 0.5))
+    Qt.rgba(lineColor.r, lineColor.g, lineColor.b, level === 1 ? 0.65 : 0.4))
   readonly property int artworkPadding: 15
   readonly property string assetPrefix: "assets/devices/" + (phone ? "phone" : "laptop")
   width: phone ? 20 : 35

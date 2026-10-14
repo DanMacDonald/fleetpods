@@ -3,7 +3,7 @@
 
 const source = Deno.readTextFileSync(new URL("../Model.js", import.meta.url))
 const Model = new Function(
-  source + "; return { pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, audioStatusLabel, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
+  source + "; return { pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
 )()
 
 const PEERS = {
@@ -760,6 +760,8 @@ for (const recovering of [false, true]) {
   check('XPS retry does not draw a connected link', state.seat.connectedToOmarchy, false)
   check('the empty XPS seat names the pending attempt', state.seat.omarchyTransitionLabel,
     recovering ? 'Reconnecting…' : 'Connecting…')
+  check('the attempt kind is typed beside its label', state.seat.attempt,
+    { kind: recovering ? 'reconnecting' : 'connecting', label: recovering ? 'Reconnecting…' : 'Connecting…' })
   check('background retry header does not name a stale owner', state.subtitle,
     recovering ? 'Retrying connection' : 'Connecting')
   check('background retry schedules a wake before the playback carry expires',
@@ -1148,8 +1150,9 @@ check('a fleet route in flight reads as switching', Model.backgroundJoin({ ...jo
   fleet: { routing: { phase: 'connecting', busy: true } } }), true)
 
 // 2026-10-07: "Omarchy fleet · Switching" hid the audio status for seconds; the seat shows the switch instead.
-check('a fleet label is an audio status', Model.audioStatusLabel('Apple fleet · iPhone · Playing'), true)
-check('a connection state is not an audio status', Model.audioStatusLabel('Connecting'), false)
+check('a fleet label carries its kind from its branch', Model.localAudio('ready', '').fleet, true)
+check('a plain audio state is not a fleet label', Model.localAudio('routing', '').fleet, false)
+check('a failure is not a fleet label', Model.localAudio('routing', 'audio_operation_timeout:routing').fleet, false)
 check('a switch keeps the last audio status', Model.heldSubtitle(true, 'Not connected', 'Apple fleet · iPhone · Playing'),
   'Apple fleet · iPhone · Playing')
 check('a switch without a known status shows the live one', Model.heldSubtitle(true, 'Connecting', ''), 'Connecting')
@@ -1685,9 +1688,16 @@ check('the tray opens for known Apple devices once this laptop holds the empty A
   Model.appleTrayAvailable([], [SEATED_LAPTOP], false, [MAC], true), true)
 check('the tray stays hidden with no Apple device to wait',
   Model.appleTrayAvailable([], [SEATED_LAPTOP], false, [], true), false)
+check('the tray shows for a waiting Mac while the seated phone is not playing',
+  Model.appleTrayAvailable([PHONE], [SEATED_LAPTOP], false, [MAC], true, false), true)
+check('the tray stays hidden for a waiting Mac while the seated phone is playing',
+  Model.appleTrayAvailable([PHONE], [SEATED_LAPTOP], false, [MAC], true, true), false)
 
 const omarchy = Model.omarchySeat([{ address: 'B', label: 'xps' }, { address: 'A', label: 'gram' }], [], '', true, false, false)
-check('every laptop draws the Omarchy pair in the same order', omarchy.devices.map(d => d.label), ['gram', 'xps'])
+check('without a known local laptop the pair falls back to label order', omarchy.devices.map(d => d.label), ['gram', 'xps'])
+check('the local laptop takes the left slot of the pair',
+  Model.omarchySeat([{ address: 'B', label: 'xps' }, { address: 'A', label: 'gram' }], [], '', true, false, false, 'B').devices.map(d => d.label),
+  ['xps', 'gram'])
 check('a held Omarchy seat shows its tray once ownership is known',
   [Model.omarchySeat([], [], '', true, true, false).showWaiting, Model.omarchySeat([], [], '', true, true, true).showWaiting], [true, false])
 check('the Omarchy link follows this laptop or a seated peer',
@@ -2186,6 +2196,7 @@ check('a pair lights only the named source', [Model.seatDeviceLit(XPS, named, tr
   state = Model.statusLog(state, { t: 4000, ev: 'status', status: { ...reconnect, bluezConnected: false,
     fleet: { roster: { reporter: gram, peers: [gram], pending: false, audio_source: gram } } } })
   check('Gram fleet confirmation keeps it seated during Apple reconnect', state.seat.seats.omarchy.map(d => d.address), [gram])
+  check('the Omarchy seat waits during an Apple reconnect', state.seat.omarchyTransitionLabel, 'Waiting…')
 }
 
 // 2026-10-12: XPS joined beside a playing iPhone. Its socket opened before the pods listed their peers, the Gram's

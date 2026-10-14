@@ -108,7 +108,7 @@ impl Daemon {
                     self.enrollment.cancel(id);
                 }
                 self.commit.clear();
-                self.keyring_dirty = false;
+                self.effects.keyring_dirty = false;
                 self.pake = None;
                 self.offer = None;
             }
@@ -175,7 +175,7 @@ impl Daemon {
             return;
         };
         self.commit.stage_grant(peer, id, tag, proposal);
-        self.keyring_dirty = true;
+        self.effects.keyring_dirty = true;
     }
 
     fn on_grant(&mut self, from: Address, id: InvitationId, confirm: [u8; 32], proposal: Proposal) {
@@ -185,7 +185,7 @@ impl Daemon {
         }
         let Some(proposal) = self.prepare_enrollment(id, proposal) else { return };
         self.commit.stage_saved(from, id, proposal);
-        self.keyring_dirty = true;
+        self.effects.keyring_dirty = true;
     }
 
     fn prepare_enrollment(&mut self, id: InvitationId, proposal: Proposal) -> Option<Proposal> {
@@ -206,7 +206,7 @@ impl Daemon {
         };
         if self.enrollment.fail(id, message) {
             self.commit.clear();
-            self.keyring_dirty = false;
+            self.effects.keyring_dirty = false;
             if let Some((peer, _)) = self.enrollment.peer() {
                 self.send(peer, Letter::Cancel { id });
             }
@@ -335,7 +335,7 @@ mod tests {
         else {
             panic!("expected grant")
         };
-        inviter.keyring_dirty = false;
+        inviter.effects.keyring_dirty = false;
         inviter.send(to, Letter::Grant { id, confirm, proposal });
         transfer(&mut inviter, &mut joiner, now);
         (inviter, joiner, now)
@@ -394,7 +394,7 @@ mod tests {
             assert!(joiner.enrollment.error().contains("different fleet"));
             assert_eq!(joiner.saved_fleet(), Some(original));
             assert!(!joiner.commit.is_staged());
-            assert!(!joiner.keyring_dirty);
+            assert!(!joiner.effects.keyring_dirty);
             transfer(&mut joiner, &mut inviter, now);
             assert_eq!(inviter.enrollment.phase(), Phase::Error);
             assert!(inviter.enrollment.error().contains("other device"));

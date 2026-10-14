@@ -9,7 +9,7 @@ use crate::fleet::roster::RosterReport;
 use crate::panel::ipc::Command;
 use crate::pods::link::{FailReason, Stage};
 use crate::pods::reports::Pod;
-use crate::pods::setup::{self, Event, Place};
+use crate::pods::setup::{self, Place};
 use crate::types::{Address, Battery, Clock, Generation, MonoMs};
 
 use crate::daemon::{host_id, Daemon};
@@ -84,39 +84,12 @@ pub enum Input {
     },
     /// BlueZ `InProgress` while a profile operation is still running.
     ProfilePending(bool),
-    /// Battery, placement, and the case, from one accessory report.
-    Bud {
-        bud: crate::pods::setup::Bud,
-        level: u8,
-        charging: bool,
-        in_ear: Option<bool>,
-        in_case: Option<bool>,
-    },
-    Ownership(bool),
-    Source {
-        local: bool,
-        kind: u8,
-        remote: Option<Address>,
-    },
-    Noise(crate::types::NoiseMode),
+    /// One typed accessory observation, translated from a control
+    /// packet by `pods::observe` — the same vocabulary production
+    /// packets arrive in.
+    Observation(crate::pods::observe::Observation),
     Profiles(Vec<Profile>),
     ActivateAudio,
-    Battery {
-        slot: PodSlot,
-        level: u8,
-        charging: bool,
-    },
-    Ears {
-        left: Option<bool>,
-        right: Option<bool>,
-        at: MonoMs,
-    },
-    /// A direct accessory report. A play does not write this. The platform
-    /// sends it when the pods confirm who is playing.
-    PodsConfirmed {
-        local: bool,
-        remote: Option<Address>,
-    },
     Radio(Vec<u8>),
     /// One fleet service-data advertisement. A finished frame is heard as `Radio`.
     Advertisement(Vec<u8>),
@@ -295,7 +268,7 @@ impl Daemon {
         if !self.wants_local_confirm(now.mono) {
             return;
         }
-        self.control_out.push((self.connection.generation(), setup::ownership(true)));
+        self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
         eprintln!("fleetpodsd: claiming AirPods audio on the existing control link");
     }
 
@@ -328,7 +301,7 @@ impl Daemon {
                 if !self.radio_quiet() {
                     self.replan(now);
                 }
-                self.announce_dirty = true;
+                self.effects.announce_dirty = true;
                 None
             }
             Input::Lid { open } => {
@@ -392,7 +365,7 @@ impl Daemon {
                     return None;
                 }
                 let was_ready = self.connection.stage() == Stage::Ready;
-                self.note_socket(up, generation);
+                self.note_socket(up, generation, now.mono);
                 if up {
                     self.begin_setup(generation, now);
                 } else {
@@ -430,20 +403,9 @@ impl Daemon {
                 self.note_profile_pending(pending);
                 None
             }
-            Input::Bud { bud, level, charging, in_ear, in_case } => {
-                self.note_bud(bud, level, charging, in_ear, in_case, now.mono);
-                None
-            }
-            Input::Ownership(local) => {
-                self.observe_ownership(local, now);
-                None
-            }
-            Input::Source { local, kind, remote } => {
-                self.observe_source(local, kind, remote, now);
-                None
-            }
-            Input::Noise(mode) => {
-                self.note_noise_report(mode, now.mono);
+            Input::Observation(observation) => {
+                let generation = self.connection.generation();
+                self.apply_observation(observation, generation, now);
                 None
             }
             Input::Profiles(profiles) => {
@@ -452,21 +414,6 @@ impl Daemon {
             }
             Input::ActivateAudio => {
                 self.activate_profile();
-                None
-            }
-            Input::Battery { slot, level, charging } => {
-                self.note_battery(slot, level, charging, now.mono);
-                None
-            }
-            Input::Ears { left, right, at } => {
-                self.note_ears(left, right, at, now.mono);
-                None
-            }
-            Input::PodsConfirmed { local, remote } => {
-                if !local && self.output.want && !self.seat.user_intent_fresh(now.mono) {
-                    self.step_back(now);
-                }
-                self.confirm_pods(local, remote, now.mono);
                 None
             }
             Input::Radio(bytes) => {
@@ -560,7 +507,7 @@ impl Daemon {
             }
             Input::Players(players) => {
                 self.audio.startup_players(&players);
-                self.announce_dirty = true;
+                self.effects.announce_dirty = true;
                 None
             }
             Input::Player { service, playing } => {
@@ -569,7 +516,7 @@ impl Daemon {
                     eprintln!("fleetpodsd: player {service:?} reported new Playing state (after_yield={after_yield})");
                     self.claim_playback(now);
                 }
-                self.announce_dirty = true;
+                self.effects.announce_dirty = true;
                 None
             }
             Input::Audio(graph) => {
@@ -614,7 +561,7 @@ impl Daemon {
         }
         self.request_playback_ownership(now);
         self.flush_settings();
-        self.announce_dirty = true;
+        self.effects.announce_dirty = true;
     }
 
     fn begin_setup(&mut self, generation: Generation, now: Clock) {
@@ -623,69 +570,59 @@ impl Daemon {
         }
         let hello = self.accessory_setup.start().to_vec();
         self.connection.advance(crate::pods::link::OpenStep::Handshake, generation, now.mono);
-        self.control_out.push((generation, hello));
+        self.effects.control_out.push((generation, hello));
     }
 
     fn feed_accessory(&mut self, packet: &[u8], generation: Generation, now: Clock) {
         if self.hear_microphone(packet, now.mono) {
             return;
         }
-        if let Some(report) = crate::pods::peer::parse(packet) {
-            if let Some(label) = report.name {
-                self.learn_apple_name(report.sender, &label);
-            }
-            if let Some(playing) = report.playing {
-                self.note_peer_playback(report.sender, playing, now.mono);
-            }
-        }
-        if setup::priority_acknowledged(packet) {
-            self.note_priority_ack();
-            self.note_pair_reserved(now);
-        }
-        if let Some(peer) = setup::peer_reconnect(packet) {
-            self.free_slot(peer, now);
-        }
-        let (follow, events) = self.accessory_setup.observe(packet);
+        // One packet, interpreted once: `pods::observe` reads the peer
+        // relay, the priority acknowledgement, the peer-reconnect, and
+        // the setup report, and states each as a typed observation.
+        let (follow, observations) =
+            crate::pods::observe::translate(&mut self.accessory_setup, packet, self.local_address);
         if let Some(follow) = follow {
             self.connection.advance(follow.step(), generation, now.mono);
-            self.control_out.push((generation, follow.bytes().to_vec()));
+            self.effects.control_out.push((generation, follow.bytes().to_vec()));
             if follow == setup::FollowUp::Notifications {
-                self.control_out.push((generation, setup::request_keys().to_vec()));
+                self.effects.control_out.push((generation, setup::request_keys().to_vec()));
             }
         }
-        for event in events {
-            if matches!(event, Event::Ready) {
-                self.control_ready(generation, now);
-            } else {
-                self.apply_setup_event(event, now);
-            }
+        for observation in observations {
+            self.apply_observation(observation, generation, now);
         }
     }
 
-    fn apply_setup_event(&mut self, event: Event, now: Clock) {
-        match event {
-            Event::BudReport { bud, level, charging, place } => {
+    fn apply_observation(
+        &mut self,
+        observation: crate::pods::observe::Observation,
+        generation: Generation,
+        now: Clock,
+    ) {
+        use crate::pods::observe::Observation;
+        match observation {
+            Observation::Bud { bud, level, charging, place } => {
                 let (in_ear, in_case) = place_of(place);
                 self.note_bud(bud, level, charging, in_ear, in_case, now.mono);
             }
-            Event::Case { level, charging } => {
+            Observation::CaseBattery { level, charging } => {
                 self.note_battery(PodSlot::Case, level, charging, now.mono);
             }
-            Event::Ownership(local) => {
+            Observation::Ownership(local) => {
                 self.observe_ownership(local, now);
             }
-            Event::Source { address, kind } => {
-                let mine = self.local_address == Some(address);
-                self.observe_source(mine, kind, (!mine).then_some(address), now);
+            Observation::Source { local, kind, remote } => {
+                self.observe_source(local, kind, remote, now);
             }
-            Event::Noise(mode) => self.note_noise_report(mode, now.mono),
-            Event::Identity { name, model } => {
+            Observation::Noise(mode) => self.note_noise_report(mode, now.mono),
+            Observation::Identity { name, model } => {
                 let sku = if model.is_empty() { self.accessory.sku.clone() } else { model };
                 if !name.is_empty() || !sku.is_empty() {
                     self.set_identity(name, &sku);
                 }
             }
-            Event::Keys { irk, encryption } => {
+            Observation::Keys { irk, encryption } => {
                 // Every link reports the keys. Rewriting unchanged items on each connection
                 // only makes the keyring replace them, so write only what changed.
                 let keys = crate::fleet::members::AccessoryKeys { irk, encryption };
@@ -694,7 +631,7 @@ impl Daemon {
                     self.queue_accessory_keys();
                 }
             }
-            Event::PodPeers { peers, owner } => {
+            Observation::PodPeers { peers, owner } => {
                 self.note_pod_peers(peers, now.unix);
                 if let (Some(owner), Some(local)) = (owner, self.local_address) {
                     if owner != local {
@@ -704,7 +641,22 @@ impl Daemon {
                     self.observe_ownership(owner == local, now);
                 }
             }
-            Event::Ready => {}
+            Observation::PeerName { address, label } => {
+                self.learn_apple_name(address, &label);
+            }
+            Observation::PeerPlaying { address, playing } => {
+                self.note_peer_playback(address, playing, now.mono);
+            }
+            Observation::PriorityAcknowledged => {
+                self.note_priority_ack();
+                self.note_pair_reserved(now);
+            }
+            Observation::PeerReconnect(peer) => {
+                self.free_slot(peer, now);
+            }
+            Observation::Ready => {
+                self.control_ready(generation, now);
+            }
         }
     }
 
@@ -717,7 +669,7 @@ impl Daemon {
         if !local {
             self.yield_to_remote_report(now);
         }
-        self.announce_dirty = true;
+        self.effects.announce_dirty = true;
     }
 
     fn observe_source(&mut self, local: bool, kind: u8, remote: Option<Address>, now: Clock) {
@@ -732,7 +684,7 @@ impl Daemon {
         if !local && kind > 0 {
             self.yield_to_remote_report(now);
         }
-        self.announce_dirty = true;
+        self.effects.announce_dirty = true;
     }
 
     fn yield_to_remote_report(&mut self, now: Clock) {
@@ -758,7 +710,7 @@ impl Daemon {
             return;
         }
         if !busy && !self.output.holding_takeover() {
-            self.restore_pending = self.audio.fail_acquisition();
+            self.effects.restore_pending = self.audio.fail_acquisition();
         }
         let reason = if busy { FailReason::Busy } else { FailReason::Transport };
         self.note_setup_failed(generation, reason, now.mono);
@@ -777,20 +729,6 @@ impl Daemon {
                 self.note_pod(true, Pod { battery, in_ear: None, in_case: None }, now)
             }
         }
-    }
-
-    fn confirm_pods(&mut self, local: bool, remote: Option<Address>, now: MonoMs) {
-        if local {
-            self.note_ownership(true, now);
-            self.note_source(true, 2, now);
-        } else {
-            self.note_ownership(false, now);
-            self.note_source(false, 2, now);
-            if let Some(address) = remote {
-                self.note_remote(address, now);
-            }
-        }
-        self.announce_dirty = true;
     }
 
     fn hear_radio(&mut self, bytes: &[u8], source: Option<Address>, now: Clock) {
@@ -909,36 +847,36 @@ impl Daemon {
         if let Some(generation) = self.take_open_link(now.mono) {
             effects.push(Effect::OpenLink { generation });
         }
-        if self.follow_link {
-            self.follow_link = false;
+        if self.effects.follow_link {
+            self.effects.follow_link = false;
             effects.push(Effect::FollowLink);
         }
-        if self.keyring_dirty {
-            self.keyring_dirty = false;
+        if self.effects.keyring_dirty {
+            self.effects.keyring_dirty = false;
             if let Some(fleet) = self.commit.fleet() {
                 effects.push(Effect::WriteKeyring(fleet));
             }
         }
         let accessory = self.config.accessory;
-        for (generation, bytes) in std::mem::take(&mut self.control_out) {
+        for (generation, bytes) in std::mem::take(&mut self.effects.control_out) {
             if let Some(accessory) = accessory {
                 effects.push(Effect::WriteControl { accessory, generation, bytes });
             }
         }
-        for (name, bytes) in std::mem::take(&mut self.secret_out) {
+        for (name, bytes) in std::mem::take(&mut self.effects.secret_out) {
             effects.push(Effect::WriteSecret { name, bytes });
         }
-        let players = std::mem::take(&mut self.pause_players);
+        let players = std::mem::take(&mut self.effects.pause_players);
         if !players.is_empty() {
             effects.push(Effect::PausePlayers(players));
         }
-        if self.drop_link {
-            self.drop_link = false;
+        if self.effects.drop_link {
+            self.effects.drop_link = false;
             if let Some(accessory) = accessory {
                 effects.push(Effect::Disconnect { accessory });
             }
         }
-        if let Some(accessory) = self.remove_device.take() {
+        if let Some(accessory) = self.effects.remove_device.take() {
             effects.push(Effect::RemoveDevice { accessory });
         }
         if let Some(effect) = self.pace_microphone() {
@@ -956,7 +894,7 @@ impl Daemon {
                 if self.output.begin_recovery(id, address, graph, now.mono) {
                     // This input may already have planned an unmute on arrival.
                     // Recovery now owns these saved states until relinking ends.
-                    self.restore_pending.retain(|saved| {
+                    self.effects.restore_pending.retain(|saved| {
                         !self
                             .output
                             .held
@@ -973,8 +911,8 @@ impl Daemon {
         if let Some(effect) = self.pace_output_health(now) {
             effects.push(effect);
         }
-        if self.announce_dirty {
-            self.announce_dirty = false;
+        if self.effects.announce_dirty {
+            self.effects.announce_dirty = false;
             if let Some(address) = self.local_address {
                 let seated = self.connection.stage() == Stage::Ready;
                 let roster = self.audio_roster(now);
@@ -986,8 +924,8 @@ impl Daemon {
                 )));
             }
         }
-        if !self.restore_pending.is_empty() {
-            effects.push(Effect::Restore(std::mem::take(&mut self.restore_pending)));
+        if !self.effects.restore_pending.is_empty() {
+            effects.push(Effect::Restore(std::mem::take(&mut self.effects.restore_pending)));
         }
         // The Router ordered this work; translate it in one place. A quiet
         // still leads the whole step, before any control write.
@@ -1061,7 +999,7 @@ impl Daemon {
         }
         self.audio.set_routed(outcome.routed);
         if !outcome.restore.is_empty() {
-            self.restore_pending.extend(outcome.restore);
+            self.effects.restore_pending.extend(outcome.restore);
         }
     }
 

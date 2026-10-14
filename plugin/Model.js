@@ -164,11 +164,6 @@ function openingControlLink(connected, control, routing) {
   return controlOpening(control) || routeRequesting(routing)
 }
 
-// The subtitle answers where the audio is; a seat handover does not change that, so it keeps the last answer.
-function audioStatusLabel(label) {
-  return /^(Apple|Omarchy) fleet( ·|$)/.test(String(label || ""))
-}
-
 // The subtitle names the seat the panel draws lit, so the two never disagree. Both lit defers to the lit device.
 function seatAudioSubtitle(omarchyOwns, appleOwns, memberLabel, memberKind, playing) {
   var fleet = omarchyOwns && appleOwns ? (memberKind === "apple" ? "Apple" : "Omarchy")
@@ -917,24 +912,31 @@ function idleAudioReady(status) {
     && (status.left.inEar || status.right.inEar) ? true : false
 }
 
-function localAudioLabel(state, failure, worn, playbackConfirmed, device, idleOwnerConfirmed) {
-  if (playbackConfirmed && !audioFailure(failure)) return playingLabel(device, "Omarchy")
-  if (!state || state === "ready") return fleetLabel("Omarchy", device)
-  if (state === "playing") return playingLabel(device, "Omarchy")
-  if (audioFailure(failure)) return "Audio needs attention"
+// The label plus its typed kind: fleet labels name this laptop's fleet
+// seat, the rest are plain audio states. Callers decide on the kind,
+// never on the rendered words.
+function localAudio(state, failure, worn, playbackConfirmed, device, idleOwnerConfirmed) {
+  if (playbackConfirmed && !audioFailure(failure)) return { text: playingLabel(device, "Omarchy"), fleet: true }
+  if (!state || state === "ready") return { text: fleetLabel("Omarchy", device), fleet: true }
+  if (state === "playing") return { text: playingLabel(device, "Omarchy"), fleet: true }
+  if (audioFailure(failure)) return { text: "Audio needs attention", fleet: false }
   // Idle ownership does not require an active audio output. Activity can
   // transfer that ownership while both laptops retain their control links.
-  if (state === "unavailable" && idleOwnerConfirmed) return fleetLabel("Omarchy", device)
-  if (state === "unavailable" && worn === false) return "Connected"
+  if (state === "unavailable" && idleOwnerConfirmed) return { text: fleetLabel("Omarchy", device), fleet: true }
+  if (state === "unavailable" && worn === false) return { text: "Connected", fleet: false }
   switch (state) {
-    case "routing": return "Routing audio"
-    case "starting": return "Starting audio"
-    case "profile_missing": return "Preparing audio"
-    case "output_elsewhere": return "Another output selected"
+    case "routing": return { text: "Routing audio", fleet: false }
+    case "starting": return { text: "Starting audio", fleet: false }
+    case "profile_missing": return { text: "Preparing audio", fleet: false }
+    case "output_elsewhere": return { text: "Another output selected", fleet: false }
     // Shown only while the pods name this laptop the owner, so a leftover release still reads as its fleet.
-    case "remote": return fleetLabel("Omarchy", device)
-    default: return "Audio unavailable"
+    case "remote": return { text: fleetLabel("Omarchy", device), fleet: true }
+    default: return { text: "Audio unavailable", fleet: false }
   }
+}
+
+function localAudioLabel(state, failure, worn, playbackConfirmed, device, idleOwnerConfirmed) {
+  return localAudio(state, failure, worn, playbackConfirmed, device, idleOwnerConfirmed).text
 }
 
 // The seats show who stays where, so a switch names only where the audio went.
@@ -1187,6 +1189,12 @@ function seatAudioOwner(status, fleet, previous, carried) {
   if (fleet && !fleet.pending) return from("fleet", fleet.appleOwnsAudio, fleet.sourceAddress, fleet.sourcePlaying)
   if (previous && previous.handover) return from("handover", previous.appleOwnsAudio, previous.sourceAddress, previous.playing)
   if (carried) return from("carried", carried.appleOwnsAudio, carried.sourceAddress, carried.playing)
+  // The roster derivation here is deliberate, not a second-guessing of
+  // the daemon: the daemon's holder is per-machine, while the roster is
+  // the fleet-sync evidence that lets every laptop draw the same owner
+  // (including a peer that has stepped back to its speakers). Giving
+  // the daemon holder veto power breaks exactly those cases; the
+  // recorded replay sessions pin them. Change this only with them.
   var omarchyOwner = omarchyRosterOwner(status), appleOwner = appleRosterOwner(status)
   var appleAudio = appleOwnsAudio(status)
   var omarchyAudio = !!(status.audioHere || status.remoteOmarchyAudio || omarchyOwner !== ""
@@ -1323,6 +1331,17 @@ function seatPresentation(status, takingOmarchySeat, heldOmarchySeat) {
     waiting.push(peerInfo(local, local, status.localName, names))
   var control = status.controlConnection || {}
   var localAttempt = takingOmarchySeat || controlOpening(control) || routeRequesting(status.fleet && status.fleet.routing)
+  // The one connection attempt, as a typed kind; the transition label is
+  // rendered from it and never read back as state.
+  var attemptKind = caseClosed ? "none"
+    : control.peer_reconnect ? "waiting"
+    : !localConnected && seats.omarchy.length === 0
+    ? (takingOver ? "switching"
+      : localAttempt ? (control.recovering ? "reconnecting" : "connecting") : "none")
+    : switching ? (replacingOmarchy ? "switching" : "connecting")
+    : "none"
+  var attemptLabel = { none: "", waiting: "Waiting…", switching: "Switching…",
+    connecting: "Connecting…", reconnecting: "Reconnecting…" }[attemptKind]
   return {
     fleetView: fleet, previousConnection: previous, refreshingConnection: refreshing,
     seatMap: seatMap, seats: seats, localWaiting: localWaiting, ownershipUnknown: appleSeatUnknown || ownerUnknown,
@@ -1333,19 +1352,16 @@ function seatPresentation(status, takingOmarchySeat, heldOmarchySeat) {
       : seatAudioSubtitle(owner.omarchy, owner.apple, peer.label, peer.kind, owner.playing),
     switching: switching,
     takingOverOmarchy: takingOver,
-    omarchyTransitionLabel: caseClosed ? "" : control.peer_reconnect ? "Reconnecting…"
-      : !localConnected && seats.omarchy.length === 0
-      ? (takingOver ? "Switching…"
-        : localAttempt ? (control.recovering ? "Reconnecting…" : "Connecting…") : "")
-      : switching ? (replacingOmarchy ? "Switching…" : "Connecting…")
-      : "",
+    attempt: { kind: attemptKind, label: attemptLabel },
+    omarchyTransitionLabel: attemptLabel,
     appleSeatUnknown: appleSeatUnknown,
     appleTrayRemembered: appleSeatUnknown || (!localConnected && !fleet && docked),
     availableApple: fleet ? fleet.availableApple : availableDevices("apple", seated,
       names, status.localAddress, status.remoteSourceAddress),
     appleTrayAvailable: appleTrayAvailable(seats.apple, seats.omarchy, owner.apple,
       fleet ? fleet.availableApple : availableDevices("apple", seated,
-        names, status.localAddress, status.remoteSourceAddress), localConnected),
+        names, status.localAddress, status.remoteSourceAddress), localConnected,
+      owner.apple && owner.playing),
     availableOmarchy: waiting,
     linuxHeld: !!(fleet ? fleet.omarchyOwnsAudio : previous ? previous.linuxHeld && seats.omarchy.length > 0
       : (localConnected && heldOmarchySeat) || status.remoteOmarchyAudio),
@@ -1386,8 +1402,13 @@ function seatAudioAddress(devices, activeAddress) {
 // through the current Apple owner. Saved names alone do not enable it.
 // Once this laptop holds the pods and the Apple seat is empty, the known
 // Apple devices wait in the tray too: they may reconnect from there.
-function appleTrayAvailable(appleDevices, omarchyDevices, appleOwns, availableApple, localConnected) {
+function appleTrayAvailable(appleDevices, omarchyDevices, appleOwns, availableApple, localConnected, seatedApplePlaying) {
   if (appleOwns && (appleDevices || []).some(function (device) { return device.onAcl === true })) return true
+  // A seated Apple device that is not playing can be displaced by the
+  // waiting one over Apple smart routing, whoever holds the audio: the
+  // tray shows so that device can come forward.
+  if (!seatedApplePlaying && (availableApple || []).length > 0
+    && (appleDevices || []).some(function (device) { return device.onAcl === true })) return true
   return localConnected === true
     && !(appleDevices || []).some(function (device) { return device.onAcl === true })
     && (omarchyDevices || []).some(function (device) { return device.onAcl === true })
@@ -1409,10 +1430,16 @@ function appleSeat(appleDevices, availableApple, activeAddress, reconnect, trayA
   }
 }
 
-function omarchySeat(omarchyDevices, availableOmarchy, activeAddress, connected, linuxHeld, ownershipUnknown) {
-  // Each machine reports itself last; sort so every laptop draws the seat the same way.
+function omarchySeat(omarchyDevices, availableOmarchy, activeAddress, connected, linuxHeld, ownershipUnknown, localAddress) {
+  // This laptop takes the left slot of a pair, so the device arriving from
+  // the tray lands leftmost and the one already seated slides right. Without
+  // a known local address, fall back to label order.
+  var local = normalizeAddress(localAddress)
   var devices = omarchyDevices.slice().sort(function (a, b) {
-    return String(a.label).localeCompare(String(b.label)) || String(a.address).localeCompare(String(b.address))
+    var aLocal = local !== "" && normalizeAddress(a.address) === local ? 0 : 1
+    var bLocal = local !== "" && normalizeAddress(b.address) === local ? 0 : 1
+    return aLocal - bLocal
+      || String(a.label).localeCompare(String(b.label)) || String(a.address).localeCompare(String(b.address))
   })
   return {
     devices: devices, waiting: availableOmarchy,
@@ -1808,7 +1835,7 @@ function statusLogInputs(s, now) {
     && !pods.connected && !pods.bluezConnected && !opening && !pods.connecting && !taking))
   var guidanceVisible = pairingRequired || (caseClosed ? !pods.connected && !pods.bluezConnected : !connectionVisible)
   var idle = !taking && !pods.connecting && !pods.holdingOmarchySeat
-  var localAudio = localAudioLabel(pods.localAudioState, pods.localAudioFailure,
+  var localAudioResult = localAudio(pods.localAudioState, pods.localAudioFailure,
     pods.isHeadset || pods.leftPod.inEar || pods.rightPod.inEar, pods.localPlaybackConfirmed, hostLabel(pods.localName),
     audioOwner(pods).holder === "local" && !audioOwner(pods).playing)
   // The local output can disappear before an ownership handoff completes.
@@ -1860,7 +1887,7 @@ function statusLogInputs(s, now) {
     : elsewhere ? { kind: "elsewhere" }
     : telemetry ? { kind: "unavailable", headset: pods.isHeadset }
     : !pods.connected ? { kind: "notConnected" }
-    : s.linuxHeld && !audioStatusLabel(localAudio) && !outputUnavailableDuringHandoff ? { kind: "audio", text: localAudio }
+    : s.linuxHeld && !localAudioResult.fleet && !outputUnavailableDuringHandoff ? { kind: "audio", text: localAudioResult.text }
     : seat.audioSubtitle ? { kind: "audio", text: seat.audioSubtitle } : { kind: "connected" }
   // The seat and header use the same bounded evidence, never an independently
   // cached caption that can outlive the device and its playing animation.
@@ -1883,7 +1910,8 @@ function statusLogInputs(s, now) {
     connectedToOmarchy: false, viewOwnershipUnknown: true,
     audioPlaying: false, audioDeviceAddress: "", audioSubtitle: "",
     audioPeer: { label: "", address: "", kind: "" },
-    switching: false, takingOverOmarchy: false, omarchyTransitionLabel: ""
+    switching: false, takingOverOmarchy: false, omarchyTransitionLabel: "",
+    attempt: { kind: "none", label: "" }
   }) : seat
   var alongside = connectedFleetPeer(s.status)
   var routing = pods.fleet && pods.fleet.routing

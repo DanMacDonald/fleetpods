@@ -681,6 +681,17 @@ struct Live {
     adapter_path: Option<String>,
     /// A service interruption is in progress. Do not open the control socket until the daemon asks.
     defer_attach: bool,
+    /// bluetoothd itself is gone (it crashed or is restarting), so the
+    /// device list is empty because the inventory vanished, not because
+    /// any pairing was removed.
+    bluez_lost: bool,
+    // Link state is split on purpose across the thread seam: this
+    // watcher owns the D-Bus connection and the socket fds, while the
+    // daemon owns link stage and policy. The generation originates in
+    // the daemon's Connection; the watcher only echoes it as a tag on
+    // socket events so stale readiness is discarded, and `defer_attach`
+    // above is the watcher's rate-limiter so `AttachAvailable` is
+    // emitted once per ACL rather than on every notice.
     air: Air,
 }
 
@@ -702,6 +713,7 @@ impl Default for Live {
             calls: Vec::new(),
             adapter_path: None,
             defer_attach: false,
+            bluez_lost: false,
             air: Air::default(),
         }
     }
@@ -1084,6 +1096,7 @@ fn on_notice(
         }
         Notice::Name { present: false } => {
             // These registrations belong to the old bluetoothd instance.
+            live.bluez_lost = true;
             live.air.scan_result(false, Instant::now());
             live.air.registered = false;
             live.air.scan_transport = None;
@@ -1102,6 +1115,7 @@ fn on_notice(
             note_connected(live, reports, false);
         }
         Notice::Name { present: true } => {
+            live.bluez_lost = false;
             if let Ok(inventory) = bus.inventory() {
                 remember_inventory(reports, configured, live, inventory);
                 sync(reports, configured, live);
@@ -1356,6 +1370,13 @@ fn remember_inventory(
 
 fn sync(reports: &Sender<Input>, configured: Option<Address>, live: &mut Live) {
     let Some(device) = bluez::select(&live.devices, configured).cloned() else {
+        // While bluetoothd is down its whole inventory is gone; an absent
+        // accessory then says nothing about pairing. Keep the selection
+        // and let the fresh inventory on its return judge instead.
+        if live.bluez_lost {
+            note_connected(live, reports, false);
+            return;
+        }
         if let Some(address) = live.accessory.take() {
             close_control(live, reports);
             live.name.clear();
@@ -2332,6 +2353,52 @@ mod advertisement_tests {
             assert!(live.accessory.is_none());
             assert!(!live.paths.contains_key(&address));
         }
+    }
+
+    // bluetoothd crashed at 07:04:12 on the XPS and systemd restarted it.
+    // Its whole inventory vanished while it was down; the daemon read the
+    // absent accessory as a removed pairing and the panel showed its
+    // pairing screen even though BlueZ still held the bond.
+    #[test]
+    fn a_bluetoothd_outage_does_not_unpair_the_accessory() {
+        let address = Address::parse("CC:22:FE:54:DF:C7").unwrap();
+        let mut live = Live::default();
+        live.devices.push(Device {
+            path: "/org/bluez/hci0/dev_CC_22_FE_54_DF_C7".into(),
+            adapter_path: "/org/bluez/hci0".into(),
+            adapter: Some(Address::parse("A8:72:4D:0C:7C:EE").unwrap()),
+            address,
+            name: "AirPods".into(),
+            rssi: None,
+            paired: true,
+            bonded: true,
+            connected: true,
+            control: true,
+        });
+        let (tx, rx) = mpsc::channel();
+        sync(&tx, Some(address), &mut live);
+        assert_eq!(live.accessory, Some(address));
+        let _ = rx.try_iter().count();
+        // bluetoothd goes away and takes its inventory with it.
+        live.bluez_lost = true;
+        live.devices.clear();
+        sync(&tx, Some(address), &mut live);
+        sync(&tx, Some(address), &mut live);
+        assert!(
+            !rx.try_iter().any(|input| matches!(input, Input::Unpaired { .. })),
+            "an outage must not read as a removed pairing"
+        );
+        assert_eq!(live.accessory, Some(address), "the selection survives the outage");
+        // It returns without the accessory: now the absence is real.
+        live.bluez_lost = false;
+        sync(&tx, Some(address), &mut live);
+        assert_eq!(
+            rx.try_iter()
+                .filter(|input| matches!(input, Input::Unpaired { address: a } if *a == address))
+                .count(),
+            1
+        );
+        assert!(live.accessory.is_none());
     }
 
     #[test]

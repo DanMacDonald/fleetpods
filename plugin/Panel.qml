@@ -202,9 +202,6 @@ Panel {
   readonly property string localConnectionLabel: pods.view.daemonReachable ? Model.localConnectionLabel(pods.view) : ""
   readonly property var displayedSeats: root.seatPresentation.seats
   readonly property bool ownershipUnknown: root.seatPresentation.ownershipUnknown
-  // A confirmed Apple owner wins over an in-progress Omarchy click. Otherwise
-  // the claim flag keeps Omarchy in front after the iPhone has already taken the buds.
-  readonly property bool appleOwnsAudio: Model.appleOwnsAudio(pods.view)
   readonly property bool takingOmarchySeat: pods.statusLogState.taking === true
   readonly property bool linuxHeld: pods.statusLogState.linuxHeld === true
   function beginOmarchyClaim(origin) {
@@ -323,13 +320,37 @@ Panel {
     bar: root.bar
     iconComponent: Component {
       Item {
+        // The bar fits every icon's measured ink to the same size, so the buds, wide and short, read
+        // small beside the others. The bar measures the box below, `grow` times smaller than the art.
+        readonly property real grow: 1.1
         AirPodsIcon {
+          id: barPods
           anchors.centerIn: parent
           // A pair of buds is wider than it is tall, so it takes a size above the stock 12 to carry the row.
           iconSize: Style.space(13)
           color: root.barIconColor
           variant: root.podsVariant
           caseState: root.barCaseState
+          // Drawn through the copy below; the bar skips transparent items, which would measure the Shape outline too.
+          // Not `visible: false`: a hidden Shape stops drawing its layer and the copy comes out blank.
+          opacity: 0
+        }
+        ShaderEffectSource {
+          x: barPods.x
+          y: barPods.y
+          width: barPods.width
+          height: barPods.height
+          sourceItem: barPods
+          // Rendered well past the painted size, so the scale-up to the bar stays sharp.
+          textureSize: Qt.size(width * 8, height * 8)
+          mipmap: true
+        }
+        Rectangle {
+          color: "transparent"
+          width: barPods.inkBox.width / parent.grow
+          height: barPods.inkBox.height / parent.grow
+          x: barPods.x + barPods.inkBox.x + (barPods.inkBox.width - width) / 2
+          y: barPods.y + barPods.inkBox.y + (barPods.inkBox.height - height) / 2
         }
       }
     }
@@ -546,22 +567,10 @@ Panel {
             width: parent.width
             height: implicitHeight
             captionGap: Style.space(12)
-            appleDevices: root.displayedSeats.apple
-            omarchyDevices: root.displayedSeats.omarchy
-            availableApple: root.seatPresentation.availableApple
-            availableOmarchy: root.seatPresentation.availableOmarchy
-            linuxHeld: root.seatPresentation.linuxHeld
-            ownershipUnknown: root.seatPresentation.viewOwnershipUnknown
-            connectedToOmarchy: root.seatPresentation.connectedToOmarchy
+            presentation: root.seatPresentation
             // The pulse runs only while the panel is open.
             audioPlaying: root.opened && root.seatPresentation.audioPlaying
-            omarchyTransitionLabel: root.seatPresentation.omarchyTransitionLabel
-            appleTrayAvailable: root.seatPresentation.appleTrayAvailable
-            appleSeatUnknown: root.seatPresentation.appleSeatUnknown === true
-            appleTrayRemembered: root.seatPresentation.appleTrayRemembered === true
-            appleOwnsAudio: root.seatPresentation.appleOwnsAudio
-            omarchyOwnsAudio: root.seatPresentation.omarchyOwnsAudio
-            activeDeviceAddress: root.seatPresentation.audioDeviceAddress
+            localAddress: pods.view && pods.view.localAddress ? String(pods.view.localAddress) : ""
             accent: Commons.Color.accent
             foreground: root.foreground
             dim: root.dim
@@ -569,7 +578,6 @@ Panel {
             fontFamily: root.fontFamily
             podsVariant: root.podsVariant
             connectionSpinVisible: root.connectionSpinVisible
-            seatSwitching: root.seatPresentation.takingOverOmarchy === true
             connectionComplete: Model.localSeatConnected(pods.view)
             caseState: root.barCaseState
             pairingMode: pods.view.pairingMode && (!pods.view.bluetoothPaired || !pods.view.pairingKeysReady)

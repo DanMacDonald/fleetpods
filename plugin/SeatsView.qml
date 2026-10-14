@@ -6,22 +6,30 @@ import "Model.js" as Model
 Item {
   id: root
 
-  property var appleDevices: []
-  property var omarchyDevices: []
-  property var availableApple: []
-  property var availableOmarchy: []
-  property bool linuxHeld: false
-  property bool ownershipUnknown: false
-  property bool connectedToOmarchy: false
-  property bool audioPlaying: false
-  property string omarchyTransitionLabel: ""
-  property bool appleTrayAvailable: true
-  property bool appleSeatUnknown: false
-  property bool appleTrayRemembered: false
+  /// The seat presentation, owned by Model's seatPresentation: the one
+  /// input the panel forwards. Every property below binds from it; tests
+  /// and other callers may still assign the properties directly, which
+  /// simply replaces the binding for that property.
+  property var presentation
+  readonly property var presentationSeats: presentation && presentation.seats
+    ? presentation.seats : { apple: [], omarchy: [] }
+  property var appleDevices: presentationSeats.apple
+  property var omarchyDevices: presentationSeats.omarchy
+  property var availableApple: presentation ? presentation.availableApple : []
+  property var availableOmarchy: presentation ? presentation.availableOmarchy : []
+  property bool linuxHeld: presentation ? presentation.linuxHeld : false
+  property bool ownershipUnknown: presentation ? presentation.viewOwnershipUnknown : false
+  property bool connectedToOmarchy: presentation ? presentation.connectedToOmarchy : false
+  property bool audioPlaying: presentation ? presentation.audioPlaying : false
+  property string omarchyTransitionLabel: presentation ? presentation.omarchyTransitionLabel : ""
+  property bool appleTrayAvailable: presentation ? presentation.appleTrayAvailable : true
+  property bool appleSeatUnknown: presentation ? presentation.appleSeatUnknown === true : false
+  property bool appleTrayRemembered: presentation ? presentation.appleTrayRemembered === true : false
   readonly property bool rememberedAppleTray: appleSeatUnknown || appleTrayRemembered
-  property bool appleOwnsAudio: false
-  property bool omarchyOwnsAudio: false
-  property string activeDeviceAddress: ""
+  property bool appleOwnsAudio: presentation ? presentation.appleOwnsAudio : false
+  property bool omarchyOwnsAudio: presentation ? presentation.omarchyOwnsAudio : false
+  property string activeDeviceAddress: presentation ? presentation.audioDeviceAddress : ""
+  property string localAddress: ""
   property color foreground: "#e6e6e6"
   property color accent: "#7aa2f7"
   property color dim: "#888888"
@@ -41,15 +49,23 @@ Item {
     : leftBatteryLevel >= 0 || rightBatteryLevel >= 0 || caseBatteryLevel >= 0
   property bool connectionSpinVisible: false
   property bool connectionComplete: false
+  /// The one connection attempt, typed by Model: none, waiting,
+  /// connecting, reconnecting, or switching. The transition label is
+  /// display-only and never read back as state.
+  property string attemptKind: presentation && presentation.attempt ? presentation.attempt.kind : "none"
   // The connector finishes independently of the status-bar ring. A quick
   // background connection still draws the remaining wire before fading.
   property int connectorPhase: 0 // idle, drawing, completing
   property real connectorOpacity: 0
   readonly property bool connectionAnimating: connectorPhase !== 0
-  // A seat switch keeps its wire solid, with "Switching…" over the empty seat and no trace. Once an attempt
-  // is a switch it stays quiet until it ends, so the trace cannot start partway through.
-  property bool seatSwitching: false
-  property bool quietAttempt: false
+  /// The attempt is live: the trace is running, or the attempt kind says
+  /// this laptop is connecting (the labelled gap before the spin starts,
+  /// and after it ends while a seat frees up).
+  readonly property bool attemptActive: connectionAnimating
+    || attemptKind === "connecting" || attemptKind === "reconnecting"
+  // An attempt that began as a seat switch never draws a trace, even if
+  // it stops being a switch partway through.
+  property bool attemptQuiet: false
 
   property bool reconnectBusy: false
   property bool reconnectEnabled: true
@@ -60,7 +76,7 @@ Item {
   signal omarchyClicked
 
   function activateApple() {
-    if (root.rememberedAppleTray) return
+    if (root.reconnectBusy || root.rememberedAppleTray) return
     if (appleSeat.actionLabel) {
       if (appleSeat.actionEnabled) { appleSeat.holdTray(); root.reconnectClicked() }
     } else if (root.connectedToOmarchy) root.appleClicked()
@@ -141,9 +157,20 @@ Item {
     objectName: "appleSeat"
     title: "Apple"
     waitingUnconfirmed: root.rememberedAppleTray
+    // A tray Apple device can come forward by smart routing only when the
+    // seated Apple device is the idle audio owner: the routing request
+    // asks the owner to yield. A seated device that is not the owner (an
+    // Omarchy device owns instead) cannot be taken from, and a playing
+    // owner is protected, so the tray device stays dim in those states.
+    // During a reconnect either tray device might take the seat, so
+    // both draw at the active (not owner) brightness while it runs.
+    waitingLit: root.reconnectBusy || (!!occupant && occupantOnAcl && !root.audioPlaying && Model.seatDeviceLit(
+      { address: occupant.address, onAcl: occupantOnAcl }, layout, ownsAudio))
     layout: Model.appleSeat(root.appleDevices, root.availableApple, root.activeDeviceAddress,
       { busy: root.reconnectBusy, connected: root.connectedToOmarchy, enabled: root.reconnectEnabled }, root.appleTrayAvailable, root.rememberedAppleTray)
     ownsAudio: root.appleOwnsAudio
+    otherOwnsAudio: root.omarchyOwnsAudio
+    clickSuspended: root.reconnectBusy
     lineColor: root.foreground
     dimColor: root.dim
     screenFill: root.screenFill
@@ -159,10 +186,15 @@ Item {
     objectName: "omarchySeat"
     title: "Omarchy"
     statusText: root.omarchyTransitionLabel
-    switching: root.seatSwitching
+    switching: root.attemptKind === "switching"
+    connecting: root.attemptActive
     layout: Model.omarchySeat(root.omarchyDevices, root.availableOmarchy, root.activeDeviceAddress,
-      root.connectedToOmarchy, root.linuxHeld, root.ownershipUnknown)
+      root.connectedToOmarchy, root.linuxHeld, root.ownershipUnknown, root.localAddress)
     ownsAudio: root.omarchyOwnsAudio
+    otherOwnsAudio: root.appleOwnsAudio
+    reconnectSeatGuard: true
+    waitingAlwaysActive: true
+    clickSuspended: root.reconnectBusy
     lineColor: root.foreground
     dimColor: root.dim
     screenFill: root.screenFill
@@ -316,41 +348,57 @@ Item {
     }
   }
 
-  function syncConnectionProgress() {
-    if (connectionSpinVisible && (seatSwitching || quietAttempt)) {
-      quietAttempt = true
-      drawing.stop()
-      finishing.stop()
-      connectorPhase = 0
-      connectorOpacity = 0
-      connectionProgress = 0
+  // The attempt machine. One reconcile folds the attempt kind, the ring
+  // spin, and the completion fact into the trace phase:
+  // - waiting: not this laptop's attempt yet; no trace, however long the
+  //   ring spins. It plays once waiting ends.
+  // - switching from the start: quiet for the whole attempt (the wire
+  //   stays solid and the switch is drawn by the gliding devices).
+  // - switching mid-draw: the trace is not interrupted; it finishes.
+  // - connecting/reconnecting: the trace sweeps until the device lands,
+  //   even after the spin ends while a seat frees up.
+  // - complete after the spin: the remaining wire draws fast, holds,
+  //   and fades (the finishing animation), then the seat takes over.
+  function resetTrace() {
+    drawing.stop()
+    finishing.stop()
+    connectorPhase = 0
+    connectorOpacity = 0
+    connectionProgress = 0
+  }
+  function reconcileAttempt() {
+    if (attemptKind === "waiting") {
+      if (connectorPhase === 1) resetTrace()
       return
     }
-    quietAttempt = false
     if (connectionSpinVisible) {
-      if (connectorPhase === 1) return
-      finishing.stop()
-      connectorPhase = 1
-      connectorOpacity = 1
-      drawing.restart()
-    } else if (connectionComplete && connectorPhase === 1) {
+      if (attemptKind === "switching" && connectorPhase === 0) attemptQuiet = true
+      if (attemptQuiet) return
+      if (connectorPhase !== 1) {
+        finishing.stop()
+        connectorPhase = 1
+        connectorOpacity = 1
+        drawing.restart()
+      }
+      return
+    }
+    attemptQuiet = false
+    if (connectionComplete && connectorPhase === 1) {
       drawing.stop()
       connectorPhase = 2
       finishing.restart()
-    } else if (!connectionComplete) {
-      drawing.stop()
-      finishing.stop()
-      connectorPhase = 0
-      connectorOpacity = 0
-      connectionProgress = 0
+    } else if (attemptKind !== "connecting" && attemptKind !== "reconnecting"
+      && connectorPhase === 1) {
+      resetTrace()
     }
   }
-  // The ready flag and attempt flag come from different bindings. Reconcile
-  // them together rather than hiding the trace between those assignments.
-  onConnectionSpinVisibleChanged: Qt.callLater(syncConnectionProgress)
-  onConnectionCompleteChanged: Qt.callLater(syncConnectionProgress)
-  onSeatSwitchingChanged: Qt.callLater(syncConnectionProgress)
-  Component.onCompleted: syncConnectionProgress()
+  // The kind and the two event flags arrive through different bindings.
+  // Reconcile them together rather than hiding the trace between those
+  // assignments.
+  onConnectionSpinVisibleChanged: Qt.callLater(reconcileAttempt)
+  onConnectionCompleteChanged: Qt.callLater(reconcileAttempt)
+  onAttemptKindChanged: Qt.callLater(reconcileAttempt)
+  Component.onCompleted: reconcileAttempt()
 
   NumberAnimation {
     id: drawing
@@ -360,6 +408,7 @@ Item {
     to: 1
     duration: root.connectorDrawMs
     easing.type: Easing.InOutQuad
+    loops: Animation.Infinite
   }
 
   SequentialAnimation {
@@ -386,10 +435,10 @@ Item {
     readonly property real wireX: root.width / 2 - towardCenter * root.wireGap / 2
     anchors.fill: parent
     preferredRendererType: Shape.CurveRenderer
-    opacity: connecting ? 0.25 : seat.connectorConnected && !seat.drawnConnected ? 0.5 : seat.linkOpacity
+    readonly property real paintFactor: connecting ? 0.25 : seat.connectorConnected && !seat.drawnConnected ? 0.5 : seat.linkOpacity
 
     ShapePath {
-      strokeColor: root.foreground
+      strokeColor: branch.seat.paint(branch.paintFactor)
       strokeWidth: branch.solid ? 1.25 : branch.seat.linkWidth
       strokeStyle: branch.solid ? ShapePath.SolidLine : ShapePath.DashLine
       dashPattern: [3, 4]
@@ -426,7 +475,12 @@ Item {
     readonly property bool arriving: firstPerson.arriving || secondPerson.arriving
     property bool drawnConnected: false
     property bool switching: false
-    readonly property bool connectorConnected: drawnConnected || switching || (linkConnected && arriving)
+    /// A connection attempt toward this seat is in flight: the seat
+    /// reads as connecting (solid connector) rather than disconnected,
+    /// while its status label names the attempt at the dim label
+    /// treatment like "Waiting…".
+    property bool connecting: false
+    readonly property bool connectorConnected: drawnConnected || switching || connecting || (linkConnected && arriving)
     Component.onCompleted: drawnConnected = linkConnected
     function holdTray() { waitingStack.captureHold() }
     function syncDrawn() { if (linkConnected && !arriving) drawnConnected = true }
@@ -440,10 +494,33 @@ Item {
     readonly property real linkWidth: drawnConnected ? 1.25 : 1
     // Claimed audio brightens the connector at the same weight. The ellipse stays at the connected opacity.
     readonly property real ellipseOpacity: drawnConnected ? 0.3 : linkOpacity
+    /// Shapes draw opaque in a colour blended from the line colour toward
+    /// the background by the state's factor, instead of the line colour
+    /// at that opacity: overlapping translucent strokes composite into a
+    /// bright dot where they meet, while one opaque colour merges
+    /// invisibly. Over this uniform background the blended colour is
+    /// identical where strokes do not meet.
+    function paint(factor) {
+      return Qt.rgba(screenFill.r + (lineColor.r - screenFill.r) * factor,
+        screenFill.g + (lineColor.g - screenFill.g) * factor,
+        screenFill.b + (lineColor.b - screenFill.b) * factor, 1)
+    }
+    readonly property color ellipsePaint: paint(ellipseOpacity)
     readonly property real ellipseWidth: linkWidth
     property string title: ""
     property string statusText: ""
     property bool waitingUnconfirmed: false
+    /// Tray devices drawn lit (active colour) rather than dim.
+    property bool waitingLit: false
+    /// Whether the other seat currently owns the audio.
+    property bool otherOwnsAudio: false
+    /// Tray devices can always come forward (Omarchy seat): they draw at
+    /// the active brightness instead of waiting for a lit state.
+    property bool waitingAlwaysActive: false
+    /// During an Apple reconnect only this laptop may (re)enter this seat.
+    property bool reconnectSeatGuard: false
+    /// Clicks are suspended while a reconnect runs.
+    property bool clickSuspended: false
     readonly property real titleCenterX: x + width / 2
     readonly property var devices: layout.devices
     readonly property var waiting: layout.waiting
@@ -459,11 +536,90 @@ Item {
     readonly property real padY: height - titleGap - padH / 2 - padH * padFlat
     readonly property real padFlat: 0.36
     property var pairHold: ({ pair: [], emptied: false })
-    onDevicesChanged: pairHold = Model.seatPairHold(pairHold, devices, root.reconnectBusy)
+    /// The seat emptied during this reconnect (pairHold's flag is gone the
+    /// moment a device is named again, so this one sticks until the pair
+    /// reforms or the reconnect ends).
+    property bool reconnectEmptied: false
+    onDevicesChanged: {
+      pairHold = Model.seatPairHold(pairHold, devices, root.reconnectBusy)
+      if (devices.length === 2) reconnectEmptied = false
+      else if (root.reconnectBusy && pairHold.emptied) reconnectEmptied = true
+    }
+    Connections {
+      target: root
+      function onReconnectBusyChanged() { if (!root.reconnectBusy) seat.reconnectEmptied = false }
+    }
     // One binding, so a frame never pairs the new list with a stale hold and shifts the remaining laptop.
-    readonly property var seated: Model.seatedDevices(devices, pairHold, root.reconnectBusy)
-    readonly property var occupant: seated && seated.length ? seated[0] : null
-    readonly property var occupantTwo: seated && seated.length > 1 ? seated[1] : null
+    // Once the seat has emptied mid-reconnect, a remembered snapshot can
+    // name the other laptop as its occupant again. That laptop was asked
+    // to stay off, so only this laptop may take the seat from the tray;
+    // the other stays up there (the tray hold below keeps it drawn).
+    readonly property var seated: {
+      const list = Model.seatedDevices(devices, pairHold, root.reconnectBusy)
+      if (!reconnectSeatGuard || !root.reconnectBusy || !reconnectEmptied) return list
+      return list.filter(function (device) {
+        return Model.normalizeAddress(device.address || "") === Model.normalizeAddress(root.localAddress)
+      })
+    }
+    // Pair order is by arrival: when a second device joins, the newcomer
+    // takes the left slot and the device already seated slides right,
+    // whichever laptop is drawing the seat.
+    property var pairOrder: []
+    /// The seat order of the last pair, kept after the seat empties: the
+    /// tray places the risen pair on the sides they sat on.
+    property var lastPairOrder: []
+    property var previousSeatedKeys: []
+    function seatedKey(device) { return Model.normalizeAddress(device && device.address || "") }
+    onSeatedChanged: {
+      const list = seated || []
+      const keys = list.map(seatedKey)
+      if (list.length === 2) {
+        const samePair = pairOrder.length === 2
+          && pairOrder.every(function (key) { return keys.indexOf(key) >= 0 })
+        if (!samePair) {
+          const fresh = list.filter(function (device) {
+            return previousSeatedKeys.indexOf(seatedKey(device)) < 0
+          })
+          pairOrder = fresh.length === 1
+            ? [seatedKey(fresh[0]), keys.find(function (key) { return key !== seatedKey(fresh[0]) })]
+            : keys.slice()
+        }
+        if (pairOrder.length === 2) lastPairOrder = pairOrder.slice()
+      } else {
+        pairOrder = []
+        // One member of the pair is back in the seat on its own: the tray
+        // episode is over and the other re-centres to the lone left slot.
+        if (list.length === 1 && !list[0].standIn && lastPairOrder.length === 2
+          && lastPairOrder.indexOf(keys[0]) >= 0) lastPairOrder = []
+      }
+      previousSeatedKeys = keys
+    }
+    readonly property var seatedOrdered: {
+      if (!seated || seated.length !== 2 || pairOrder.length !== 2) return seated
+      const byKey = {}
+      seated.forEach(function (device) { byKey[seatedKey(device)] = device })
+      return pairOrder.map(function (key) { return byKey[key] }).filter(function (device) { return !!device })
+    }
+    readonly property var occupant: seatedOrdered && seatedOrdered.length ? seatedOrdered[0] : null
+    readonly property var occupantTwo: seatedOrdered && seatedOrdered.length > 1 ? seatedOrdered[1] : null
+    // Whoever last held this seat takes the right-hand tray slot when they
+    // leave it; devices already waiting keep the left. A lone device waits
+    // on the left.
+    property string lastOccupantAddress: ""
+    onOccupantChanged: if (occupant) lastOccupantAddress = Model.normalizeAddress(occupant.address || "")
+    // This laptop is taking the seat but has not landed yet: the seated
+    // device slides to the right slot at once, so the takeover reads as
+    // responsive and the left slot is already clear when it arrives.
+    readonly property bool pairIncoming: switching && !occupantTwo && !!occupant
+      && root.localAddress !== ""
+      && Model.normalizeAddress(occupant.address || "") !== Model.normalizeAddress(root.localAddress)
+      && (waiting || []).some(function (device) {
+        return Model.normalizeAddress(device.address || "") === Model.normalizeAddress(root.localAddress)
+      })
+    readonly property var incomingDevice: (waiting || []).filter(function (device) {
+      return Model.normalizeAddress(device.address || "") === Model.normalizeAddress(root.localAddress)
+    })[0] || null
+    readonly property string incomingLabel: incomingDevice ? String(incomingDevice.label || "") : ""
     readonly property var waiter: waiting && waiting.length ? waiting[0] : null
     readonly property string occupantLabel: occupant ? String(occupant.label) : "Empty"
     readonly property string occupantTwoLabel: occupantTwo ? String(occupantTwo.label) : ""
@@ -533,30 +689,76 @@ Item {
       }
       readonly property var shown: {
         motionHistory.departures
-        const base = Model.trayDevices(seat.waiting, motionHistory.departedAt)
-        if (!holdingTray) return base
-        const seated = {}
-        seat.devices.forEach(function (device) { seated[Model.normalizeAddress(device.address || "")] = true })
-        const extras = heldDevices.filter(function (device) {
-          const key = Model.normalizeAddress(device.address || "")
-          return !seated[key] && !base.some(function (d) { return Model.normalizeAddress(d.address || "") === key })
-        })
-        return base.concat(extras).slice(0, 2)
+        let base = Model.trayDevices(seat.waiting, motionHistory.departedAt)
+        if (holdingTray) {
+          // Keys are the drawn seat, not the raw layout: a laptop the
+          // reconnect guard keeps out of the seat stays in the tray.
+          const seated = {}
+          seat.seated.forEach(function (device) { seated[Model.normalizeAddress(device.address || "")] = true })
+          const extras = []
+          heldDevices.forEach(function (device) {
+            const key = Model.normalizeAddress(device.address || "")
+            if (!seated[key] && !base.some(function (d) { return Model.normalizeAddress(d.address || "") === key })
+              && !extras.some(function (d) { return Model.normalizeAddress(d.address || "") === key }))
+              extras.push(device)
+          })
+          base = base.concat(extras).slice(0, 2)
+        }
+        // A pair that rose from the seat keeps its seat sides in the tray,
+        // whichever of them left first: left seat to left tray, right to right.
+        if (base.length === 2 && seat.lastPairOrder.length === 2) {
+          const order = {}
+          seat.lastPairOrder.forEach(function (key, at) { order[key] = at })
+          const first = Model.normalizeAddress(base[0].address || "")
+          const second = Model.normalizeAddress(base[1].address || "")
+          if (first in order && second in order)
+            base.sort(function (a, b) {
+              return order[Model.normalizeAddress(a.address || "")]
+                - order[Model.normalizeAddress(b.address || "")]
+            })
+        }
+        return base
       }
       onShownChanged: syncDevices()
       Component.onCompleted: syncDevices()
       // Fleet refreshes update each device in place so its active glide survives.
       function syncDevices() {
-        shrank = shown.length < waitingModel.count
+        const beforeKeys = []
+        for (var b = 0; b < waitingModel.count; ++b) beforeKeys.push(waitingModel.get(b).key)
+        // While the tray is held, a device already drawn here stays unless
+        // the drawn seat takes it: an update whose waiting list empties (a
+        // snapshot naming it seated again) must not drop it from the tray.
+        const effective = shown.slice()
+        if (holdingTray) {
+          const seatedKeys = {}
+          seat.seated.forEach(function (device) {
+            seatedKeys[Model.normalizeAddress(device.address || "")] = true })
+          // The drawn seat can lag a frame behind the guard, so retention
+          // follows the guard rule itself: a non-local tray device never
+          // leaves during a reconnect, and the local one leaves only once
+          // it is drawn in the seat.
+          const guardActive = seat.reconnectSeatGuard && root.reconnectBusy
+          const localKey = Model.normalizeAddress(root.localAddress)
+          for (var r = 0; r < waitingModel.count; ++r) {
+            const item = waitingModel.get(r)
+            const retain = guardActive
+              ? item.key !== localKey || !seatedKeys[item.key]
+              : !seatedKeys[item.key]
+            if (retain && !effective.some(function (device) {
+              return Model.normalizeAddress(device.address || "") === item.key }))
+              effective.push(item.device)
+          }
+        }
+        shrank = effective.length < waitingModel.count
         for (var i = waitingModel.count - 1; i >= 0; --i) {
           var key = waitingModel.get(i).key
-          if (!shown.some(function (device) { return Model.normalizeAddress(device.address || "") === key })) {
+          if (!effective.some(function (device) { return Model.normalizeAddress(device.address || "") === key })) {
             waitingDevices.itemAt(i).recordPlacement()
             waitingModel.remove(i)
           }
         }
-        for (var at = 0; at < shown.length; ++at) {
-          var device = shown[at]
+        for (var at = 0; at < effective.length; ++at) {
+          var device = effective[at]
           var key = Model.normalizeAddress(device.address || "")
           var found = -1
           for (var j = at; j < waitingModel.count; ++j)
@@ -565,6 +767,22 @@ Item {
           else {
             if (found !== at) waitingModel.move(found, at, 1)
             waitingModel.setProperty(at, "device", device)
+          }
+        }
+        // A device displaced from the seat joins the right of a tray that
+        // already has devices waiting; a pair rising together into an
+        // empty tray (Reconnect) keeps its seat order instead.
+        const last = seat.lastOccupantAddress
+        const risenPair = seat.lastPairOrder.length === 2 && waitingModel.count === 2
+          && seat.lastPairOrder.indexOf(waitingModel.get(0).key) >= 0
+          && seat.lastPairOrder.indexOf(waitingModel.get(1).key) >= 0
+        if (!risenPair && last !== "" && beforeKeys.length > 0 && beforeKeys.indexOf(last) < 0
+          && last !== Model.normalizeAddress(seat.occupant && seat.occupant.address || "")) {
+          for (var m = 0; m < waitingModel.count; ++m) {
+            if (waitingModel.get(m).key === last && m < waitingModel.count - 1) {
+              waitingModel.move(m, waitingModel.count - 1, 1)
+              break
+            }
           }
         }
       }
@@ -633,7 +851,13 @@ Item {
           function recordPlacement() { motion.capture() }
           objectName: "waiting" + seat.title + index
           width: Math.max(iconSpan, labelSpan, enrollButton.visible ? enrollButton.width : 0)
-          x: index * (waitingStack.slotWidth + seat.labelGutter) + (waitingStack.slotWidth - width) / 2
+          // A lone riser that sat on the right of a pair waits on the right
+          // of the tray, so it rises on its own side while its partner is
+          // still seated; the pair order above keeps it there when the
+          // partner joins it.
+          readonly property int slotIndex: waitingModel.count === 1 && seat.lastPairOrder.length === 2
+            && seat.lastPairOrder[1] === key ? 1 : index
+          x: slotIndex * (waitingStack.slotWidth + seat.labelGutter) + (waitingStack.slotWidth - width) / 2
           onXChanged: motion.relayout(x)
           spacing: 6
 
@@ -647,6 +871,7 @@ Item {
               scale: waitingStack.iconScale * motion.iconGrow
               transformOrigin: Item.Bottom
               phone: waitingDevice.phone
+              level: seat.waitingLit || seat.waitingAlwaysActive ? 1 : 0
               lineColor: seat.lineColor
               screenFill: seat.screenFill
             }
@@ -711,7 +936,6 @@ Item {
       width: seat.padW
       height: seat.padH
       preferredRendererType: Shape.CurveRenderer
-      opacity: seat.ellipseOpacity
 
       ShapePath {
         strokeColor: "transparent"
@@ -725,11 +949,13 @@ Item {
           sweepAngle: 360
         }
       }
-      // A connected pair leaves the arc between its two connectors' inner edges undrawn, with flat ends at those edges.
+      // A connected pair leaves the arc between its two connectors' inner
+      // edges undrawn, with flat ends at those edges; any other seat's
+      // ellipse stays closed, and its join lands flush on it instead.
       ShapePath {
-        strokeColor: seat.lineColor
+        strokeColor: seat.ellipsePaint
         strokeWidth: seat.ellipseWidth
-        strokeStyle: seat.drawnConnected ? ShapePath.SolidLine : ShapePath.DashLine
+        strokeStyle: seat.connectorConnected ? ShapePath.SolidLine : ShapePath.DashLine
         dashPattern: [3, 4]
         capStyle: seat.pairGapDegrees > 0 ? ShapePath.FlatCap : ShapePath.RoundCap
         fillColor: "transparent"
@@ -760,12 +986,12 @@ Item {
       z: 1
       width: seat.linkWidth
       x: (seat.width - width) / 2 + (seat.occupantTwo ? seat.joinSide * seat.pairJoinOffset : 0)
-      // Lit, it reaches the stroke's top edge to square the corner where the glow turns. Dim, it stops at the
-      // stroke's outer edge, since two overlapping translucent strokes draw a bright dot.
-      y: seat.linkState === "claimed" ? seat.ellipseBottom - glow.stroke / 2 : seat.ellipseBottom + seat.ellipseWidth / 2
+      // It lands flush on the stroke's outer edge (the glow stroke's when
+      // lit): landing there shares an edge without overlapping it, while
+      // running into the stroke composites a bright dot where they join.
+      y: seat.linkState === "claimed" ? seat.ellipseBottom + glow.stroke / 2 : seat.ellipseBottom + seat.ellipseWidth / 2
       height: seat.titleTop - y
-      color: seat.lineColor
-      opacity: seat.linkState === "claimed" ? seat.linkOpacity : seat.ellipseOpacity
+      color: seat.linkState === "claimed" ? seat.lineColor : seat.ellipsePaint
     }
     // The other device in a pair is connected too, so its connector is as bright as the glowing device's.
     Rectangle {
@@ -774,10 +1000,9 @@ Item {
       z: 1
       width: seat.linkWidth
       x: (seat.width - width) / 2 - seat.joinSide * seat.pairJoinOffset
-      y: seat.linkState === "claimed" ? seat.ellipseBottom - glow.stroke / 2 : seat.ellipseBottom + seat.ellipseWidth / 2
+      y: seat.linkState === "claimed" ? seat.ellipseBottom + glow.stroke / 2 : seat.ellipseBottom + seat.ellipseWidth / 2
       height: seat.titleTop - y
-      color: seat.lineColor
-      opacity: seat.linkState === "claimed" ? seat.linkOpacity : seat.ellipseOpacity
+      color: seat.linkState === "claimed" ? seat.lineColor : seat.ellipsePaint
     }
     // A disconnected seat ties its label to its ellipse with a dashed line, like the ellipse and its wire.
     Shape {
@@ -788,12 +1013,12 @@ Item {
       z: 1
       anchors.fill: parent
       preferredRendererType: Shape.CurveRenderer
-      opacity: seat.ellipseOpacity
       ShapePath {
-        strokeColor: seat.lineColor
+        strokeColor: seat.ellipsePaint
         strokeWidth: seat.linkWidth
         strokeStyle: ShapePath.DashLine
         dashPattern: [3, 4]
+        capStyle: ShapePath.FlatCap
         fillColor: "transparent"
         startX: seat.width / 2
         startY: seat.ellipseBottom + seat.ellipseWidth / 2
@@ -863,7 +1088,7 @@ Item {
     Item {
       id: iconStack
       // A pair mirrors the ellipse center. Labels keep a gutter between them.
-      readonly property real centerDistance: !seat.occupantTwo ? 0 : Math.max(
+      readonly property real centerDistance: !(seat.occupantTwo || seat.pairIncoming) ? 0 : Math.max(
         seat.pairGap + firstPerson.iconWidth / 2 + secondPerson.iconWidth / 2,
         seat.labelGutter + firstPerson.labelWidth / 2 + secondPerson.labelWidth / 2)
       z: 8
@@ -876,7 +1101,9 @@ Item {
         id: firstPerson
         x: seat.occupantTwo
           ? parent.width / 2 - iconStack.centerDistance / 2 - iconWidth / 2
-          : (parent.width - iconWidth) / 2
+          : seat.pairIncoming
+            ? parent.width / 2 + iconStack.centerDistance / 2 - iconWidth / 2
+            : (parent.width - iconWidth) / 2
         channel: seat
         visible: !!seat.occupant && !seat.occupant.standIn
         label: seat.occupantLabel
@@ -890,7 +1117,9 @@ Item {
         x: parent.width / 2 + iconStack.centerDistance / 2 - iconWidth / 2
         channel: seat
         visible: !!seat.occupantTwo && !seat.occupantTwo.standIn
-        label: seat.occupantTwoLabel
+        // While a pair is incoming, the phantom slot carries the arriving
+        // device's label so the pair spacing already matches the formed pair.
+        label: seat.occupantTwo ? seat.occupantTwoLabel : seat.incomingLabel
         phone: seat.occupantTwoPhone
         onAcl: seat.occupantTwoOnAcl
         deviceIndex: 1
@@ -905,7 +1134,11 @@ Item {
       anchors.horizontalCenter: parent.horizontalCenter
       y: seat.ellipseCenter - height / 2
       text: seat.actionLabel
-      color: seat.actionLabel && seat.actionEnabled ? seat.lineColor : seat.dimColor
+      // An in-progress label ("Reconnecting…") draws like the status label
+      // ("Waiting…"): the seat colour at ellipse opacity. A clickable
+      // action ("Reconnect") stays full brightness.
+      color: seat.lineColor
+      opacity: seat.actionEnabled ? 1 : seat.ellipseOpacity
       font.family: seat.fontFamily
       font.pixelSize: 12
     }
@@ -956,9 +1189,10 @@ Item {
     }
 
     MouseArea {
+      objectName: "seatClick" + seat.title
       z: 10
       anchors.fill: parent
-      enabled: !seat.actionLabel || seat.actionEnabled
+      enabled: !seat.clickSuspended && (!seat.actionLabel || seat.actionEnabled)
       preventStealing: true
       cursorShape: Qt.PointingHandCursor
       onClicked: seat.clicked()
@@ -1103,7 +1337,10 @@ Item {
     property int deviceIndex
     property string address
     readonly property real iconWidth: device.width
-    readonly property bool lit: device.selected
+    // The ellipse glow follows the audio holder only; a seated device can
+    // draw brighter than that (below) without claiming the glow.
+    readonly property bool lit: Model.seatDeviceLit({ address: person.address, onAcl: person.onAcl },
+      person.channel.layout, person.channel.ownsAudio)
     readonly property real labelWidth: name.implicitWidth
     readonly property real labelGap: person.channel.padH * person.channel.padFlat
       - person.channel.iconOverlap - name.implicitHeight / 2
@@ -1122,7 +1359,7 @@ Item {
       labelItem: name
       address: person.shown
       seated: true
-      shouldRecenter: function () { return !person.channel.occupantTwo }
+      shouldRecenter: function () { return !person.channel.occupantTwo && !person.channel.pairIncoming }
     }
     width: iconWidth
     height: iconSlot.height + labelGap + name.implicitHeight
@@ -1134,8 +1371,11 @@ Item {
       DeviceIcon {
         id: device
         objectName: "device" + person.channel.title + person.deviceIndex
-        selected: Model.seatDeviceLit({ address: person.address, onAcl: person.onAcl }, person.channel.layout,
-          person.channel.ownsAudio)
+        // Brightness tiers: off the link dim, seated without ownership
+        // active, seated with ownership full.
+        level: !person.onAcl ? 0
+          : Model.seatDeviceLit({ address: person.address, onAcl: person.onAcl }, person.channel.layout,
+            person.channel.ownsAudio) ? 2 : 1
         playing: root.audioPlaying
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
@@ -1154,8 +1394,8 @@ Item {
       anchors.topMargin: person.labelGap
       text: person.label
       color: person.onAcl ? person.channel.ink : person.channel.dimColor
-      // Matches the unselected icon, which draws at half opacity.
-      opacity: person.onAcl && !device.selected ? 0.5 : 1
+      // Label shade follows the icon tier.
+      opacity: person.onAcl ? (device.level >= 2 ? 1 : device.level === 1 ? 0.75 : 0.5) : 1
       font.family: person.channel.fontFamily
       font.pixelSize: root.seatedLabelPx
       scale: motion.labelGrow

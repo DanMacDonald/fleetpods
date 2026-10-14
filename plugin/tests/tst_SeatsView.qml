@@ -62,10 +62,10 @@ TestCase {
   // 2026-10-12: taking the seat from the Gram drew a trace to the label, then the seat dropped to dashed while the XPS
   // glided in. Switching keeps the connector solid without replaying a connection trace.
   function test_aSeatSwitchDrawsNoTrace() {
-    var item = createTemporaryObject(view, this, { seatSwitching: true, connectionSpinVisible: true })
+    var item = createTemporaryObject(view, this, { attemptKind: "switching", connectionSpinVisible: true })
     wait(200)
     verify(!item.connectionAnimating, "no trace while switching")
-    item.seatSwitching = false
+    item.attemptKind = "none"
     wait(200)
     verify(!item.connectionAnimating, "the trace does not start partway through the switch")
     item.connectionComplete = true
@@ -78,6 +78,115 @@ TestCase {
     verify(item.connectionAnimating, "the next ordinary attempt draws its trace")
   }
 
+  // 2026-10-14: a switch that starts while the trace is already drawing
+  // (Gram activity lands mid-reconnect) must not interrupt it: the trace
+  // finishes to the label and the connected state takes over, instead of
+  // the seat flashing its disconnected state in between.
+  function test_aSwitchStartingMidTraceLetsItFinish() {
+    var item = createTemporaryObject(view, this, { connectionSpinVisible: true })
+    wait(80)
+    verify(item.connectionAnimating, "trace is drawing")
+    var progress = item.connectionProgress
+    verify(progress > 0, "trace has started along the wire")
+    item.attemptKind = "switching"
+    wait(150)
+    verify(item.connectionAnimating, "the switch does not interrupt the trace")
+    verify(item.connectionProgress > progress, "the trace keeps drawing")
+    item.connectionComplete = true
+    item.connectionSpinVisible = false
+    item.attemptKind = "none"
+    tryCompare(item, "connectionProgress", 1, 650)
+    tryCompare(item, "connectionAnimating", false, 900)
+  }
+
+  // 2026-10-14: while the connection trace animates toward the Omarchy
+  // seat (this laptop connecting while two Apple devices hold the pods),
+  // the seat must not flash its disconnected look: no dashed join, and
+  // "Connecting…" shows inside it at the dim label treatment.
+  function test_connectingTraceKeepsOmarchySeatOutOfDisconnectedState() {
+    var item = createTemporaryObject(view, this, {
+      connectionSpinVisible: true, attemptKind: "connecting", omarchyTransitionLabel: "Connecting…"
+    })
+    wait(150)
+    verify(item.connectionAnimating, "trace is drawing")
+    var seat = findChild(item, "omarchySeat")
+    verify(seat.connectorConnected, "seat reads as connecting while the trace runs")
+    verify(!findChild(item, "seatJoinDashedOmarchy").visible, "no dashed join during the trace")
+    verify(findChild(item, "seatJoinOmarchy").visible, "solid join during the trace")
+    // "Connecting…" names the attempt inside the seat at the dim label
+    // treatment (seat colour at ellipse opacity), like "Waiting…".
+    var status = findChild(item, "seatStatusOmarchy")
+    tryCompare(status, "opacity", seat.ellipseOpacity, 1000, "Connecting… shows dim while the line animates")
+    compare(status.text, "Connecting…")
+    // The spin ends but the attempt is still in flight (the label still
+    // reports it): the trace keeps sweeping and the seat stays out of
+    // its disconnected state, rather than standing still like a switch.
+    item.connectionSpinVisible = false
+    wait(100)
+    verify(item.connectionAnimating, "trace keeps animating while the attempt runs")
+    verify(seat.connectorConnected, "seat stays connecting while the attempt runs")
+    verify(!findChild(item, "seatJoinDashedOmarchy").visible, "still no dashed join")
+    fuzzyCompare(findChild(item, "seatStatusOmarchy").opacity, seat.ellipseOpacity, 0.01, "label stays dim")
+    // The attempt ends without connecting: the trace stops and the
+    // disconnected look returns.
+    item.attemptKind = "none"
+    item.omarchyTransitionLabel = ""
+    tryCompare(item, "connectionAnimating", false, 1000)
+    verify(!seat.connectorConnected, "attempt over")
+    verify(findChild(item, "seatJoinDashedOmarchy").visible, "disconnected look returns after a failed attempt")
+  }
+
+  // 2026-10-14: clicking Reconnect on the Apple seat makes the bar ring
+  // spin right away, but the Omarchy seat is only "Waiting…" for the
+  // Apple device: the trace must not play (or loop) there. It starts
+  // when waiting ends and this laptop actually attempts, and stops if
+  // waiting resumes mid-draw.
+  function test_traceWaitsUntilTheAttemptStarts() {
+    var item = createTemporaryObject(view, this, {
+      connectionSpinVisible: true, attemptKind: "waiting", omarchyTransitionLabel: "Waiting…"
+    })
+    wait(250)
+    verify(!item.connectionAnimating, "no trace while waiting for the Apple device")
+    item.attemptKind = "connecting"
+    item.omarchyTransitionLabel = "Connecting…"
+    wait(150)
+    verify(item.connectionAnimating, "trace starts when the attempt does")
+    item.attemptKind = "waiting"
+    item.omarchyTransitionLabel = "Waiting…"
+    tryCompare(item, "connectionAnimating", false, 1000)
+  }
+
+  // Candidate 6: the panel forwards one presentation; every seat fact
+  // binds from it, and a new presentation moves them together.
+  function test_presentationDrivesTheSeatAsOneInput() {
+    var phone = { address: "02:00:00:00:00:05", label: "iPhone", kind: "apple", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      presentation: {
+        seats: { apple: [phone], omarchy: [] }, availableApple: [], availableOmarchy: [],
+        linuxHeld: false, viewOwnershipUnknown: false, connectedToOmarchy: false,
+        audioPlaying: false, omarchyTransitionLabel: "", appleTrayAvailable: false,
+        appleSeatUnknown: false, appleTrayRemembered: false,
+        appleOwnsAudio: true, omarchyOwnsAudio: false, audioDeviceAddress: phone.address,
+        attempt: { kind: "none", label: "" }
+      }
+    })
+    wait(200)
+    compare(findChild(item, "appleSeat").occupantLabel, "iPhone")
+    verify(findChild(item, "appleSeat").ownsAudio)
+    item.presentation = {
+      seats: { apple: [], omarchy: [] }, availableApple: [], availableOmarchy: [],
+      linuxHeld: false, viewOwnershipUnknown: false, connectedToOmarchy: false,
+      audioPlaying: false, omarchyTransitionLabel: "Waiting…", appleTrayAvailable: false,
+      appleSeatUnknown: false, appleTrayRemembered: false,
+      appleOwnsAudio: false, omarchyOwnsAudio: false, audioDeviceAddress: "",
+      attempt: { kind: "waiting", label: "Waiting…" }
+    }
+    wait(100)
+    compare(item.attemptKind, "waiting")
+    compare(item.omarchyTransitionLabel, "Waiting…")
+    verify(!findChild(item, "appleSeat").ownsAudio)
+  }
+
   function test_handoffKeepsConnectorSolidUntilArrivalOrFailure() {
     var gram = { address: "02:00:00:00:00:01", label: "Gram", onAcl: true }
     var xps = { address: "02:00:00:00:00:02", label: "XPS", onAcl: true }
@@ -87,7 +196,7 @@ TestCase {
     var wire = findChild(item, "omarchyLink")
     var dashedJoin = findChild(item, "seatJoinDashedOmarchy")
     verify(wire.solid)
-    item.seatSwitching = true
+    item.attemptKind = "switching"
     item.omarchyDevices = []
     item.availableOmarchy = [gram, xps]
     item.connectedToOmarchy = false
@@ -98,18 +207,18 @@ TestCase {
     item.availableOmarchy = [gram]
     item.connectedToOmarchy = true
     wait(50)
-    item.seatSwitching = false
+    item.attemptKind = "none"
     for (var elapsed = 0; elapsed < 600; elapsed += 50) {
       wait(50)
       verify(wire.solid, "arrival does not interrupt the connector")
     }
-    item.seatSwitching = true
+    item.attemptKind = "switching"
     item.omarchyDevices = []
     item.availableOmarchy = [gram, xps]
     item.connectedToOmarchy = false
     wait(50)
     verify(wire.solid)
-    item.seatSwitching = false
+    item.attemptKind = "none"
     wait(50)
     verify(!wire.solid, "a failed or abandoned switch is disconnected")
     verify(dashedJoin.visible)
@@ -180,14 +289,21 @@ TestCase {
     var p = findChild(item, "deviceApple0")
     verify(!a.selected)
     verify(b.selected)
+    // Three brightness tiers: the non-owner seated devices draw at the
+    // middle (active) level, the owner at full; the glow stays owner-only.
+    compare(a.level, 1)
+    compare(b.level, 2)
+    compare(p.level, 1)
     verify(!p.selected)
     var aName = findChild(item, "nameOmarchy0")
     var bName = findChild(item, "nameOmarchy1")
-    compare(aName.opacity, 0.5)
+    compare(aName.opacity, 0.75)
     compare(bName.opacity, 1)
     var aOutline = findChild(a, "outline")
     compare(aOutline.opacity, 1)
-    verify(Qt.colorEqual(aOutline.color, "#808082"))
+    verify(Math.abs(aOutline.color.r * 255 - 0x9f) < 1.5
+      && Math.abs(aOutline.color.g * 255 - 0x9f) < 1.5
+      && Math.abs(aOutline.color.b * 255 - 0xa0) < 1.5, "mid tier tint, got " + aOutline.color)
     verify(Qt.colorEqual(findChild(b, "outline").color, "#e6e6e6"))
     item.activeDeviceAddress = first.address
     verify(a.selected)
@@ -616,6 +732,248 @@ TestCase {
     verify(item.availableOmarchy.some(function (d) { return d.address === gram }))
   }
 
+  function test_seatedGramSlidesToPairSlotWhenXpsJoins() {
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
+      localAddress: xps.address
+    })
+    wait(700)
+    var soloIcon = findChild(item, "deviceOmarchy0")
+    var solo = soloIcon.mapToItem(item, soloIcon.width / 2, soloIcon.height / 2)
+    item.omarchyDevices = [gram, xps]
+    wait(120)
+    var xpsIcon = findChild(item, "deviceOmarchy0")
+    var gramIcon = findChild(item, "deviceOmarchy1")
+    verify(xpsIcon !== gramIcon)
+    verify(xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2).x < solo.x,
+      "the XPS descends into the left slot")
+    verify(gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2).x > solo.x + 2,
+      "the Gram slides right to its pair slot")
+    wait(800)
+    verify(gramIcon.mapToItem(item, gramIcon.width / 2, 0).x
+      > xpsIcon.mapToItem(item, xpsIcon.width / 2, 0).x, "XPS holds the left slot, Gram the right")
+  }
+
+  // The seated Gram starts sliding right as soon as the XPS begins taking
+  // the seat, before the XPS has landed.
+  function test_seatedGramSlidesRightAsSoonAsXpsTakesOver() {
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps" }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [xps],
+      localAddress: xps.address
+    })
+    wait(700)
+    var soloIcon = findChild(item, "deviceOmarchy0")
+    var solo = soloIcon.mapToItem(item, soloIcon.width / 2, soloIcon.height / 2)
+    item.attemptKind = "switching"
+    wait(200)
+    var moved = findChild(item, "deviceOmarchy0")
+    verify(moved.mapToItem(item, moved.width / 2, moved.height / 2).x > solo.x + 5,
+      "the Gram slides right at once, before the XPS lands")
+    verify(findChild(item, "waitingOmarchy0"), "the XPS is still in the tray")
+  }
+
+  function test_joiningGramTakesLeftSeatAndXpsSlidesRight() {
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram" }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [gram],
+      localAddress: xps.address
+    })
+    wait(700)
+    var soloIcon = findChild(item, "deviceOmarchy0")
+    var solo = soloIcon.mapToItem(item, soloIcon.width / 2, soloIcon.height / 2)
+    item.omarchyDevices = [xps, Object.assign({}, gram, { onAcl: true })]
+    item.availableOmarchy = []
+    wait(120)
+    var gramIcon = findChild(item, "deviceOmarchy0")
+    var xpsIcon = findChild(item, "deviceOmarchy1")
+    verify(gramIcon !== xpsIcon)
+    var gramMid = gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2)
+    var xpsMid = xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2)
+    verify(gramMid.x < solo.x, "Gram descends into the left slot")
+    verify(xpsMid.x > solo.x + 2, "XPS is sliding right: solo=" + solo.x + " mid=" + xpsMid.x)
+    fuzzyCompare(xpsMid.y, solo.y, 1)
+    wait(800)
+    var gramSettled = gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2)
+    var xpsSettled = xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2)
+    verify(gramSettled.x < xpsSettled.x, "Gram holds the left slot, XPS the right")
+    fuzzyCompare(gramSettled.y, solo.y, 1)
+    fuzzyCompare(xpsSettled.y, solo.y, 1)
+  }
+
+  // 2026-10-13: on Reconnect both Omarchy occupants rise together and
+  // keep their seat order in the tray: left seat to left tray, right seat
+  // to right tray. The displaced-device-goes-right rule must not mirror them.
+  function test_reconnectPairRisesKeepingSeatOrder() {
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [xps, gram], availableOmarchy: [],
+      localAddress: xps.address
+    })
+    wait(800)
+    item.reconnectBusy = true
+    item.omarchyDevices = []
+    item.availableOmarchy = [Object.assign({}, xps, { onAcl: false }), Object.assign({}, gram, { onAcl: false })]
+    wait(60)
+    compare(findChild(item, "waitingOmarchy0").device.label, "omarchy-xps")
+    compare(findChild(item, "waitingOmarchy1").device.label, "lg-gram")
+    wait(900)
+    compare(findChild(item, "waitingOmarchy0").device.label, "omarchy-xps")
+    compare(findChild(item, "waitingOmarchy1").device.label, "lg-gram")
+    var left = findChild(item, "waitingOmarchy0"), right = findChild(item, "waitingOmarchy1")
+    verify(left.mapToItem(item, 0, 0).x < right.mapToItem(item, 0, 0).x)
+  }
+
+  // 2026-10-13: after a Reconnect the pair sits in the tray with the Gram
+  // on the left and the XPS on the right. The XPS then takes the seat
+  // alone: it must glide from the right tray slot down to the middle of
+  // the seat, and the Gram must stay in the tray throughout.
+  function test_xpsReturnsAloneToSeatCenterFromRightTraySlot() {
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [],
+      localAddress: xps.address
+    })
+    wait(700)
+    item.omarchyDevices = [xps, gram]
+    wait(800)
+    item.reconnectBusy = true
+    item.omarchyDevices = []
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false }),
+      Object.assign({}, xps, { onAcl: false })]
+    wait(900)
+    compare(findChild(item, "waitingOmarchy0").device.label, "lg-gram")
+    compare(findChild(item, "waitingOmarchy1").device.label, "omarchy-xps")
+    item.omarchyDevices = [xps]
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false })]
+    wait(60)
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupantLabel, "omarchy-xps")
+    var seated = findChild(item, "deviceOmarchy0").parent.parent
+    verify(seated.glideY < -5, "XPS descends from the tray, glideY=" + seated.glideY)
+    verify(seated.glideX > 5, "XPS comes from the right tray slot, glideX=" + seated.glideX)
+    compare(findChild(item, "waitingOmarchy0").device.label, "lg-gram")
+    tryCompare(seated, "glideY", 0, 1500)
+    tryCompare(seated, "glideX", 0, 1500)
+    var center = seat.mapToItem(item, seat.width / 2, 0).x
+    var icon = findChild(item, "deviceOmarchy0")
+    fuzzyCompare(icon.mapToItem(item, icon.width / 2, 0).x, center, 2)
+    compare(findChild(item, "waitingOmarchy0").device.label, "lg-gram")
+  }
+
+  // 2026-10-13: the pair rises one at a time on Reconnect, the Gram first.
+  // Each laptop rises to the tray side it already sat on: the right-hand
+  // occupant waits on the right even while it is alone in the tray, and
+  // the left-hand one joins it on the left.
+  function test_pairRisesToTheTraySidesTheySatOn() {
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
+      localAddress: xps.address
+    })
+    wait(700)
+    item.omarchyDevices = [gram, xps]
+    wait(800)
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupantLabel, "omarchy-xps")
+    compare(seat.occupantTwoLabel, "lg-gram")
+    item.reconnectBusy = true
+    item.omarchyDevices = [xps]
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false })]
+    wait(900)
+    var trayCenter = seat.mapToItem(item, seat.width / 2, 0).x
+    var gramTray = findChild(item, "waitingOmarchy0")
+    verify(gramTray.mapToItem(item, gramTray.width / 2, 0).x > trayCenter,
+      "the Gram rises to the right tray slot, not the left")
+    item.omarchyDevices = []
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false }),
+      Object.assign({}, xps, { onAcl: false })]
+    wait(900)
+    compare(findChild(item, "waitingOmarchy0").device.label, "omarchy-xps")
+    compare(findChild(item, "waitingOmarchy1").device.label, "lg-gram")
+    var left = findChild(item, "waitingOmarchy0"), right = findChild(item, "waitingOmarchy1")
+    verify(left.mapToItem(item, left.width / 2, 0).x < trayCenter)
+    verify(right.mapToItem(item, right.width / 2, 0).x > trayCenter)
+    item.reconnectBusy = false
+  }
+
+  // 2026-10-13: once the XPS has returned to the seat after a Reconnect,
+  // the Gram is alone in the tray and slides to the left slot.
+  function test_gramSlidesLeftWhenXpsReturnsAfterReconnect() {
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
+      localAddress: xps.address
+    })
+    wait(700)
+    item.omarchyDevices = [gram, xps]
+    wait(800)
+    item.reconnectBusy = true
+    item.omarchyDevices = [xps]
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false })]
+    wait(900)
+    item.omarchyDevices = []
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false }),
+      Object.assign({}, xps, { onAcl: false })]
+    wait(900)
+    item.omarchyDevices = [xps]
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false })]
+    item.reconnectBusy = false
+    wait(200)
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupantLabel, "omarchy-xps")
+    var trayCenter = seat.mapToItem(item, seat.width / 2, 0).x
+    var gramTray = findChild(item, "waitingOmarchy0")
+    compare(gramTray.device.label, "lg-gram")
+    tryVerify(function () {
+      return gramTray.mapToItem(item, gramTray.width / 2, 0).x < trayCenter
+    }, 3000)
+  }
+
+  // 2026-10-13: mid-reconnect, after both laptops have risen to the tray,
+  // a remembered snapshot can name the Gram as the seat's occupant again.
+  // It was asked to stay off: it must stay in the tray, not glide down and
+  // back up before the XPS lands.
+  function test_snapshotDoesNotReseatGramDuringReconnect() {
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [],
+      localAddress: xps.address
+    })
+    wait(700)
+    item.omarchyDevices = [xps, gram]
+    wait(800)
+    item.reconnectBusy = true
+    item.omarchyDevices = []
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false }),
+      Object.assign({}, xps, { onAcl: false })]
+    wait(900)
+    compare(findChild(item, "waitingOmarchy0").device.label, "lg-gram")
+    item.omarchyDevices = [Object.assign({}, gram, { onAcl: true })]
+    item.availableOmarchy = []
+    wait(300)
+    compare(findChild(item, "waitingOmarchy0").device.label, "lg-gram")
+    fuzzyCompare(findChild(item, "waitingOmarchy0").glideY, 0, 1)
+    verify(!findChild(item, "deviceOmarchy0").parent.parent.visible,
+      "the snapshot does not draw the Gram in the seat")
+    item.omarchyDevices = [xps]
+    item.availableOmarchy = [Object.assign({}, gram, { onAcl: false })]
+    wait(60)
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupantLabel, "omarchy-xps")
+    compare(findChild(item, "waitingOmarchy0").device.label, "lg-gram")
+    item.reconnectBusy = false
+  }
+
   function test_fleetRefreshKeepsTheTrayRiseInProgress() {
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps" }
@@ -946,7 +1304,10 @@ TestCase {
     var glow = findChild(item, "seatGlowApple")
     verify(join.visible && glow.visible)
     verify(!findChild(item, "seatJoinOmarchy").visible && !findChild(item, "seatGlowOmarchy").visible)
-    fuzzyCompare(join.joinTop, seat.ellipseBottom - glow.stroke / 2, 0.01)
+    // The lit join lands flush on the glow stroke's outer edge: reaching
+    // into it overlapped the translucent strokes into a bright dot, and
+    // stopping short left a visible gap.
+    fuzzyCompare(join.joinTop, seat.ellipseBottom + glow.stroke / 2, 0.01)
     compare(Math.round(join.joinBottom), Math.round(seat.titleTop))
     var context = glow.getContext("2d")
     var rx = seat.ellipseRadiusX, ry = seat.padH * seat.padFlat, cx = glow.width / 2, cy = glow.height / 2
@@ -967,8 +1328,12 @@ TestCase {
     // 2026-10-05: the background connection still reaches its ellipse, drawn as dim as the ellipse itself.
     item.appleOwnsAudio = false
     verify(join.visible && !glow.visible)
-    compare(join.opacity, seat.ellipseOpacity)
-    // Two translucent strokes overlapping drew a bright dot, so the dim connector stops at the ellipse stroke's edge.
+    // The join draws opaque in the pre-blended ellipse colour, not the
+    // line colour at ellipse opacity, so strokes meeting cannot
+    // composite into a brighter dot.
+    compare(join.opacity, 1)
+    verify(Qt.colorEqual(join.color, seat.ellipsePaint))
+    // Two translucent strokes overlapping drew a bright dot, so the dim connector lands flush on the ellipse stroke's edge.
     fuzzyCompare(join.joinTop, seat.ellipseBottom + seat.ellipseWidth / 2, 0.01)
     item.appleOwnsAudio = true
     verify(join.visible && glow.visible)
@@ -979,8 +1344,19 @@ TestCase {
     verify(!join.visible && !glow.visible)
     // 2026-10-05: a disconnected seat still ties its label to its ellipse, dashed like both of them.
     verify(dashed.visible)
-    compare(dashed.opacity, seat.ellipseOpacity)
+    compare(dashed.opacity, 1)
+    var dashedPath = null
+    for (var child = 0; child < dashed.data.length; ++child)
+      if (dashed.data[child].hasOwnProperty("strokeColor")) dashedPath = dashed.data[child]
+    verify(dashedPath && Qt.colorEqual(dashedPath.strokeColor, seat.ellipsePaint))
+    compare(seat.ellipsePaint.a, 1)
+    // The dashed join lands flush on the ellipse stroke's edge too; its
+    // flat cap keeps the first dash from extending into the stroke.
     fuzzyCompare(dashed.joinTop, seat.ellipseBottom + seat.ellipseWidth / 2, 0.01)
+    // A lone seat's ellipse stays closed; only a seated pair opens a
+    // gap in it. The join landing flush is what prevents the dot.
+    var arc = findChild(item, "seatOutlineApple")
+    compare(arc.sweepAngle, 360)
     fuzzyCompare(dashed.joinBottom, seat.titleTop, 0.01)
   }
 
@@ -1351,6 +1727,124 @@ TestCase {
     fuzzyCompare(centerOf(findChild(item, "waitingApple0")), macCenter, 1)
   }
 
+  // 2026-10-14: a tray Apple device can come forward only when the seated
+  // Apple device is the idle audio owner: smart routing asks the owner to
+  // yield, so a seated device that is not the owner (an Omarchy device
+  // owns instead) cannot be taken from, and a playing owner is protected.
+  function test_waitingMacLightsOnlyWhileSeatedPhoneIsNotPlaying() {
+    var phone = { address: "02:00:00:00:00:05", label: "iPhone", kind: "apple", onAcl: true }
+    var mac = { address: "02:00:00:00:00:06", label: "MacBook Pro", kind: "apple" }
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [phone], availableApple: [mac],
+      omarchyDevices: [gram], connectedToOmarchy: true, linuxHeld: true
+    })
+    function iconOf(delegate) {
+      var found = null
+      function walk(node) {
+        if (!node || found) return
+        if (node.hasOwnProperty("selected") && node.hasOwnProperty("strokeColor")) { found = node; return }
+        for (var i = 0; i < node.children.length; ++i) walk(node.children[i])
+      }
+      walk(delegate)
+      return found
+    }
+    wait(400)
+    var seat = findChild(item, "appleSeat")
+    // Nobody owns the audio: the seated phone cannot yield a takeover.
+    verify(seat.waitingLit === false)
+    compare(iconOf(findChild(item, "waitingApple0")).level, 0)
+    // The phone owns the audio idle (e.g. after a reconnect): the Mac can
+    // come forward.
+    item.appleOwnsAudio = true
+    item.activeDeviceAddress = phone.address
+    wait(100)
+    verify(seat.waitingLit === true)
+    compare(iconOf(findChild(item, "waitingApple0")).level, 1)
+    item.audioPlaying = true
+    wait(100)
+    verify(seat.waitingLit === false)
+    compare(iconOf(findChild(item, "waitingApple0")).level, 0)
+  }
+
+  // 2026-10-14: the mirror case from the panel: the Mac holds the Apple
+  // seat but the XPS owns the audio, so the iPhone in the tray is truly
+  // disabled (dimmest). If the Mac were the idle owner, it could yield.
+  function test_waitingPhoneStaysDimWhileSeatedMacIsNotTheOwner() {
+    var mac = { address: "02:00:00:00:00:06", label: "MacBook Pro", kind: "apple", onAcl: true }
+    var phone = { address: "02:00:00:00:00:05", label: "iPhone", kind: "apple" }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [mac], availableApple: [phone],
+      omarchyDevices: [xps], connectedToOmarchy: true,
+      omarchyOwnsAudio: true, activeDeviceAddress: xps.address
+    })
+    wait(400)
+    var seat = findChild(item, "appleSeat")
+    verify(seat.waitingLit === false)
+    item.appleOwnsAudio = true
+    item.omarchyOwnsAudio = false
+    item.activeDeviceAddress = mac.address
+    wait(100)
+    verify(seat.waitingLit === true)
+  }
+
+  // 2026-10-13: a lone seated phone draws at the lit tray brightness while
+  // the other seat owns the audio, without claiming the audio glow.
+  function test_loneSeatedPhoneDrawsAtTrayBrightnessWhileOtherSeatOwns() {
+    var phone = { address: "02:00:00:00:00:05", label: "iPhone", kind: "apple", onAcl: true }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [phone], omarchyDevices: [xps],
+      omarchyOwnsAudio: true, activeDeviceAddress: xps.address
+    })
+    wait(200)
+    var icon = findChild(item, "deviceApple0")
+    compare(icon.level, 1, "idle seated phone draws at the active level while Omarchy owns the audio")
+    verify(!icon.selected, "active is not ownership brightness")
+    verify(icon.parent.parent.lit === false, "but the audio glow stays with the holder")
+    item.omarchyOwnsAudio = false
+    item.activeDeviceAddress = ""
+    wait(100)
+    compare(icon.level, 1, "a seated phone stays active even with no owner")
+    item.appleDevices = [Object.assign({}, phone, { onAcl: false })]
+    wait(100)
+    compare(icon.level, 0, "off the link it dims to disabled")
+  }
+
+  // 2026-10-13: a displaced phone rises to the right-hand tray slot and the
+  // device already waiting (the Mac) takes the left, even when both enter
+  // the tray in the same update. Alone, the phone waits on the left.
+  function test_displacedPhoneTakesRightTraySlot() {
+    var phone = { address: "02:00:00:00:00:05", label: "iPhone", kind: "apple", onAcl: true }
+    var mac = { address: "02:00:00:00:00:06", label: "MacBook Pro", kind: "apple" }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [phone], availableApple: [mac], connectedToOmarchy: true
+    })
+    wait(700)
+    item.appleDevices = []
+    item.availableApple = [mac, Object.assign({}, phone, { onAcl: false })]
+    wait(900)
+    compare(findChild(item, "waitingApple0").device.label, "MacBook Pro")
+    compare(findChild(item, "waitingApple1").device.label, "iPhone")
+  }
+
+  function test_displacedPhoneAloneWaitsOnTheLeft() {
+    var phone = { address: "02:00:00:00:00:05", label: "iPhone", kind: "apple", onAcl: true }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [phone], availableApple: [], connectedToOmarchy: true
+    })
+    wait(700)
+    item.appleDevices = []
+    item.availableApple = [Object.assign({}, phone, { onAcl: false })]
+    wait(900)
+    var seat = findChild(item, "appleSeat")
+    var waiting = findChild(item, "waitingApple0")
+    compare(waiting.device.label, "iPhone")
+    verify(waiting.mapToItem(item, waiting.width / 2, 0).x < seat.mapToItem(item, seat.width / 2, 0).x,
+      "a lone displaced phone waits on the left")
+  }
+
   // 2026-10-06: with the Mac seated, the iPhone vanished from the Apple tray whenever Omarchy held the audio or
   // ownership read as unknown. A waiting device stays in the tray, as lg-gram does on the Omarchy side.
   function test_appleWaitingDeviceStaysAboveConnectedSeat_data() {
@@ -1461,6 +1955,68 @@ TestCase {
 
   // Reconnect keeps both tray devices in place while it runs; the one that
   // takes the seat glides down from the tray and the other stays waiting.
+  // 2026-10-14: "Reconnecting…" is an in-progress label like "Waiting…":
+  // it takes the same dim treatment (seat colour at ellipse opacity), and
+  // neither seat is clickable while a reconnect runs.
+  function test_reconnectingLabelIsDimAndSeatsAreNotClickable() {
+    var phone = { address: "02:00:00:00:00:03", label: "iPhone", kind: "apple" }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [], availableApple: [phone], connectedToOmarchy: true
+    })
+    wait(200)
+    var action = findChild(item, "seatActionApple")
+    verify(action.visible)
+    item.reconnectBusy = true
+    wait(100)
+    compare(action.text, "Reconnecting…")
+    var seat = findChild(item, "appleSeat")
+    verify(Qt.colorEqual(action.color, seat.lineColor), "same colour as the Waiting… label")
+    fuzzyCompare(action.opacity, seat.ellipseOpacity, 0.01)
+    verify(!findChild(item, "seatClickApple").enabled, "Apple seat not clickable during reconnect")
+    verify(!findChild(item, "seatClickOmarchy").enabled, "Omarchy seat not clickable during reconnect")
+    item.reconnectBusy = false
+    wait(100)
+    compare(action.text, "Reconnect")
+    fuzzyCompare(action.opacity, 1, 0.01)
+    verify(findChild(item, "seatClickApple").enabled, "seats clickable again afterwards")
+  }
+
+  // 2026-10-14: while "Reconnecting…" runs, either Apple tray device
+  // might take the seat, so both draw at the active (not owner) level
+  // instead of the dimmest one.
+  function test_reconnectLightsAppleTrayDevicesAtActiveLevel() {
+    var phone = { address: "02:00:00:00:00:03", label: "iPhone", kind: "apple" }
+    var mac = { address: "02:00:00:00:00:06", label: "MacBook Pro", kind: "apple" }
+    var item = createTemporaryObject(view, this, {
+      appleDevices: [], availableApple: [phone, mac], appleTrayAvailable: true, connectedToOmarchy: true
+    })
+    function iconOf(delegate) {
+      var found = null
+      function walk(node) {
+        if (!node || found) return
+        if (node.hasOwnProperty("selected") && node.hasOwnProperty("strokeColor")) { found = node; return }
+        for (var i = 0; i < node.children.length; ++i) walk(node.children[i])
+      }
+      walk(delegate)
+      return found
+    }
+    wait(400)
+    var seat = findChild(item, "appleSeat")
+    verify(seat.waitingLit === false)
+    compare(iconOf(findChild(item, "waitingApple0")).level, 0)
+    compare(iconOf(findChild(item, "waitingApple1")).level, 0)
+    item.reconnectBusy = true
+    wait(100)
+    verify(seat.waitingLit === true)
+    compare(iconOf(findChild(item, "waitingApple0")).level, 1)
+    compare(iconOf(findChild(item, "waitingApple1")).level, 1)
+    verify(!iconOf(findChild(item, "waitingApple0")).selected, "active is not ownership brightness")
+    item.reconnectBusy = false
+    wait(100)
+    verify(seat.waitingLit === false)
+    compare(iconOf(findChild(item, "waitingApple0")).level, 0)
+  }
+
   function test_reconnectHoldsTheTrayUntilADeviceDescends() {
     var phone = { address: "02:00:00:00:00:03", label: "iPhone", kind: "apple" }
     var mac = { address: "02:00:00:00:00:06", label: "MacBook Pro", kind: "apple" }

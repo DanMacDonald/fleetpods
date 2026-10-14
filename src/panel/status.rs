@@ -491,7 +491,22 @@ fn pod_broadcast(snapshot: &Snapshot<'_>) -> Option<Vec<crate::types::Address>> 
         return Some(Vec::new());
     };
     if snapshot.pod_peers.contains(&local) && snapshot.pod_peers.len() <= 2 {
-        Some(snapshot.pod_peers.to_vec())
+        // As in the daemon's broadcast: a solo list from a simultaneous
+        // connection is completed by the other laptop's fresh roster.
+        let report = snapshot.config.accessory.zip(snapshot.held_reporter).and_then(
+            |(accessory, reporter)| {
+                snapshot
+                    .peers
+                    .fresh_from(snapshot.clock, accessory, reporter)
+                    .map(|report| report.peers.as_slice())
+            },
+        );
+        Some(crate::fleet::roster::complete_solo_list(
+            snapshot.pod_peers,
+            local,
+            snapshot.held_reporter,
+            report.unwrap_or(&[]),
+        ))
     } else {
         Some(Vec::new())
     }

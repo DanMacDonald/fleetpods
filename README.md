@@ -2,7 +2,7 @@
 
 ![FleetPods showing iPhone audio playback and an Omarchy machine connected to the AirPods](docs/images/fleetpods-connections.png)
 
-**FleetPods is in beta.** AirPods Pro 3 is the current tested hardware. Broader hardware support and complete fleet roster management are the goals for version 1.0.
+**FleetPods is in beta.** AirPods Pro 3 is the current tested hardware. Broader hardware support, magic pairing, and complete fleet roster management are the goals for version 1.0.
 
 ## The Problem
 
@@ -22,13 +22,18 @@ FleetPods adds that request and yield coordination between Omarchy machines, alo
 
 The Omarchy plugin shows the state of play: which devices currently hold the two AirPods connections, which fleet devices are nearby, when an Apple device can take over seamlessly, and when a manual connection is still required.
 
+> [!NOTE]
+> **Known issue on macOS:** macOS does not report media pauses to the AirPods right away. After you pause on a Mac, the plugin may keep showing the Mac as playing for 5–10 seconds before the pause clears. Pauses on an iPhone clear almost immediately. FleetPods displays the state as soon as the AirPods report it; the delay is in macOS's reporting, not in the plugin.
+
 ## Road to 1.0
 
 Version 1.0 targets:
 
+- **Magic pairing:** Pair the AirPods with one device in the fleet, and every other member can take the connection and hand off audio without pairing again.
 - **Full AirPods hardware support:** Support the full Apple AirPods catalog, including AirPods, AirPods Pro, and AirPods Max, with each model tested on real hardware.
 - **Matching artwork:** Model-specific artwork for every supported AirPods device.
 - **Fleet roster management:** A clear view of fleet membership, with controls for adding and removing devices and leaving a fleet.
+- **An explicit animation state machine:** Boil the plugin's accumulated animation rules down to a clear set of seat and connection states, with named actions for the transitions between them, replacing the transition logic that grew rule by rule.
 
 Future versions may also include a macOS daemon that brings Apple computers into the FleetPods protocol, so every machine in the fleet can request and yield the AirPods the same way.
 

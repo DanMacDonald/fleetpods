@@ -7,6 +7,29 @@ use crate::types::{Address, Clock, HostId, MonoMs, SessionId, UnixMs};
 
 pub const DEFAULT_TTL_MS: u64 = 30_000;
 
+/// Complete a pod list that names only this laptop. When two laptops
+/// connect at the same moment, the pods can tell each of them it is alone
+/// and never send a corrected list; the other laptop's fresh roster,
+/// naming only itself, is the missing half. A report naming anyone else
+/// (or no reporter) does not complete the list.
+pub fn complete_solo_list(
+    listed: &[Address],
+    local: Address,
+    reporter: Option<Address>,
+    report: &[Address],
+) -> Vec<Address> {
+    if listed.len() != 1 || listed[0] != local {
+        return listed.to_vec();
+    }
+    let Some(reporter) = reporter.filter(|reporter| *reporter != local) else {
+        return listed.to_vec();
+    };
+    if report.contains(&reporter) && report.iter().all(|peer| *peer == local || *peer == reporter) {
+        return vec![local, reporter];
+    }
+    listed.to_vec()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RosterReport {
     pub reporter: HostId,

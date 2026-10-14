@@ -12,10 +12,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use fleetpods::audio::play::{Profile, StreamSnap};
 use fleetpods::fleet::members::Fleet;
 use fleetpods::panel::ipc::{self, Incoming};
+use fleetpods::pods::observe::Observation;
 use fleetpods::pods::setup::{self, Outgoing};
 
 use super::accessory;
-use fleetpods::step::{Effect, Input, PodSlot};
+use fleetpods::step::{Effect, Input};
 use fleetpods::types::{Address, Clock, Generation, MonoMs};
 use fleetpods::Daemon;
 
@@ -435,16 +436,46 @@ impl World {
                 self.step_host(&host, Input::ActivateAudio);
             }
             Event::Battery { host, slot, level, charging } => {
-                self.step_host(&host, Input::Battery { slot: slot.into(), level, charging });
+                let observation = match slot {
+                    Slot::Case => Observation::CaseBattery { level, charging },
+                    Slot::Left | Slot::Right => Observation::Bud {
+                        bud: if matches!(slot, Slot::Left) {
+                            setup::Bud::Left
+                        } else {
+                            setup::Bud::Right
+                        },
+                        level,
+                        charging,
+                        place: None,
+                    },
+                };
+                self.step_host(&host, Input::Observation(observation));
             }
             Event::Ears { host, left, right, at } => {
-                self.step_host(&host, Input::Ears { left, right, at });
+                let byte = |ear| match ear {
+                    Some(true) => 0,
+                    Some(false) => 1,
+                    None => 0xff,
+                };
+                let generation = self.hosts[&host].daemon.connection().generation();
+                let packet = vec![4, 0, 4, 0, 6, 0, byte(left), byte(right)];
+                // Placement was observed when queued, before a caller advanced
+                // the world clock to let the ear debounce expire.
+                let clock =
+                    Clock::new(at.0, self.unix.saturating_sub(self.mono.saturating_sub(at.0)));
+                let host = self.hosts.get_mut(&host).expect("host");
+                let outcome = host.daemon.step(Input::Accessory { generation, packet }, clock);
+                host.effects.extend(outcome.effects);
             }
             Event::RemotePlay { who } => {
                 let remote = Some(self.player_address(&who));
                 let names = self.hosts.keys().cloned().collect::<Vec<_>>();
                 for name in names {
-                    self.step_host(&name, Input::PodsConfirmed { local: false, remote });
+                    self.step_host(&name, Input::Observation(Observation::Ownership(false)));
+                    self.step_host(
+                        &name,
+                        Input::Observation(Observation::Source { local: false, kind: 2, remote }),
+                    );
                 }
             }
             Event::Advertisement(bytes) => {
@@ -708,16 +739,6 @@ impl World {
 
     fn clock(&self) -> Clock {
         Clock::new(self.mono, self.unix)
-    }
-}
-
-impl From<Slot> for PodSlot {
-    fn from(slot: Slot) -> Self {
-        match slot {
-            Slot::Left => Self::Left,
-            Slot::Right => Self::Right,
-            Slot::Case => Self::Case,
-        }
     }
 }
 

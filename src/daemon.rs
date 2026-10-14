@@ -38,6 +38,23 @@ fn placement(sight: &crate::pods::air::Frame, right: bool) -> (Option<bool>, Opt
     (Some(in_ear), in_case)
 }
 
+/// Effects queued by handlers and drained once per step by the harvest
+/// sweep in `step`. Handlers write here and nowhere else for anything
+/// that must leave the process; harvest is the only reader, so an
+/// effect's cause is always the handler that queued it.
+#[derive(Default)]
+pub(crate) struct PendingEffects {
+    pub control_out: Vec<(Generation, Vec<u8>)>,
+    pub secret_out: Vec<(String, Vec<u8>)>,
+    pub drop_link: bool,
+    pub remove_device: Option<Address>,
+    pub pause_players: Vec<String>,
+    pub keyring_dirty: bool,
+    pub follow_link: bool,
+    pub announce_dirty: bool,
+    pub restore_pending: Vec<StreamSnap>,
+}
+
 pub struct Daemon {
     pub(crate) local_name: String,
     pub(crate) local_address: Option<Address>,
@@ -63,30 +80,29 @@ pub struct Daemon {
     pub(crate) keyring_locked: bool,
     pub(crate) roster_seq: u64,
     pub(crate) link_asked: Option<Generation>,
-    pub(crate) announce_dirty: bool,
-    pub(crate) keyring_dirty: bool,
+    pub(crate) effects: PendingEffects,
     pub(crate) commit: crate::fleet::commit::Commit,
     pub(crate) accessory_setup: Setup,
-    pub(crate) control_out: Vec<(Generation, Vec<u8>)>,
-    pub(crate) secret_out: Vec<(String, Vec<u8>)>,
-    pub(crate) drop_link: bool,
-    pub(crate) remove_device: Option<Address>,
     priority_until: Option<MonoMs>,
     priority_generation: u64,
-    pub(crate) pause_players: Vec<String>,
     /// The only seat record. Claim and step-back are its writers. Status reads it.
     pub(crate) seat: Seat,
     reconnect: crate::pods::reconnect::Reconnect,
     reconnect_retry_at: Option<MonoMs>,
     reconnect_retries: u8,
-    /// After yielding a slot for an Apple reconnect, do not auto-attach
-    /// again until this passes: the freed slot is for the Apple device.
+    /// Hold passive reconnects after yielding or losing a slot so the
+    /// incoming device can finish connecting without being displaced.
     slot_hold_until: Option<MonoMs>,
+    /// Who owned the audio while this laptop shared the pods with a fleet
+    /// laptop, and whether this laptop is holding its automatic reconnect
+    /// so that owner can come back first.
+    pair_audio_owner: Option<Address>,
+    reopen_wait: bool,
+    reopen_hold_until: Option<MonoMs>,
     codec_asked: Option<String>,
     transport_asked: bool,
     pub(crate) staged_controls: Vec<Vec<u8>>,
     pub(crate) peers_seated: Vec<Address>,
-    pub(crate) restore_pending: Vec<StreamSnap>,
     pub(crate) output: crate::audio::route::Router,
     pub(crate) last_graph: Option<crate::audio::route::Graph>,
     pub(crate) output_health: crate::audio::health::Health,
@@ -102,8 +118,6 @@ pub struct Daemon {
     pub(crate) suspending: bool,
     pub(crate) adapter_down: bool,
     pub(crate) radio_silenced: bool,
-    /// The thread may attach the control socket. Set when no reconnect is waiting.
-    pub(crate) follow_link: bool,
     air_session: [u8; 16],
     session_fleet: Option<FleetId>,
     roster_air: crate::fleet::airtime::RosterAir,
@@ -119,6 +133,9 @@ pub struct Daemon {
     /// Connected devices from the pods' own list. Known stays set after an empty list.
     pod_peers: Vec<Address>,
     pod_peers_known: bool,
+    /// The pods' list has arrived at least once. After that, a dropped link
+    /// resets the saved roster instead of reviving remembered seat members.
+    pod_list_seen: bool,
     pod_peers_at: Option<crate::types::UnixMs>,
     /// An Apple device took the slot this laptop had been sitting in.
     /// A failed route, a closed case, and an idle link do not set this.
@@ -194,6 +211,14 @@ const RECONNECT_RETRY_LIMIT: u8 = 3;
 /// to take it, short enough that the laptop rejoins on its own afterwards.
 const SLOT_HOLD_MS: u64 = 30_000;
 
+/// An established link disappearing may be another device taking its slot.
+/// Desktop activity must give that connection time to settle before reopening.
+const DISPLACEMENT_HOLD_MS: u64 = 5_000;
+
+/// How long the non-owner of a dropped laptop pair holds its automatic
+/// reconnect so the owner can land first, before it may attach anyway.
+const REOPEN_HOLD_MS: u64 = 15_000;
+
 /// An incoming invitation held aside across a fleet reset (see
 /// [`Daemon::take_invitation`]).
 pub(crate) struct InvitationSave {
@@ -233,27 +258,23 @@ impl Daemon {
             keyring_locked: false,
             roster_seq: 0,
             link_asked: None,
-            announce_dirty: true,
-            keyring_dirty: false,
+            effects: PendingEffects { announce_dirty: true, ..Default::default() },
             commit: crate::fleet::commit::Commit::new(),
             accessory_setup: Setup::new(),
-            control_out: Vec::new(),
-            secret_out: Vec::new(),
-            drop_link: false,
-            remove_device: None,
             priority_until: None,
             priority_generation: 0,
-            pause_players: Vec::new(),
             seat: Seat::new(),
             reconnect: crate::pods::reconnect::Reconnect::new(),
             reconnect_retry_at: None,
             reconnect_retries: 0,
             slot_hold_until: None,
+            pair_audio_owner: None,
+            reopen_wait: false,
+            reopen_hold_until: None,
             codec_asked: None,
             transport_asked: false,
             staged_controls: Vec::new(),
             peers_seated: Vec::new(),
-            restore_pending: Vec::new(),
             output: crate::audio::route::Router::new(),
             last_graph: None,
             output_health: crate::audio::health::Health::default(),
@@ -267,7 +288,6 @@ impl Daemon {
             suspending: false,
             adapter_down: false,
             radio_silenced: false,
-            follow_link: false,
             air_session: {
                 let mut bytes = [0u8; 16];
                 let _ = os::random_bytes(&mut bytes);
@@ -282,6 +302,7 @@ impl Daemon {
             held_reporter: None,
             pod_peers: Vec::new(),
             pod_peers_known: false,
+            pod_list_seen: false,
             pod_peers_at: None,
             displaced: false,
             background_requested: false,
@@ -432,7 +453,7 @@ impl Daemon {
                 Response::line("error: discovery control is not available")
             }
             Command::Disconnect => {
-                self.drop_link = true;
+                self.effects.drop_link = true;
                 self.interrupt("disconnect", now);
                 Response::line("ok")
             }
@@ -509,14 +530,41 @@ impl Daemon {
         self.connection.note_profile_pending(pending);
     }
 
-    pub fn note_socket(&mut self, up: bool, generation: Generation) {
+    pub fn note_socket(&mut self, up: bool, generation: Generation, now: MonoMs) {
+        if generation != self.connection.generation() {
+            return;
+        }
         if !up {
+            if self.connection.stage() == Stage::Ready
+                && !self.routing.phase().busy()
+                && !self.connection.apple_reconnect()
+            {
+                let until = now.saturating_add(DISPLACEMENT_HOLD_MS);
+                self.slot_hold_until = Some(self.slot_hold_until.map_or(until, |held| {
+                    if held.0 > until.0 {
+                        held
+                    } else {
+                        until
+                    }
+                }));
+            }
             self.consider_apple_displacement();
+            self.consider_reopen_order();
         }
         if self.connection.note_socket(up, generation) {
             self.background_requested = false;
             self.drop_reports();
         }
+    }
+
+    /// The other device sharing the pods with this laptop, when the pods
+    /// named exactly two and this laptop is one of them.
+    fn pod_pair_other(&self) -> Option<Address> {
+        let local = self.local_address?;
+        if !self.pod_peers_known || self.pod_peers.len() != 2 || !self.pod_peers.contains(&local) {
+            return None;
+        }
+        self.pod_peers.iter().copied().find(|peer| *peer != local)
     }
 
     /// The pods ended the link while this laptop and one Apple device were the pair.
@@ -525,13 +573,7 @@ impl Daemon {
         if self.displaced || self.seat.held() || self.routing.phase().busy() {
             return;
         }
-        let Some(local) = self.local_address else {
-            return;
-        };
-        if !self.pod_peers_known || self.pod_peers.len() != 2 || !self.pod_peers.contains(&local) {
-            return;
-        }
-        let Some(other) = self.pod_peers.iter().copied().find(|peer| *peer != local) else {
+        let Some(other) = self.pod_pair_other() else {
             return;
         };
         if !self.membership.contains(other) {
@@ -539,11 +581,55 @@ impl Daemon {
         }
     }
 
+    /// The link dropped while this laptop shared the pods with a fleet
+    /// laptop that owned the audio. When the pods come back (case opens,
+    /// wake), both laptops would race back on; the non-owner holds its
+    /// automatic reconnect so the owner lands first.
+    fn consider_reopen_order(&mut self) {
+        let Some(other) = self.pod_pair_other() else {
+            return;
+        };
+        if self.membership.contains(other) && self.pair_audio_owner == Some(other) {
+            self.reopen_wait = true;
+            self.reopen_hold_until = None;
+        }
+    }
+
+    /// Whether the automatic reconnect is currently held for the pair's
+    /// audio owner. The grace window starts at the first held attempt;
+    /// after it, this laptop may attach anyway (the owner may be gone).
+    fn reopen_blocked(&mut self, now: MonoMs) -> bool {
+        if !self.reopen_wait {
+            return false;
+        }
+        let until =
+            *self.reopen_hold_until.get_or_insert_with(|| now.saturating_add(REOPEN_HOLD_MS));
+        if now.0 < until.0 {
+            true
+        } else {
+            self.reopen_wait = false;
+            self.reopen_hold_until = None;
+            false
+        }
+    }
+
+    /// Passive ACL attachment and desktop activity share the same slot hold.
+    /// An explicit Connect or a new Play request can still reconnect immediately.
+    fn background_reopen_blocked(&mut self, now: MonoMs) -> bool {
+        if self.slot_hold_until.is_some_and(|until| now.0 < until.0) {
+            return true;
+        }
+        self.slot_hold_until = None;
+        self.reopen_blocked(now)
+    }
+
     pub fn mark_control_ready(&mut self, generation: Generation) -> bool {
         let ready = self.connection.mark_ready(generation);
         if ready {
             self.displaced = false;
             self.slot_hold_until = None;
+            self.reopen_wait = false;
+            self.reopen_hold_until = None;
             self.background_requested = false;
             self.microphone.set_control_ready(true);
         }
@@ -615,7 +701,7 @@ impl Daemon {
         if self.radio_quiet() || self.connection.reason() == "link_lost" || self.wake_link(at) {
             return;
         }
-        self.follow_link = true;
+        self.effects.follow_link = true;
     }
 
     pub(crate) fn radio_quiet(&self) -> bool {
@@ -624,6 +710,13 @@ impl Daemon {
 
     pub fn note_ownership(&mut self, local: bool, at: MonoMs) {
         self.accessory.note_ownership(local, at);
+        // Remember who owned the audio in a two-laptop pair, so a later
+        // drop can let that owner reconnect first.
+        if let (Some(local_address), Some(other)) = (self.local_address, self.pod_pair_other()) {
+            if self.membership.contains(other) {
+                self.pair_audio_owner = Some(if local { local_address } else { other });
+            }
+        }
         if local && self.idle_claimed.is_some_and(|(_, requested)| at >= requested) {
             self.idle_claimed = None;
             self.audio.clear_yield();
@@ -650,7 +743,7 @@ impl Daemon {
         let was_docked = self.accessory.both_docked();
         self.accessory.note_pod(right, pod, at);
         if self.accessory.both_docked() != was_docked {
-            self.announce_dirty = true;
+            self.effects.announce_dirty = true;
         }
         self.hold_stowed_connection();
     }
@@ -661,7 +754,7 @@ impl Daemon {
         }
         self.background_requested = false;
         if self.connection.wait_for_case() {
-            self.drop_link = true;
+            self.effects.drop_link = true;
             self.drop_reports();
         }
         if self.routing.phase().busy() {
@@ -685,7 +778,7 @@ impl Daemon {
         self.background_requested = false;
         let asked = self.link_asked == Some(self.connection.generation());
         if self.connection.wait_for_case() {
-            self.drop_link |= asked;
+            self.effects.drop_link |= asked;
             self.drop_reports();
         }
         if self.routing.phase().busy() {
@@ -711,12 +804,9 @@ impl Daemon {
     /// An existing Bluetooth ACL still needs a tracked, retryable control setup.
     /// Property updates must never reopen an established seat that was lost.
     pub(crate) fn attach_available(&mut self, generation: Generation, now: MonoMs) {
-        // A slot yielded for an Apple reconnect stays yielded for a while:
-        // the pods offering the ACL back is not an invitation to retake it.
-        if self.slot_hold_until.is_some_and(|until| now.0 < until.0) {
+        if self.background_reopen_blocked(now) {
             return;
         }
-        self.slot_hold_until = None;
         if generation != self.connection.generation()
             || !matches!(self.connection.stage(), Stage::Idle | Stage::Waiting)
             || self.connection.bluez() != Some(true)
@@ -959,7 +1049,7 @@ impl Daemon {
         if session == [0; 16] || now.unix.0 == 0 {
             return None;
         }
-        let peers = self.roster_peers();
+        let peers = self.roster_peers(now);
         let (audio_source, audio_idle) = self.roster_audio(now);
         let audio_source = audio_source.filter(|owner| peers.contains(owner));
         let audio_idle = audio_idle && audio_source.is_some();
@@ -1238,16 +1328,22 @@ impl Daemon {
     /// Once the pods have sent their device list, that list is the roster.
     /// A laptop we used to hear is not kept on it. Before the first list, the
     /// seated members stand in so a playback roster can still name a neighbor.
-    fn roster_peers(&self) -> Vec<Address> {
+    fn roster_peers(&self, now: Clock) -> Vec<Address> {
+        // Once the pods' list has been seen, a drop resets the saved
+        // roster: the remembered seated members stand in only before the
+        // first list, never after one was dropped.
+        if self.pod_list_seen {
+            return self.pod_broadcast(now);
+        }
         if !self.pod_peers_known {
             return self.seated_members();
         }
-        self.pod_broadcast()
+        self.pod_broadcast(now)
     }
 
     /// The pods' connected devices, published only while this laptop is one of
     /// at most two. Any other shape is an empty roster, matching the previous daemon.
-    fn pod_broadcast(&self) -> Vec<Address> {
+    fn pod_broadcast(&self, now: Clock) -> Vec<Address> {
         let Some(local) = self.local_address else {
             return Vec::new();
         };
@@ -1257,7 +1353,21 @@ impl Daemon {
         {
             return Vec::new();
         }
-        self.pod_peers.clone()
+        // Two laptops connecting at once can each be told they are alone.
+        // The other laptop's fresh roster completes the pair until the
+        // pods' own list catches up (or supersedes this).
+        let report =
+            self.config.accessory.zip(self.held_reporter).and_then(|(accessory, reporter)| {
+                self.peers
+                    .fresh_from(now, accessory, reporter)
+                    .map(|report| report.peers.as_slice())
+            });
+        crate::fleet::roster::complete_solo_list(
+            &self.pod_peers,
+            local,
+            self.held_reporter,
+            report.unwrap_or(&[]),
+        )
     }
 
     pub(crate) fn note_pod_peers(&mut self, peers: Vec<Address>, now: crate::types::UnixMs) {
@@ -1265,6 +1375,7 @@ impl Daemon {
             return;
         }
         self.pod_peers_known = true;
+        self.pod_list_seen = true;
         self.peer_playback.retain(|peer, _| peers.contains(peer));
         self.pod_peers = peers;
         self.pod_peers_at = Some(now);
@@ -1283,7 +1394,7 @@ impl Daemon {
             self.idle_claimed = None;
         }
         self.peer_playback.insert(peer, (playing, now));
-        self.announce_dirty = true;
+        self.effects.announce_dirty = true;
     }
 
     /// A peer's own playback state can update an older accessory source report.
@@ -1382,13 +1493,13 @@ impl Daemon {
                 for packet in
                     crate::pods::peer::introduction(local, *peer, &self.local_name, playing)
                 {
-                    self.control_out.push((generation, packet));
+                    self.effects.control_out.push((generation, packet));
                 }
                 self.introduced_peers.1.push(*peer);
             } else if self.peer_media_sent.get(peer) != Some(&playing) {
                 let packet =
                     crate::pods::peer::media_information(local, *peer, &self.local_name, playing);
-                self.control_out.push((generation, packet));
+                self.effects.control_out.push((generation, packet));
             }
             self.peer_media_sent.insert(*peer, playing);
         }
@@ -1567,6 +1678,27 @@ impl Daemon {
         }
     }
 
+    /// A full seat can still admit a fleet laptop when this laptop holds
+    /// one slot and the other is an idle device: this laptop stays, the
+    /// priority pair becomes (this laptop, the requester), and the idle
+    /// device gives up its slot. A playing remote device is never the one
+    /// displaced, and a requester already seated needs no admission.
+    fn full_seat_retain(
+        seated: &[Address],
+        local: Option<Address>,
+        source: Address,
+        holder: &Holder,
+    ) -> Option<Address> {
+        let local = local?;
+        if seated.len() != 2 || !seated.contains(&local) || seated.contains(&source) {
+            return None;
+        }
+        if matches!(holder, Holder::Remote { playing: true, .. }) {
+            return None;
+        }
+        Some(local)
+    }
+
     fn hear_request(&mut self, message: crate::fleet::route_air::Message, now: Clock) {
         use crate::fleet::route_air::Answer;
         let key = (message.source, message.source_session);
@@ -1610,6 +1742,13 @@ impl Daemon {
             }
         } else if seated.len() == 1 {
             (Answer::Ok, Some(seated[0]), true)
+        } else if let Some(local) = Self::full_seat_retain(
+            &seated,
+            self.local_address,
+            message.source,
+            &self.resolved(now).holder,
+        ) {
+            (Answer::Ok, Some(local), true)
         } else {
             (Answer::RosterChanged, None, false)
         };
@@ -1624,7 +1763,7 @@ impl Daemon {
             if let Some(stay) = retain {
                 if Some(stay) != self.local_address {
                     self.step_back(now);
-                    self.drop_link = true;
+                    self.effects.drop_link = true;
                     self.pending_admission = Some(PendingAdmission {
                         request: message.clone(),
                         until: now.mono.saturating_add(8_000),
@@ -1949,8 +2088,8 @@ impl Daemon {
         if let Some(keys) = self.membership.accessory_keys() {
             let irk = keys.irk.to_vec();
             let encryption = keys.encryption.to_vec();
-            self.secret_out.push((crate::linux::keyring::IRK_ITEM.into(), irk));
-            self.secret_out.push((crate::linux::keyring::ENC_ITEM.into(), encryption));
+            self.effects.secret_out.push((crate::linux::keyring::IRK_ITEM.into(), irk));
+            self.effects.secret_out.push((crate::linux::keyring::ENC_ITEM.into(), encryption));
         }
     }
 
@@ -1994,7 +2133,7 @@ impl Daemon {
         }
         if self.enrollment.phase().active()
             || self.commit.is_staged()
-            || self.keyring_dirty
+            || self.effects.keyring_dirty
             || self.routing.phase().busy()
         {
             return Err("finish or cancel the current fleet operation, then retry");
@@ -2024,7 +2163,7 @@ impl Daemon {
         self.peer_media_sent.remove(&peer);
         self.introduced_peers.1.retain(|address| *address != peer);
         self.roster_dirty = true;
-        self.announce_dirty = true;
+        self.effects.announce_dirty = true;
     }
 
     /// An incoming invitation the adapter is holding aside across a local
@@ -2073,7 +2212,7 @@ impl Daemon {
         self.membership.mark_unlocked();
         self.membership.mark_confirmed_empty();
         self.keyring_locked = false;
-        self.keyring_dirty = false;
+        self.effects.keyring_dirty = false;
         self.commit.clear();
         self.enrollment = Enrollment::new();
         self.pake = None;
@@ -2106,7 +2245,7 @@ impl Daemon {
         self.roster_air.reset();
         self.roster_change_queued = None;
         self.presence_air.reset();
-        self.announce_dirty = true;
+        self.effects.announce_dirty = true;
         eprintln!("fleetpodsd: local fleet reset; AirPods pairing preserved");
     }
 
@@ -2138,7 +2277,7 @@ impl Daemon {
             seq: self.roster_seq,
             at: now.mono,
             sent: now.unix,
-            peers: self.roster_peers(),
+            peers: self.roster_peers(now),
             audio_source,
             pending: false,
             audio_idle,
@@ -2170,7 +2309,11 @@ impl Daemon {
                 self.displaced = false;
             }
         }
-        if open && self.config.accessory.is_some() && self.connection.stage() == Stage::Waiting {
+        if open
+            && self.config.accessory.is_some()
+            && self.connection.stage() == Stage::Waiting
+            && !self.background_reopen_blocked(now)
+        {
             self.background_requested = true;
             self.open_connection(now);
         }
@@ -2496,6 +2639,11 @@ impl Daemon {
                 "ignored"
             });
         }
+        // Input on an established link can claim idle audio immediately. Input
+        // after a slot loss must not evict the device still taking that slot.
+        if self.background_reopen_blocked(now.mono) {
+            return Response::line("ignored");
+        }
         // Use a connected helper when present; otherwise open only the control link.
         match self.activity_target(now) {
             ActivityTarget::Several => Response::line("ignored"),
@@ -2588,7 +2736,8 @@ impl Daemon {
                 }) {
                     self.activity_at = None;
                     self.idle_claimed = Some((peer, now.mono));
-                    self.control_out
+                    self.effects
+                        .control_out
                         .push((self.connection.generation(), crate::pods::setup::ownership(true)));
                     eprintln!("fleetpodsd: claiming idle AirPods ownership on desktop activity");
                     return true;
@@ -2709,7 +2858,7 @@ impl Daemon {
             return;
         }
         self.step_back(now);
-        self.drop_link = true;
+        self.effects.drop_link = true;
         self.slot_hold_until = Some(now.mono.saturating_add(SLOT_HOLD_MS));
     }
 
@@ -2723,7 +2872,7 @@ impl Daemon {
         self.transport_asked = false;
         let players = self.audio.yield_playback();
         if !players.is_empty() {
-            self.pause_players = players;
+            self.effects.pause_players = players;
         }
         self.replan(now);
     }
@@ -2760,7 +2909,7 @@ impl Daemon {
                 self.transport_asked = false;
                 let players = self.audio.yield_playback();
                 if !players.is_empty() {
-                    self.pause_players = players;
+                    self.effects.pause_players = players;
                 }
                 self.reconnect.begin(now.mono);
                 Response::line("accepted")
@@ -2779,11 +2928,19 @@ impl Daemon {
             link_ready: self.connection.stage() == Stage::Ready
                 && self.connection.socket_up() == Some(true)
                 && self.connection.bluez() != Some(false),
+            attempting: matches!(
+                self.connection.stage(),
+                Stage::Connecting
+                    | Stage::Handshake
+                    | Stage::Features
+                    | Stage::Notifications
+                    | Stage::Retrying
+            ),
         };
         match self.reconnect.advance(now.mono, facts) {
             Advance::None => {}
             Advance::SendRequests => self.send_reconnect_requests(),
-            Advance::DropLink => self.drop_link = true,
+            Advance::DropLink => self.effects.drop_link = true,
             Advance::Rejoin => {
                 self.background_requested = true;
                 self.connection.rejoin_after_apple_reconnect(now.mono);
@@ -3161,7 +3318,7 @@ impl Daemon {
         let Some(address) = self.config.accessory else {
             return Response::line("error: no accessory");
         };
-        self.remove_device = Some(address);
+        self.effects.remove_device = Some(address);
         self.unpaired(address, now);
         Response::line("ok")
     }
@@ -3176,9 +3333,9 @@ impl Daemon {
         self.select_accessory(None);
         self.reconnect.cancel();
         self.link_asked = None;
-        self.follow_link = false;
-        self.drop_link = false;
-        self.control_out.clear();
+        self.effects.follow_link = false;
+        self.effects.drop_link = false;
+        self.effects.control_out.clear();
         self.displaced = false;
         self.held_peers.clear();
         self.held_reporter = None;
@@ -3276,7 +3433,7 @@ impl Daemon {
     fn queue_priority(&mut self, packet: Vec<u8>, now: Clock) -> u64 {
         self.priority_generation = self.priority_generation.saturating_add(1);
         self.priority_until = Some(now.mono.saturating_add(5_000));
-        self.control_out.push((self.connection.generation(), packet));
+        self.effects.control_out.push((self.connection.generation(), packet));
         self.priority_generation
     }
 
@@ -3320,7 +3477,7 @@ impl Daemon {
 
     fn queue_setting(&mut self, bytes: Vec<u8>) {
         if self.connection.socket_up() == Some(true) && self.connection.stage() == Stage::Ready {
-            self.control_out.push((self.connection.generation(), bytes));
+            self.effects.control_out.push((self.connection.generation(), bytes));
         } else {
             self.staged_controls.push(bytes);
         }
@@ -3329,7 +3486,7 @@ impl Daemon {
     pub(crate) fn flush_settings(&mut self) {
         let generation = self.connection.generation();
         for bytes in std::mem::take(&mut self.staged_controls) {
-            self.control_out.push((generation, bytes));
+            self.effects.control_out.push((generation, bytes));
         }
     }
 
@@ -3454,7 +3611,7 @@ mod tests {
                 members: vec![Member { address: addr(2), label: "gram".into() }],
             },
         );
-        daemon.keyring_dirty = true;
+        daemon.effects.keyring_dirty = true;
         daemon.routing.start(addr(2));
         daemon.held_peers.push(addr(2));
         daemon.held_reporter = Some(addr(2));
@@ -4078,7 +4235,7 @@ mod tests {
         daemon.note_ownership(true, now.mono);
         daemon.output.want = true;
         assert!(matches!(daemon.start_route(addr(2)), crate::fleet::route::Start::Sent { .. }));
-        daemon.note_socket(false, generation);
+        daemon.note_socket(false, generation, now.mono);
         assert_eq!(daemon.connection().stage(), Stage::Interrupted);
         assert_eq!(daemon.connection().reason(), "link_lost");
         assert_eq!(daemon.status_value(now)["reported_ownership"], -1);
@@ -4515,41 +4672,56 @@ mod tests {
             .all(|effect| !matches!(effect, Effect::RemoveDevice { .. })));
         assert_eq!(daemon.status_value(disconnected_at)["bluetooth_paired"], true);
         assert_eq!(daemon.status_value(disconnected_at)["native_handoff"]["phase"], "reconnecting");
-        let soon = daemon.step(Input::Tick, Clock::new(now.mono.0 + 5_000, now.unix.0));
+        // The pods sit free for the rejoin delay first (giving a nearby
+        // Apple device its chance to connect), then this laptop rejoins.
+        let soon = daemon.step(Input::Tick, Clock::new(now.mono.0 + 9_200, now.unix.0));
         assert!(soon.effects.iter().all(|effect| !matches!(effect, Effect::FollowLink)));
-        let back = daemon.step(Input::Tick, Clock::new(now.mono.0 + 7_100, now.unix.0));
+        let back = daemon.step(Input::Tick, Clock::new(now.mono.0 + 14_300, now.unix.0));
         assert!(back.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
         assert!(daemon.background_requested);
         assert_eq!(daemon.routing().intent(), crate::fleet::route::Intent::Release);
 
         // A reset while rejoining is a failed setup, not the intentional drop.
         let generation = daemon.connection.generation();
-        let failed_at = Clock::new(now.mono.0 + 7_200, now.unix.0);
+        let failed_at = Clock::new(now.mono.0 + 14_400, now.unix.0);
         daemon.step(Input::ControlSocket { up: false, generation }, failed_at);
         daemon.step(Input::LinkFailed { generation, busy: false }, failed_at);
         assert_eq!(daemon.connection.stage(), Stage::Retrying);
-        let retried = daemon.step(Input::Tick, Clock::new(now.mono.0 + 8_200, now.unix.0));
+        let retried = daemon.step(Input::Tick, Clock::new(now.mono.0 + 15_400, now.unix.0));
         assert!(retried.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
         assert_eq!(daemon.connection.retry().0, 2);
         assert!(daemon.background_requested);
         assert_eq!(daemon.routing().intent(), crate::fleet::route::Intent::Release);
 
-        // The Apple reconnect has an overall bound; it must not retry forever.
+        // An attempt still in flight is not failed by the reconnect's
+        // return wait, however long the link layer takes with it; when it
+        // lands, the reconnect completes instead of recording a failure.
         daemon.step(Input::Tick, Clock::new(now.mono.0 + 30_000, now.unix.0));
-        assert_eq!(daemon.connection.stage(), Stage::Interrupted);
-        assert!(!daemon.background_requested);
-        // After the failure the daemon retries the background connection on
-        // its own, a bounded number of times, then waits for activity again.
-        let retried = daemon.step(Input::Tick, Clock::new(now.mono.0 + 33_100, now.unix.0));
-        assert!(
-            retried.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })),
-            "a failed reconnect retries without waiting for activity"
+        assert_eq!(daemon.connection.stage(), Stage::Connecting);
+        let generation = daemon.connection.generation();
+        let landed = Clock::new(now.mono.0 + 30_100, now.unix.0);
+        daemon.step(Input::ControlSocket { up: true, generation }, landed);
+        daemon.step(
+            Input::Accessory { generation, packet: vec![0x01, 0x00, 0x04, 0x00, 0x01] },
+            landed,
         );
-        assert_eq!(daemon.reconnect_retries, 1);
-        for elapsed in [36_100, 39_100, 42_100, 60_000, 120_000] {
-            daemon.step(Input::Tick, Clock::new(now.mono.0 + elapsed, now.unix.0));
-        }
-        assert!(daemon.reconnect_retry_at.is_none(), "automatic retries are bounded");
+        daemon.step(
+            Input::Accessory { generation, packet: vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01] },
+            landed,
+        );
+        let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
+        battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
+        battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
+        battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
+        daemon.step(Input::Accessory { generation, packet: battery }, landed);
+        daemon.step(
+            Input::Accessory {
+                generation,
+                packet: vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02],
+            },
+            landed,
+        );
+        assert_eq!(daemon.connection.stage(), Stage::Ready);
     }
 
     #[test]
@@ -4628,7 +4800,7 @@ mod tests {
         ready_link(&mut daemon, now);
         daemon.note_lid(true, now.mono);
         let generation = daemon.connection().generation();
-        daemon.note_socket(false, generation);
+        daemon.note_socket(false, generation, now.mono);
         daemon.fail_reconnect("link did not return", now);
         assert!(daemon.reconnect_retry_at.is_some());
 
@@ -4666,6 +4838,100 @@ mod tests {
     }
 
     #[test]
+    fn a_full_seat_with_an_idle_partner_admits_a_fleet_laptop() {
+        let local = addr(1);
+        let phone = addr(4);
+        let xps = addr(2);
+        let seated = vec![local, phone];
+        // The idle phone gives up its slot; this laptop is retained.
+        assert_eq!(
+            Daemon::full_seat_retain(
+                &seated,
+                Some(local),
+                xps,
+                &Holder::Remote { address: Some(phone), playing: false },
+            ),
+            Some(local)
+        );
+        // A playing phone is never the device displaced.
+        assert_eq!(
+            Daemon::full_seat_retain(
+                &seated,
+                Some(local),
+                xps,
+                &Holder::Remote { address: Some(phone), playing: true },
+            ),
+            None
+        );
+        // An unnamed playing source is protected too.
+        assert_eq!(
+            Daemon::full_seat_retain(
+                &seated,
+                Some(local),
+                xps,
+                &Holder::Remote { address: None, playing: true },
+            ),
+            None
+        );
+        // A requester already in the seat needs no admission.
+        assert_eq!(Daemon::full_seat_retain(&seated, Some(local), phone, &Holder::Unknown), None);
+        // Without this laptop in the seat there is no pair to reserve.
+        assert_eq!(Daemon::full_seat_retain(&seated, Some(xps), addr(5), &Holder::Unknown), None);
+        // A single occupant is admitted by the existing branch, not this one.
+        assert_eq!(
+            Daemon::full_seat_retain(&seated[..1], Some(local), xps, &Holder::Unknown),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_pairs_audio_owner_reconnects_first_after_a_drop() {
+        use crate::fleet::members::Fleet;
+        let setup = |owner_local: Option<bool>| {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            let local = addr(1);
+            let peer = addr(2);
+            daemon.set_local_address(Some(local));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "lg-gram".into() },
+                    Member { address: peer, label: "omarchy-xps".into() },
+                ],
+            });
+            daemon.select_accessory(Some(addr(3)));
+            daemon.note_bluez(true);
+            daemon.note_pod_peers(vec![local, peer], now.unix);
+            if let Some(local_owner) = owner_local {
+                daemon.note_ownership(local_owner, now.mono);
+            }
+            daemon.note_socket(false, daemon.connection().generation(), now.mono);
+            daemon
+        };
+        let now = clock();
+        // The peer owned the audio: this laptop waits out the grace window
+        // instead of racing it back onto the pods, then may attach.
+        let mut daemon = setup(Some(false));
+        let generation = daemon.connection().generation();
+        daemon.attach_available(generation, now.mono.saturating_add(1_000));
+        assert!(!daemon.background_requested, "the non-owner does not race the reopen");
+        daemon.attach_available(generation, now.mono.saturating_add(REOPEN_HOLD_MS + 1_000));
+        assert!(daemon.background_requested, "and may attach once the grace passes");
+        // The owner itself reconnects at once.
+        let mut daemon = setup(Some(true));
+        let generation = daemon.connection().generation();
+        daemon.attach_available(generation, now.mono.saturating_add(1_000));
+        assert!(daemon.background_requested, "the owner reconnects first");
+        // With no recorded owner there is nothing to order, as before.
+        let mut daemon = setup(None);
+        let generation = daemon.connection().generation();
+        daemon.attach_available(generation, now.mono.saturating_add(1_000));
+        assert!(daemon.background_requested, "unknown ownership keeps the old behaviour");
+    }
+
+    #[test]
     fn a_yielded_slot_stays_yielded_until_the_hold_passes() {
         let mut daemon = Daemon::new("gram");
         let now = clock();
@@ -4677,7 +4943,7 @@ mod tests {
         daemon.peers_seated.push(peer);
 
         daemon.free_slot(peer, now);
-        assert!(daemon.drop_link);
+        assert!(daemon.effects.drop_link);
         assert!(daemon.slot_hold_until.is_some());
 
         let generation = daemon.connection().generation();
@@ -4686,6 +4952,80 @@ mod tests {
 
         daemon.attach_available(generation, now.mono.saturating_add(SLOT_HOLD_MS + 1));
         assert!(daemon.background_requested, "auto-attach resumes after the hold");
+    }
+
+    #[test]
+    fn a_lost_slot_holds_activity_and_acl_attach_without_extending_the_grace() {
+        use crate::step::{Effect, Input};
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        let generation = daemon.connection.generation();
+        daemon.step(Input::ControlSocket { up: false, generation }, now);
+        let generation = daemon.connection.generation();
+        let until = now.mono.saturating_add(DISPLACEMENT_HOLD_MS);
+        assert_eq!(daemon.slot_hold_until, Some(until));
+        for delta in [0, 1_000, DISPLACEMENT_HOLD_MS - 1] {
+            let at = Clock::new(now.mono.0 + delta, now.unix.0 + delta);
+            // Duplicate close notifications must not keep pushing the hold out.
+            daemon.step(Input::ControlSocket { up: false, generation }, at);
+            daemon.step(Input::Bluez(true), at);
+            for input in [
+                Input::Command(Command::Activity),
+                Input::AttachAvailable { generation },
+                Input::Tick,
+            ] {
+                let outcome = daemon.step(input, at);
+                assert!(!outcome.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            }
+            assert_eq!(daemon.slot_hold_until, Some(until));
+            assert_eq!(daemon.connection.generation(), generation);
+        }
+        let settled = Clock::new(until.0, now.unix.0 + DISPLACEMENT_HOLD_MS);
+        let outcome = daemon.step(Input::Command(Command::Activity), settled);
+        assert!(outcome.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+    }
+
+    #[test]
+    fn a_yielded_slot_holds_activity_but_explicit_connect_and_play_can_reopen() {
+        use crate::step::{Effect, Input};
+        for explicit_play in [false, true] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.set_local_address(Some(addr(1)));
+            daemon.peers_seated.push(addr(2));
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.free_slot(addr(2), now);
+            let generation = daemon.connection.generation();
+            daemon.step(Input::ControlSocket { up: false, generation }, now);
+            assert_eq!(daemon.slot_hold_until, Some(now.mono.saturating_add(SLOT_HOLD_MS)));
+            let activity = daemon.step(Input::Command(Command::Activity), now);
+            assert!(!activity.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            assert!(!daemon.background_requested);
+            let input = if explicit_play {
+                Input::Player { service: "browser".into(), playing: Some(true) }
+            } else {
+                Input::Command(Command::Connect)
+            };
+            let requested = daemon.step(input, now);
+            assert!(requested.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+        }
+    }
+
+    #[test]
+    fn an_old_socket_close_cannot_hold_or_drop_a_new_ready_link() {
+        use crate::step::Input;
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        let generation = daemon.connection.generation();
+        daemon.step(
+            Input::ControlSocket { up: false, generation: Generation(generation.0 - 1) },
+            now,
+        );
+        assert_eq!(daemon.connection.stage(), Stage::Ready);
+        assert_eq!(daemon.slot_hold_until, None);
     }
 
     #[test]
@@ -4796,7 +5136,7 @@ mod tests {
             assert_eq!(daemon.routing.admit(tx, true, Some(retained)), Admit::Beside);
             daemon.open_connection(now.mono);
             let generation = daemon.connection.generation();
-            daemon.note_socket(true, generation);
+            daemon.note_socket(true, generation, now.mono);
             // Gram's empty roster has not arrived yet. Neither a fresh cached
             // roster nor its held fallback may put a released helper back.
             for elapsed in [0, 16_000] {
@@ -4823,6 +5163,96 @@ mod tests {
                 serde_json::json!([gram.display(), local.display()])
             );
         }
+    }
+
+    #[test]
+    fn a_solo_pod_list_is_completed_by_the_other_laptops_fresh_roster() {
+        use crate::fleet::members::Fleet;
+        use crate::fleet::roster_air::Snapshot;
+        let mut daemon = Daemon::new("omarchy-xps");
+        let now = clock();
+        let local = addr(2);
+        let gram = addr(4);
+        daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: local, label: "omarchy-xps".into() },
+                Member { address: gram, label: "lg-gram".into() },
+            ],
+        });
+        ready_link(&mut daemon, now);
+        // Both laptops connected at once; the pods' list named only us.
+        daemon.note_pod_peers(vec![local], now.unix);
+        assert_eq!(daemon.roster_peers(now), vec![local]);
+        daemon.observe_nearby(host_id(Some(gram)), gram, "lg-gram", now.unix, true, Some([1; 16]));
+        daemon.hear_roster(
+            Snapshot {
+                reporter: gram,
+                session: [1; 16],
+                sequence: 1,
+                sent: now.unix,
+                accessory: addr(3),
+                peers: vec![gram],
+                audio_source: None,
+                last_use: UnixMs(0),
+                pending: false,
+                audio_idle: true,
+            },
+            now,
+        );
+        assert_eq!(daemon.roster_peers(now), vec![local, gram]);
+        assert_eq!(
+            daemon.status_value(now)["connected_peers"],
+            serde_json::json!([local.display(), gram.display()])
+        );
+        // The other laptop explicitly leaving removes it again.
+        daemon.hear_roster(
+            Snapshot {
+                reporter: gram,
+                session: [1; 16],
+                sequence: 2,
+                sent: UnixMs(now.unix.0 + 1_000),
+                accessory: addr(3),
+                peers: vec![],
+                audio_source: None,
+                last_use: UnixMs(0),
+                pending: false,
+                audio_idle: true,
+            },
+            Clock::new(now.mono.0 + 1_000, now.unix.0 + 1_000),
+        );
+        assert_eq!(daemon.roster_peers(now), vec![local]);
+    }
+
+    #[test]
+    fn a_dropped_link_resets_the_saved_roster_instead_of_repeating_it() {
+        use crate::fleet::members::Fleet;
+        let mut daemon = Daemon::new("lg-gram");
+        let now = clock();
+        let local = addr(1);
+        let peer = addr(2);
+        daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: local, label: "lg-gram".into() },
+                Member { address: peer, label: "omarchy-xps".into() },
+            ],
+        });
+        ready_link(&mut daemon, now);
+        daemon.set_local_address(Some(local));
+        daemon.peers_seated.push(peer);
+        daemon.note_pod_peers(vec![local, peer], now.unix);
+        assert_eq!(daemon.roster_peers(now), vec![local, peer]);
+        // The pods drop this laptop (an Apple device took its seat). The
+        // saved roster must reset: repeating the old pair from remembered
+        // seated members resurrects a device that is no longer connected.
+        let generation = daemon.connection().generation();
+        daemon.note_socket(false, generation, now.mono);
+        assert_eq!(daemon.roster_peers(now), Vec::<Address>::new());
     }
 
     #[test]
@@ -4868,7 +5298,7 @@ mod tests {
         daemon.step(Input::ControlSocket { up: true, generation }, now);
         let peers = |d: &Daemon, at| d.status_value(at)["connected_peers"].clone();
         assert_eq!(peers(&daemon, now), serde_json::json!([]));
-        assert!(!daemon.roster_peers().contains(&gram));
+        assert!(!daemon.roster_peers(now).contains(&gram));
         // Neither a delayed older packet nor one for different AirPods may
         // overwrite the accepted disconnection in the remembered roster.
         daemon.hear_roster(report(1, vec![gram]), now);
@@ -5087,7 +5517,8 @@ mod tests {
             let now = clock();
             ready_link(&mut daemon, now);
             daemon.step(Input::Bonded { address: addr(3), saved: true }, now);
-            daemon.step(Input::Ownership(true), now);
+            daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
             daemon.step(
                 Input::Player {
                     service: "org.mpris.MediaPlayer2.brave".into(),
@@ -5140,7 +5571,10 @@ mod tests {
                     daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(false));
                 }
                 "peer" => {
-                    daemon.step(Input::Ownership(false), now);
+                    daemon.step(
+                        Input::Observation(crate::pods::observe::Observation::Ownership(false)),
+                        now,
+                    );
                 }
                 "sleep" => {
                     daemon.step(Input::Suspend, now);
@@ -5418,7 +5852,7 @@ mod tests {
             assert_eq!(waiting["nearby"], false);
             assert!(!status["connected_peers"].as_array().unwrap().contains(&waiting["address"]));
         }
-        daemon.note_socket(false, daemon.connection.generation());
+        daemon.note_socket(false, daemon.connection.generation(), now.mono);
         let status = daemon.status_value(now);
         assert_eq!(status["connected_peers"], serde_json::json!([]));
         assert_eq!(status["devices"].as_array().unwrap().len(), 2);
@@ -5665,12 +6099,15 @@ mod tests {
         daemon.note_pod_peers(vec![local, phone], now.unix);
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], false);
         let generation = daemon.connection().generation();
-        daemon.note_socket(false, generation);
+        daemon.note_socket(false, generation, now.mono);
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], true);
         let passive = daemon.step(crate::step::Input::Tick, now);
         assert!(!passive.effects.iter().any(|e| matches!(e, crate::step::Effect::OpenLink { .. })));
-        assert_eq!(daemon.handle(Command::Activity, now).body.as_deref(), Some("accepted\n"));
-        assert_eq!(daemon.status_value(now)["waiting_for_playback"], false);
+        assert_eq!(daemon.handle(Command::Activity, now).body.as_deref(), Some("ignored\n"));
+        let settled =
+            Clock::new(now.mono.0 + DISPLACEMENT_HOLD_MS, now.unix.0 + DISPLACEMENT_HOLD_MS);
+        assert_eq!(daemon.handle(Command::Activity, settled).body.as_deref(), Some("accepted\n"));
+        assert_eq!(daemon.status_value(settled)["waiting_for_playback"], false);
         assert!(!daemon.output.want);
         let away = Pod {
             battery: Battery::new(49, false).unwrap(),
@@ -5701,7 +6138,7 @@ mod tests {
         });
         daemon.note_pod_peers(vec![local, gram], now.unix);
         let generation = daemon.connection().generation();
-        daemon.note_socket(false, generation);
+        daemon.note_socket(false, generation, now.mono);
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], false);
 
         let mut idle = Daemon::new("gram");
@@ -5719,7 +6156,7 @@ mod tests {
         ready_link(&mut daemon, now);
         daemon.set_local_address(Some(local));
         daemon.note_pod_peers(vec![local, phone], now.unix);
-        daemon.note_socket(false, daemon.connection().generation());
+        daemon.note_socket(false, daemon.connection().generation(), now.mono);
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], true);
         assert_eq!(daemon.handle(Command::Connect, now).body.as_deref(), Some("accepted\n"));
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], false);
@@ -5882,7 +6319,8 @@ mod tests {
                 .collect(),
         };
         daemon.step(Input::Audio(graph.clone()), now);
-        let yielded = daemon.step(Input::Ownership(false), now);
+        let yielded = daemon
+            .step(Input::Observation(crate::pods::observe::Observation::Ownership(false)), now);
         assert!(
             !yielded.effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))),
             "uncontrolled browser streams must remain audible rather than advance silently"
@@ -5914,7 +6352,14 @@ mod tests {
         assert!(!daemon.output.want);
         let peer = addr(4);
         daemon.note_pod_peers(vec![peer], now.unix);
-        daemon.step(Input::Source { local: false, kind: 2, remote: Some(peer) }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(peer),
+            }),
+            now,
+        );
         daemon.note_peer_playback(peer, true, now.mono);
         for elapsed in [100, 1_000, 4_000] {
             let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
@@ -5971,7 +6416,7 @@ mod tests {
             }],
         };
         daemon.step(Input::Audio(graph.clone()), now);
-        daemon.step(Input::Ownership(false), now);
+        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(false)), now);
         let play = daemon.step(
             Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
             now,
@@ -5996,7 +6441,8 @@ mod tests {
                 "normal routing must not race the upcoming sink recovery"
             );
         }
-        let grant = daemon.step(Input::Ownership(true), now);
+        let grant = daemon
+            .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
         assert!(grant.effects.iter().any(|effect| matches!(effect, Effect::MuteStreams(_))));
         assert!(!grant.effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. })));
         assert!(!grant.effects.iter().any(|effect| matches!(effect, Effect::MoveStreams(_))));
@@ -6086,8 +6532,16 @@ mod tests {
                 }),
                 now,
             );
-            daemon.step(Input::Source { local: false, kind: 2, remote: Some(peer) }, now);
-            daemon.step(Input::Ownership(false), now);
+            daemon.step(
+                Input::Observation(crate::pods::observe::Observation::Source {
+                    local: false,
+                    kind: 2,
+                    remote: Some(peer),
+                }),
+                now,
+            );
+            daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(false)), now);
             let play = daemon.step(
                 Input::Player {
                     service: "org.mpris.MediaPlayer2.brave".into(),
@@ -6104,7 +6558,14 @@ mod tests {
                 .any(|effect| matches!(effect, Effect::RestartOutput { .. })));
             assert_eq!(daemon.accessory.ownership.as_fresh(), Some(&false));
             if completion == "source" {
-                daemon.step(Input::Source { local: true, kind: 2, remote: None }, now);
+                daemon.step(
+                    Input::Observation(crate::pods::observe::Observation::Source {
+                        local: true,
+                        kind: 2,
+                        remote: None,
+                    }),
+                    now,
+                );
             } else if completion == "cancel" {
                 daemon.step(Input::Command(Command::HandoffRelease), now);
             }
@@ -6127,7 +6588,8 @@ mod tests {
                 Effect::OpenLink { .. } | Effect::Disconnect { .. } | Effect::SelectProfile { .. }
             )));
             assert_eq!(daemon.connection.generation(), generation);
-            let repeated = daemon.step(Input::Ownership(true), now);
+            let repeated = daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
             assert!(!repeated
                 .effects
                 .iter()
@@ -6406,7 +6868,7 @@ mod tests {
         daemon.note_source(false, 2, later.mono);
         daemon.note_remote(addr(4), later.mono);
         assert_eq!(daemon.status_value(later)["audio_owner"]["holder"], "remote");
-        daemon.note_socket(false, daemon.connection.generation());
+        daemon.note_socket(false, daemon.connection.generation(), now.mono);
         assert_eq!(daemon.status_value(later)["audio_owner"]["holder"], "");
     }
 
@@ -6441,7 +6903,7 @@ mod tests {
                 true,
                 "one docked bud does not rule out playback through the other"
             );
-            daemon.announce_dirty = false;
+            daemon.effects.announce_dirty = false;
             daemon.note_pod(true, docked, now.mono);
             let status = daemon.status_value(now);
             assert_eq!(status["audio_owner"]["holder"], holder);
@@ -6449,7 +6911,7 @@ mod tests {
             assert_eq!(status["audio_source_type"], 2, "retain the actual accessory report");
             assert_eq!(daemon.connection.stage(), Stage::Ready);
             assert!(daemon.audio_roster(now).unwrap().audio_idle);
-            assert!(daemon.announce_dirty, "tell the fleet when the buds are docked");
+            assert!(daemon.effects.announce_dirty, "tell the fleet when the buds are docked");
             daemon.note_pod(
                 true,
                 Pod { in_case: Some(false), in_ear: Some(true), ..docked },
@@ -7226,7 +7688,7 @@ mod tests {
         let Claim::Started(generation) = daemon.connection.claim(now.mono) else {
             panic!("claim");
         };
-        daemon.note_socket(true, generation);
+        daemon.note_socket(true, generation, now.mono);
         assert!(daemon.connection.advance(OpenStep::Notifications, generation, now.mono));
         assert!(daemon.connection.mark_ready(generation));
         daemon.note_source(true, 2, now.mono);
@@ -7475,7 +7937,8 @@ mod tests {
         assert!(!daemon.resume_output_on_grant, "a new transport needs no old-output recovery");
         let repeated = daemon.step(Input::Tick, now);
         assert!(!repeated.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
-        let granted = daemon.step(Input::Ownership(true), now);
+        let granted = daemon
+            .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
         assert!(!granted.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
     }
 
@@ -7523,7 +7986,7 @@ mod tests {
                 now,
             );
             assert_eq!(daemon.routing.retain(), Some(mac));
-            assert!(daemon.drop_link, "the helper must actually free its connection slot");
+            assert!(daemon.effects.drop_link, "the helper must actually free its connection slot");
             assert!(!daemon.output.want);
             let generation = daemon.connection.generation();
             // Closing our control socket and its optimistic down notification do
@@ -7652,7 +8115,7 @@ mod tests {
         let Claim::Started(generation) = daemon.connection.claim(now) else {
             panic!("claim");
         };
-        daemon.note_socket(true, generation);
+        daemon.note_socket(true, generation, now);
         assert!(daemon.connection.advance(OpenStep::Notifications, generation, now));
         assert!(daemon.connection.mark_ready(generation));
     }
@@ -7729,7 +8192,14 @@ mod tests {
         ready_link(&mut daemon, now);
         daemon.note_pod_peers(vec![local, gram], now.unix);
         let generation = daemon.connection.generation();
-        daemon.step(Input::Source { local: false, kind: 2, remote: Some(gram) }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(gram),
+            }),
+            now,
+        );
         let claims = |outcome: &crate::step::StepOutcome| {
             outcome
                 .effects
@@ -7778,7 +8248,7 @@ mod tests {
             "request is not confirmation"
         );
         now.mono.0 += 10;
-        daemon.step(Input::Ownership(true), now);
+        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
         assert_eq!(daemon.status_value(now)["audio_owner"]["holder"], "local");
         assert_eq!(daemon.status_value(now)["roster_audio_owner"], local.display());
         let roster = daemon.audio_roster(now).unwrap();
@@ -7799,7 +8269,14 @@ mod tests {
         daemon.set_local_address(Some(local));
         ready_link(&mut daemon, now);
         daemon.note_pod_peers(vec![local, phone], now.unix);
-        daemon.step(Input::Source { local: false, kind: 2, remote: Some(phone) }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(phone),
+            }),
+            now,
+        );
         now.mono.0 += 10;
         daemon.note_peer_playback(phone, true, now.mono);
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], true);
@@ -7826,7 +8303,14 @@ mod tests {
         daemon.set_local_address(Some(local));
         ready_link(&mut daemon, now);
         daemon.note_pod_peers(vec![local, phone], now.unix);
-        daemon.step(Input::Source { local: false, kind: 2, remote: Some(phone) }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(phone),
+            }),
+            now,
+        );
         let later_by = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
         let later = later_by(crate::pods::reports::REPORT_TTL_MS * 3);
         daemon.tick(later);
@@ -7836,7 +8320,7 @@ mod tests {
         assert!(daemon.accessory.left.as_fresh().is_some());
         assert!(daemon.accessory.noise.as_fresh().is_some() || daemon.accessory.noise.is_unknown());
         // Without the link, the battery reading ages out as before.
-        daemon.note_socket(false, daemon.connection.generation());
+        daemon.note_socket(false, daemon.connection.generation(), now.mono);
         daemon.tick(later_by(crate::pods::reports::REPORT_TTL_MS * 3 + 1));
         assert!(daemon.accessory.left.as_fresh().is_none());
         assert!(daemon.accessory.left.known().is_some(), "aged, not forgotten");
@@ -7854,7 +8338,14 @@ mod tests {
         daemon.note_pod_peers(vec![local, gram], now.unix);
         daemon.note_peer_playback(gram, false, now.mono);
         now.mono.0 += 10;
-        daemon.step(Input::Source { local: false, kind: 2, remote: Some(gram) }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(gram),
+            }),
+            now,
+        );
         assert_eq!(
             daemon.status_value(now)["audio_owner"]["playing"],
             true,
@@ -7891,11 +8382,25 @@ mod tests {
         gram.note_peer_playback(local, false, now.mono);
         now.mono.0 += 100;
         now.unix.0 += 100;
-        let source = xps.step(Input::Source { local: true, kind: 2, remote: None }, now);
+        let source = xps.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: true,
+                kind: 2,
+                remote: None,
+            }),
+            now,
+        );
         let refreshed = crate::pods::peer::media_information(local, peer, "xps", false);
         assert!(source.effects.iter().any(|e| matches!(e,
             Effect::WriteControl { bytes, .. } if *bytes == refreshed)));
-        gram.step(Input::Source { local: false, kind: 2, remote: Some(local) }, now);
+        gram.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(local),
+            }),
+            now,
+        );
         let generation = gram.connection.generation();
         let mut relay = refreshed;
         relay[4] = 0x11;
@@ -7904,7 +8409,7 @@ mod tests {
         assert_eq!(gram.status_value(now)["audio_owner"]["playing"], false);
         assert!(gram.audio_roster(now).unwrap().audio_idle);
         // A same-tick ownership notification must supersede the old source.
-        gram.step(Input::Ownership(true), now);
+        gram.step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
         assert_eq!(gram.status_value(now)["audio_owner"]["holder"], "local");
         assert_eq!(gram.status_value(now)["audio_owner"]["playing"], false);
     }
@@ -7922,7 +8427,14 @@ mod tests {
         daemon.note_pod_peers(vec![local, gram], now.unix);
         daemon
             .step(Input::Players(vec![PlayerSeen { service: "brave".into(), playing: true }]), now);
-        daemon.step(Input::Source { local: true, kind: 2, remote: None }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: true,
+                kind: 2,
+                remote: None,
+            }),
+            now,
+        );
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], true);
         let paused =
             daemon.step(Input::Player { service: "brave".into(), playing: Some(false) }, now);
@@ -8020,7 +8532,10 @@ mod tests {
                     assert!(!duplicate.effects.iter().any(|e| matches!(e,
                         Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true)
                     )));
-                    daemon.step(Input::Ownership(true), now);
+                    daemon.step(
+                        Input::Observation(crate::pods::observe::Observation::Ownership(true)),
+                        now,
+                    );
                     assert_eq!(daemon.status_value(now)["audio_owner"]["holder"], "local");
                 }
             }
@@ -8038,7 +8553,14 @@ mod tests {
             daemon.set_local_address(Some(local));
             ready_link(&mut daemon, now);
             daemon.note_pod_peers(vec![local, gram], now.unix);
-            daemon.step(Input::Source { local: false, kind: 2, remote: Some(gram) }, now);
+            daemon.step(
+                Input::Observation(crate::pods::observe::Observation::Source {
+                    local: false,
+                    kind: 2,
+                    remote: Some(gram),
+                }),
+                now,
+            );
             let generation = daemon.connection.generation();
             daemon.note_peer_playback(gram, true, now.mono);
             let activity = daemon.step(Input::Command(Command::Activity), now);
@@ -8084,7 +8606,14 @@ mod tests {
             })
         };
         // No ownership notification after attaching to an existing idle link.
-        daemon.step(Input::Source { local: true, kind: 0, remote: None }, now);
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: true,
+                kind: 0,
+                remote: None,
+            }),
+            now,
+        );
         assert_eq!(daemon.audio_roster(now).unwrap().audio_source, None);
         daemon.step(roster(local), now);
         assert_eq!(daemon.status_value(now)["audio_owner"]["holder"], "local");

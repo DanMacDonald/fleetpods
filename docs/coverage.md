@@ -114,3 +114,8 @@ The [two-laptop hardware regression](hardware-regression.md) records repeated Re
 
 - Volume controls worked in the user's hardware test. The exact input path and five-percent step behavior were not identified, and this observation does not independently verify conversation-awareness ducking/restoration.
 - Clicking the AirPods to pause playback on Gram was reported to also start playback on a connected iPhone. The observation has not been correlated with button, ownership, player, and fleet events. It is not yet attributed to the daemon, the accessory, or iPhone behavior; no corrective takeover or pause policy has been added.
+
+
+## Switching validation update, 2026-10-14
+
+The [switching validation](switching-validation-2026-10-14.md) records the current 285 passing unit tests, 32 passing acceptance scenarios, 177 passing QML checks, and the model, replay, formatting, Clippy and release-build checks. It also records the corrected background reconnect race and live two-laptop results: six standard Reconnect cycles, four deliberate race checks, six browser takeover/protection/pause cycles, and eight idle activity transfers. The source audit above remains dated 2026-10-13; this validation update does not replace it.

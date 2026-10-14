@@ -42,6 +42,11 @@ Item {
     : isMax ? [0, 12, 34, 38]
     : [10.5, 26.5, 35, 25.5]
 
+  // The artwork's painted extent in this item's coordinates.
+  readonly property rect inkBox: Qt.rect(
+    isCase ? caseX + ink[0] * fit : (iconSize - ink[2] * fit) / 2,
+    (isCase ? caseY + ink[1] * fit : (iconSize - ink[3] * fit) / 2) + (isCase ? 0 : (1 - budsIn) * -iconSize),
+    ink[2] * fit, ink[3] * fit)
   readonly property real fit: iconSize / Math.max(ink[2], ink[3])
   readonly property real caseBaseline: (iconSize + 44 * fit) / 2
   readonly property real caseX: (iconSize - ink[2] * fit) / 2 - ink[0] * fit
@@ -126,10 +131,10 @@ Item {
   // center, so the glyph hangs below the other icons. This rect is the ink.
   Rectangle {
     color: "transparent"
-    x: root.isCase ? root.caseX + root.ink[0] * root.fit : (root.iconSize - root.ink[2] * root.fit) / 2
-    y: (root.isCase ? root.caseY + root.ink[1] * root.fit : (root.iconSize - root.ink[3] * root.fit) / 2) + (root.isCase ? 0 : (1 - root.budsIn) * -root.iconSize)
-    width: root.ink[2] * root.fit
-    height: root.ink[3] * root.fit
+    x: root.inkBox.x
+    y: root.inkBox.y
+    width: root.inkBox.width
+    height: root.inkBox.height
   }
 
   NumberAnimation {
