@@ -79,6 +79,9 @@ pub struct Daemon {
     reconnect: crate::pods::reconnect::Reconnect,
     reconnect_retry_at: Option<MonoMs>,
     reconnect_retries: u8,
+    /// After yielding a slot for an Apple reconnect, do not auto-attach
+    /// again until this passes: the freed slot is for the Apple device.
+    slot_hold_until: Option<MonoMs>,
     codec_asked: Option<String>,
     transport_asked: bool,
     pub(crate) staged_controls: Vec<Vec<u8>>,
@@ -187,6 +190,10 @@ enum ActivityTarget {
 const RECONNECT_RETRY_DELAY_MS: u64 = 3_000;
 const RECONNECT_RETRY_LIMIT: u8 = 3;
 
+/// How long a yielded slot stays yielded: long enough for the Apple device
+/// to take it, short enough that the laptop rejoins on its own afterwards.
+const SLOT_HOLD_MS: u64 = 30_000;
+
 /// An incoming invitation held aside across a fleet reset (see
 /// [`Daemon::take_invitation`]).
 pub(crate) struct InvitationSave {
@@ -241,6 +248,7 @@ impl Daemon {
             reconnect: crate::pods::reconnect::Reconnect::new(),
             reconnect_retry_at: None,
             reconnect_retries: 0,
+            slot_hold_until: None,
             codec_asked: None,
             transport_asked: false,
             staged_controls: Vec::new(),
@@ -535,6 +543,7 @@ impl Daemon {
         let ready = self.connection.mark_ready(generation);
         if ready {
             self.displaced = false;
+            self.slot_hold_until = None;
             self.background_requested = false;
             self.microphone.set_control_ready(true);
         }
@@ -702,6 +711,12 @@ impl Daemon {
     /// An existing Bluetooth ACL still needs a tracked, retryable control setup.
     /// Property updates must never reopen an established seat that was lost.
     pub(crate) fn attach_available(&mut self, generation: Generation, now: MonoMs) {
+        // A slot yielded for an Apple reconnect stays yielded for a while:
+        // the pods offering the ACL back is not an invitation to retake it.
+        if self.slot_hold_until.is_some_and(|until| now.0 < until.0) {
+            return;
+        }
+        self.slot_hold_until = None;
         if generation != self.connection.generation()
             || !matches!(self.connection.stage(), Stage::Idle | Stage::Waiting)
             || self.connection.bluez() != Some(true)
@@ -2695,6 +2710,7 @@ impl Daemon {
         }
         self.step_back(now);
         self.drop_link = true;
+        self.slot_hold_until = Some(now.mono.saturating_add(SLOT_HOLD_MS));
     }
 
     pub(crate) fn step_back(&mut self, now: Clock) {
@@ -4647,6 +4663,29 @@ mod tests {
         let dropped = daemon.step(Input::Accessory { generation, packet }, now);
         assert!(dropped.effects.iter().any(|effect| matches!(effect, Effect::Disconnect { .. })));
         assert!(!daemon.routing().want_seat());
+    }
+
+    #[test]
+    fn a_yielded_slot_stays_yielded_until_the_hold_passes() {
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        let local = Address::parse("02:00:00:00:00:01").unwrap();
+        let peer = Address::parse("02:00:00:00:00:02").unwrap();
+        daemon.set_local_address(Some(local));
+        daemon.select_accessory(Some(addr(3)));
+        daemon.note_bluez(true);
+        daemon.peers_seated.push(peer);
+
+        daemon.free_slot(peer, now);
+        assert!(daemon.drop_link);
+        assert!(daemon.slot_hold_until.is_some());
+
+        let generation = daemon.connection().generation();
+        daemon.attach_available(generation, now.mono.saturating_add(1_000));
+        assert!(!daemon.background_requested, "no auto-attach during the hold");
+
+        daemon.attach_available(generation, now.mono.saturating_add(SLOT_HOLD_MS + 1));
+        assert!(daemon.background_requested, "auto-attach resumes after the hold");
     }
 
     #[test]
