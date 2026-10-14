@@ -8,5 +8,6 @@ pub mod link;
 pub mod nearby;
 pub mod peer;
 pub mod prefs;
+pub mod reconnect;
 pub mod reports;
 pub mod setup;

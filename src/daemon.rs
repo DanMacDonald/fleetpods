@@ -87,7 +87,7 @@ pub struct Daemon {
     pub(crate) pause_players: Vec<String>,
     /// The only seat record. Claim and step-back are its writers. Status reads it.
     pub(crate) seat: Seat,
-    reconnect: Reconnect,
+    reconnect: crate::pods::reconnect::Reconnect,
     codec_asked: Option<String>,
     transport_asked: bool,
     pub(crate) staged_controls: Vec<Vec<u8>>,
@@ -200,38 +200,11 @@ struct RosterAirMark {
     audio_idle: bool,
 }
 
-const PAUSE_WAIT_MS: u64 = 3_000;
-const PEER_LEAVE_MS: u64 = 5_000;
-const DROP_WAIT_MS: u64 = 5_000;
-const REJOIN_DELAY_MS: u64 = 2_000;
-const RETURN_WAIT_MS: u64 = 15_000;
-const PEER_STAYED: &str =
-    "Omarchy peer did not disconnect; update that peer or disconnect it manually";
-
 #[derive(Clone, Copy)]
 enum ActivityTarget {
     None,
     One(Address),
     Several,
-}
-
-enum Reconnect {
-    Idle,
-    Pausing {
-        until: MonoMs,
-    },
-    /// The other laptops were asked to leave. This link stays up until they do.
-    Awaiting {
-        until: MonoMs,
-    },
-    Dropping {
-        until: MonoMs,
-    },
-    Waiting {
-        rejoin_at: MonoMs,
-        until: MonoMs,
-        sent: bool,
-    },
 }
 
 /// An incoming invitation held aside across a fleet reset (see
@@ -285,7 +258,7 @@ impl Daemon {
             priority_generation: 0,
             pause_players: Vec::new(),
             seat: Seat::new(),
-            reconnect: Reconnect::Idle,
+            reconnect: crate::pods::reconnect::Reconnect::new(),
             codec_asked: None,
             transport_asked: false,
             staged_controls: Vec::new(),
@@ -2801,8 +2774,7 @@ impl Daemon {
                 if !players.is_empty() {
                     self.pause_players = players;
                 }
-                self.reconnect =
-                    Reconnect::Pausing { until: now.mono.saturating_add(PAUSE_WAIT_MS) };
+                self.reconnect.begin(now.mono);
                 Response::line("accepted")
             }
             Err(message) => Response::line(message.trim_end()),
@@ -2810,59 +2782,26 @@ impl Daemon {
     }
 
     fn advance_reconnect(&mut self, now: Clock) {
-        match self.reconnect {
-            Reconnect::Idle => {}
-            Reconnect::Pausing { until } => {
-                let quiet = !self.audio.local_playing();
-                if !quiet && now.mono.0 < until.0 {
-                    return;
-                }
-                if !quiet {
-                    self.fail_reconnect("local audio did not pause", now);
-                    return;
-                }
-                self.send_reconnect_requests();
-                self.reconnect =
-                    Reconnect::Awaiting { until: now.mono.saturating_add(PEER_LEAVE_MS) };
+        use crate::pods::reconnect::{Advance, Facts};
+        let facts = Facts {
+            quiet: !self.audio.local_playing(),
+            peers_left: self.reconnect_peers().is_empty(),
+            link_down: self.connection.socket_up() != Some(true)
+                || self.connection.bluez() == Some(false),
+            link_ready: self.connection.stage() == Stage::Ready
+                && self.connection.socket_up() == Some(true)
+                && self.connection.bluez() != Some(false),
+        };
+        match self.reconnect.advance(now.mono, facts) {
+            Advance::None => {}
+            Advance::SendRequests => self.send_reconnect_requests(),
+            Advance::DropLink => self.drop_link = true,
+            Advance::Rejoin => {
+                self.background_requested = true;
+                self.connection.rejoin_after_apple_reconnect(now.mono);
             }
-            Reconnect::Awaiting { until } => {
-                if self.reconnect_peers().is_empty() {
-                    self.drop_link = true;
-                    self.reconnect =
-                        Reconnect::Dropping { until: now.mono.saturating_add(DROP_WAIT_MS) };
-                } else if now.mono.0 >= until.0 {
-                    self.fail_reconnect(PEER_STAYED, now);
-                }
-            }
-            Reconnect::Dropping { until } => {
-                let down = self.connection.socket_up() != Some(true)
-                    || self.connection.bluez() == Some(false);
-                if down {
-                    self.reconnect = Reconnect::Waiting {
-                        rejoin_at: now.mono.saturating_add(REJOIN_DELAY_MS),
-                        until: now.mono.saturating_add(RETURN_WAIT_MS),
-                        sent: false,
-                    };
-                } else if now.mono.0 >= until.0 {
-                    self.fail_reconnect("link did not drop", now);
-                }
-            }
-            Reconnect::Waiting { rejoin_at, until, sent } => {
-                let ready = self.connection.stage() == Stage::Ready
-                    && self.connection.socket_up() == Some(true);
-                if ready && self.connection.bluez() != Some(false) {
-                    self.reconnect = Reconnect::Idle;
-                    self.seat.note_reconnected(now);
-                    return;
-                }
-                if !sent && now.mono.0 >= rejoin_at.0 {
-                    self.background_requested = true;
-                    self.connection.rejoin_after_apple_reconnect(now.mono);
-                    self.reconnect = Reconnect::Waiting { rejoin_at, until, sent: true };
-                } else if now.mono.0 >= until.0 {
-                    self.fail_reconnect("link did not return", now);
-                }
-            }
+            Advance::Done => self.seat.note_reconnected(now),
+            Advance::Fail(reason) => self.fail_reconnect(reason, now),
         }
     }
 
@@ -2892,7 +2831,7 @@ impl Daemon {
     fn fail_reconnect(&mut self, reason: &'static str, now: Clock) {
         self.connection.fail_apple_reconnect(reason);
         self.background_requested = false;
-        self.reconnect = Reconnect::Idle;
+        self.reconnect.cancel();
         self.seat.note_failure(reason, now);
     }
 
@@ -3204,7 +3143,7 @@ impl Daemon {
         self.connection.wait_for_case();
         self.connection.note_bluez(false);
         self.select_accessory(None);
-        self.reconnect = Reconnect::Idle;
+        self.reconnect.cancel();
         self.link_asked = None;
         self.follow_link = false;
         self.drop_link = false;
@@ -4622,6 +4561,7 @@ mod tests {
                 Member { address: peer, label: "gram".into() },
             ],
         });
+        use crate::pods::reconnect::{PEER_LEAVE_MS, PEER_STAYED};
         daemon.note_pod_peers(vec![local, peer], now.unix);
         daemon.routing.claim_audio();
         daemon.step(Input::Command(Command::ReconnectPeer), now);
