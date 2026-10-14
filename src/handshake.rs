@@ -107,7 +107,7 @@ impl Daemon {
                 } else {
                     self.enrollment.cancel(id);
                 }
-                self.pending_commit = None;
+                self.commit.clear();
                 self.keyring_dirty = false;
                 self.pake = None;
                 self.offer = None;
@@ -174,8 +174,7 @@ impl Daemon {
         let Some((peer, _)) = self.enrollment.peer() else {
             return;
         };
-        self.pending_commit =
-            Some(crate::daemon::PendingCommit::Grant { to: peer, id, confirm: tag, proposal });
+        self.commit.stage_grant(peer, id, tag, proposal);
         self.keyring_dirty = true;
     }
 
@@ -185,7 +184,7 @@ impl Daemon {
             return;
         }
         let Some(proposal) = self.prepare_enrollment(id, proposal) else { return };
-        self.pending_commit = Some(crate::daemon::PendingCommit::Saved { to: from, id, proposal });
+        self.commit.stage_saved(from, id, proposal);
         self.keyring_dirty = true;
     }
 
@@ -206,7 +205,7 @@ impl Daemon {
             _ => "The proposed fleet membership is invalid. Its saved fleet was not replaced.",
         };
         if self.enrollment.fail(id, message) {
-            self.pending_commit = None;
+            self.commit.clear();
             self.keyring_dirty = false;
             if let Some((peer, _)) = self.enrollment.peer() {
                 self.send(peer, Letter::Cancel { id });
@@ -328,11 +327,11 @@ mod tests {
         assert!(joiner.enrollment.submit_code(id, code));
         joiner.answer_submit();
         transfer(&mut joiner, &mut inviter, now);
-        assert!(inviter.pending_commit.is_some());
+        assert!(inviter.commit.is_staged());
         // The inviter's write is complete before its grant is sent.
         inviter.persist_enrollment(id).unwrap();
-        let crate::daemon::PendingCommit::Grant { to, id, confirm, proposal } =
-            inviter.pending_commit.take().unwrap()
+        let crate::fleet::commit::Pending::Grant { to, id, confirm, proposal } =
+            inviter.commit.take().unwrap()
         else {
             panic!("expected grant")
         };
@@ -370,7 +369,7 @@ mod tests {
         assert!(xps.enrollment.submit_code(xps.enrollment.id().unwrap(), code));
         xps.answer_submit();
         transfer(&mut xps, &mut gram, now);
-        let proposed = gram.pending_commit.as_ref().unwrap().fleet();
+        let proposed = gram.commit.fleet().unwrap();
         assert_eq!(proposed.id, original.id);
         assert_eq!(proposed.key, original.key);
         assert!(proposed.members.iter().any(|member| member.address == address(1)));
@@ -394,7 +393,7 @@ mod tests {
             assert_eq!(joiner.enrollment.phase(), Phase::Error);
             assert!(joiner.enrollment.error().contains("different fleet"));
             assert_eq!(joiner.saved_fleet(), Some(original));
-            assert!(joiner.pending_commit.is_none());
+            assert!(!joiner.commit.is_staged());
             assert!(!joiner.keyring_dirty);
             transfer(&mut joiner, &mut inviter, now);
             assert_eq!(inviter.enrollment.phase(), Phase::Error);

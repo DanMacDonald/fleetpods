@@ -421,7 +421,7 @@ impl Daemon {
                 None
             }
             Input::KeyringFailed => {
-                if let Some(pending) = self.pending_commit.take() {
+                if let Some(pending) = self.commit.take() {
                     self.enrollment.note_store_failed(pending.id());
                 }
                 None
@@ -915,8 +915,8 @@ impl Daemon {
         }
         if self.keyring_dirty {
             self.keyring_dirty = false;
-            if let Some(pending) = &self.pending_commit {
-                effects.push(Effect::WriteKeyring(pending.fleet()));
+            if let Some(fleet) = self.commit.fleet() {
+                effects.push(Effect::WriteKeyring(fleet));
             }
         }
         let accessory = self.config.accessory;
@@ -1089,7 +1089,7 @@ impl Daemon {
     }
 
     fn commit_keyring(&mut self) {
-        let Some(pending) = self.pending_commit.take() else {
+        let Some(pending) = self.commit.take() else {
             return;
         };
         let id = pending.id();
@@ -1098,10 +1098,10 @@ impl Daemon {
             return;
         }
         match pending {
-            crate::daemon::PendingCommit::Grant { to, id, confirm, proposal } => {
+            crate::fleet::commit::Pending::Grant { to, id, confirm, proposal } => {
                 self.send(to, crate::fleet::letter::Letter::Grant { id, confirm, proposal });
             }
-            crate::daemon::PendingCommit::Saved { to, id, proposal } => {
+            crate::fleet::commit::Pending::Saved { to, id, proposal } => {
                 self.send(
                     to,
                     crate::fleet::letter::Letter::Saved { id, members: proposal.members.clone() },

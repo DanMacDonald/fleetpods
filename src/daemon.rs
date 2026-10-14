@@ -49,27 +49,6 @@ pub(crate) struct PresenceMark {
     handoff: bool,
 }
 
-/// A fleet the keyring has not accepted yet. Membership stays unchanged.
-pub(crate) enum PendingCommit {
-    Grant { to: Address, id: InvitationId, confirm: [u8; 32], proposal: Proposal },
-    Saved { to: Address, id: InvitationId, proposal: Proposal },
-}
-
-impl PendingCommit {
-    pub(crate) fn id(&self) -> InvitationId {
-        match self {
-            Self::Grant { id, .. } | Self::Saved { id, .. } => *id,
-        }
-    }
-
-    pub(crate) fn fleet(&self) -> Fleet {
-        let proposal = match self {
-            Self::Grant { proposal, .. } | Self::Saved { proposal, .. } => proposal,
-        };
-        Fleet { id: proposal.id, key: proposal.key.clone(), members: proposal.members.clone() }
-    }
-}
-
 pub struct Daemon {
     pub(crate) local_name: String,
     pub(crate) local_address: Option<Address>,
@@ -97,7 +76,7 @@ pub struct Daemon {
     pub(crate) link_asked: Option<Generation>,
     pub(crate) announce_dirty: bool,
     pub(crate) keyring_dirty: bool,
-    pub(crate) pending_commit: Option<PendingCommit>,
+    pub(crate) commit: crate::fleet::commit::Commit,
     pub(crate) accessory_setup: Setup,
     pub(crate) control_out: Vec<(Generation, Vec<u8>)>,
     pub(crate) secret_out: Vec<(String, Vec<u8>)>,
@@ -288,7 +267,7 @@ impl Daemon {
             link_asked: None,
             announce_dirty: true,
             keyring_dirty: false,
-            pending_commit: None,
+            commit: crate::fleet::commit::Commit::new(),
             accessory_setup: Setup::new(),
             control_out: Vec::new(),
             secret_out: Vec::new(),
@@ -2043,7 +2022,7 @@ impl Daemon {
             return Err("unlock the keyring before removing a fleet member");
         }
         if self.enrollment.phase().active()
-            || self.pending_commit.is_some()
+            || self.commit.is_staged()
             || self.keyring_dirty
             || self.routing.phase().busy()
         {
@@ -2085,7 +2064,7 @@ impl Daemon {
         self.membership.mark_confirmed_empty();
         self.keyring_locked = false;
         self.keyring_dirty = false;
-        self.pending_commit = None;
+        self.commit.clear();
         self.enrollment = Enrollment::new();
         self.pake = None;
         self.offer = None;
@@ -3449,15 +3428,15 @@ mod tests {
             id,
             now.mono
         ));
-        daemon.pending_commit = Some(PendingCommit::Saved {
-            to: addr(2),
+        daemon.commit.stage_saved(
+            addr(2),
             id,
-            proposal: Proposal {
+            Proposal {
                 id: FleetId::new([3; 16]),
                 key: GroupKey::new([4; 32]),
                 members: vec![Member { address: addr(2), label: "gram".into() }],
             },
-        });
+        );
         daemon.keyring_dirty = true;
         daemon.routing.start(addr(2));
         daemon.held_peers.push(addr(2));
@@ -3481,7 +3460,7 @@ mod tests {
         assert!(!daemon.routing.phase().busy());
         assert!(daemon.output.want);
         assert!(daemon.held_peers.is_empty());
-        assert!(daemon.pending_commit.is_none());
+        assert!(!daemon.commit.is_staged());
         assert!(!outcome.effects.iter().any(|effect| matches!(
             effect,
             Effect::WriteKeyring(_)

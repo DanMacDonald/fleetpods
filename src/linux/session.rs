@@ -136,7 +136,7 @@ impl Session {
         {
             if self.daemon.enrollment.id() != Some(id)
                 || self.daemon.enrollment.phase() != crate::fleet::enroll::Phase::Incoming
-                || self.daemon.pending_commit.is_some()
+                || self.daemon.commit.is_staged()
             {
                 return Some("error: this invitation is no longer awaiting a code\n".into());
             }
