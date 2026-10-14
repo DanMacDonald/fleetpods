@@ -75,23 +75,53 @@ impl Response {
     }
 }
 
+/// One simple verb the socket speaks: its wire name, whether the CLI blocks
+/// until a reply, and the command it means. The parser and the CLI both read
+/// this table, so a verb is named in exactly one place. The framed families
+/// (`fleet:`, `incoming:`, `playback:`, `adaptive:`, `priority:`) carry a
+/// payload and are parsed separately; of those only `fleet` waits.
+struct Verb {
+    wire: &'static str,
+    waits: bool,
+    make: fn() -> Command,
+}
+
+const SIMPLE: &[Verb] = &[
+    Verb { wire: "status", waits: true, make: || Command::Status },
+    Verb { wire: "fleet-reset", waits: true, make: || Command::FleetReset },
+    Verb { wire: "activity", waits: true, make: || Command::Activity },
+    Verb { wire: "connect", waits: true, make: || Command::Connect },
+    Verb { wire: "audio-reset", waits: true, make: || Command::AudioReset },
+    Verb { wire: "disconnect", waits: false, make: || Command::Disconnect },
+    Verb { wire: "reconnect-peer", waits: true, make: || Command::ReconnectPeer },
+    Verb { wire: "forget", waits: false, make: || Command::Forget },
+    Verb { wire: "reopen", waits: true, make: || Command::Reopen },
+    Verb { wire: "noise:off", waits: false, make: || Command::Noise(NoiseMode::Off) },
+    Verb { wire: "noise:anc", waits: false, make: || Command::Noise(NoiseMode::Anc) },
+    Verb {
+        wire: "noise:transparency",
+        waits: false,
+        make: || Command::Noise(NoiseMode::Transparency),
+    },
+    Verb { wire: "noise:adaptive", waits: false, make: || Command::Noise(NoiseMode::Adaptive) },
+    Verb { wire: "noise:cycle", waits: false, make: || Command::NoiseCycle },
+    Verb { wire: "ear:one", waits: false, make: || Command::Ear(EarBehavior::PauseOne) },
+    Verb { wire: "ear:both", waits: false, make: || Command::Ear(EarBehavior::PauseBoth) },
+    Verb { wire: "ear:off", waits: false, make: || Command::Ear(EarBehavior::Disabled) },
+    Verb { wire: "ca:on", waits: false, make: || Command::Conversation(true) },
+    Verb { wire: "ca:off", waits: false, make: || Command::Conversation(false) },
+    Verb { wire: "onebud:on", waits: false, make: || Command::OneBud(true) },
+    Verb { wire: "onebud:off", waits: false, make: || Command::OneBud(false) },
+    Verb { wire: "handoff:claim", waits: true, make: || Command::HandoffClaim },
+    Verb { wire: "handoff:release", waits: true, make: || Command::HandoffRelease },
+    Verb { wire: "scan:pause", waits: true, make: || Command::ScanPause },
+    Verb { wire: "scan:resume", waits: true, make: || Command::ScanResume },
+    Verb { wire: "solo", waits: false, make: || Command::Solo },
+];
+
 /// `true` when the existing CLI blocks until a reply.
 pub fn cli_waits(command: &str) -> bool {
-    matches!(
-        command,
-        "fleet"
-            | "fleet-reset"
-            | "connect"
-            | "audio-reset"
-            | "reconnect-peer"
-            | "activity"
-            | "handoff:claim"
-            | "handoff:release"
-            | "status"
-            | "reopen"
-            | "scan:pause"
-            | "scan:resume"
-    )
+    command == "fleet" || SIMPLE.iter().any(|verb| verb.wire == command && verb.waits)
 }
 
 pub fn push(bytes: &[u8]) -> Incoming {
@@ -134,34 +164,9 @@ fn parse_text(text: &str) -> Command {
     if let Some(payload) = text.strip_prefix("priority:") {
         return Command::Priority(payload.trim().to_string());
     }
-    match text {
-        "status" => Command::Status,
-        "fleet-reset" => Command::FleetReset,
-        "activity" => Command::Activity,
-        "connect" => Command::Connect,
-        "audio-reset" => Command::AudioReset,
-        "disconnect" => Command::Disconnect,
-        "reconnect-peer" => Command::ReconnectPeer,
-        "forget" => Command::Forget,
-        "reopen" => Command::Reopen,
-        "noise:off" => Command::Noise(NoiseMode::Off),
-        "noise:anc" => Command::Noise(NoiseMode::Anc),
-        "noise:transparency" => Command::Noise(NoiseMode::Transparency),
-        "noise:adaptive" => Command::Noise(NoiseMode::Adaptive),
-        "noise:cycle" => Command::NoiseCycle,
-        "ear:one" => Command::Ear(EarBehavior::PauseOne),
-        "ear:both" => Command::Ear(EarBehavior::PauseBoth),
-        "ear:off" => Command::Ear(EarBehavior::Disabled),
-        "ca:on" => Command::Conversation(true),
-        "ca:off" => Command::Conversation(false),
-        "onebud:on" => Command::OneBud(true),
-        "onebud:off" => Command::OneBud(false),
-        "handoff:claim" => Command::HandoffClaim,
-        "handoff:release" => Command::HandoffRelease,
-        "scan:pause" => Command::ScanPause,
-        "scan:resume" => Command::ScanResume,
-        "solo" => Command::Solo,
-        _ => Command::Unknown,
+    match SIMPLE.iter().find(|verb| verb.wire == text) {
+        Some(verb) => (verb.make)(),
+        None => Command::Unknown,
     }
 }
 
@@ -293,6 +298,17 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn every_simple_verb_parses_and_waits_as_described() {
+        for verb in SIMPLE {
+            assert_eq!(parse_text(verb.wire), (verb.make)(), "verb {}", verb.wire);
+            assert_eq!(cli_waits(verb.wire), verb.waits, "verb {}", verb.wire);
+        }
+        assert!(cli_waits("fleet"));
+        assert!(!cli_waits("disconnect"));
+        assert!(!cli_waits("nonsense"));
     }
 
     #[test]
