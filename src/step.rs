@@ -732,14 +732,6 @@ impl Daemon {
 
     fn hear_radio(&mut self, bytes: &[u8], source: Option<Address>, now: Clock) {
         match postcard::decode(bytes) {
-            Some(Postcard::Letter { from, body, .. }) => {
-                let name = match &body {
-                    crate::fleet::letter::Letter::Hello { name, .. } => Some(name.clone()),
-                    _ => None,
-                };
-                self.note_letter_peer(from, name, now);
-                self.deliver(from, body, now);
-            }
             Some(Postcard::Announce { from, name, .. }) => {
                 self.hear_announce(from, name, now);
             }
