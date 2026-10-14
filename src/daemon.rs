@@ -77,6 +77,8 @@ pub struct Daemon {
     /// The only seat record. Claim and step-back are its writers. Status reads it.
     pub(crate) seat: Seat,
     reconnect: crate::pods::reconnect::Reconnect,
+    reconnect_retry_at: Option<MonoMs>,
+    reconnect_retries: u8,
     codec_asked: Option<String>,
     transport_asked: bool,
     pub(crate) staged_controls: Vec<Vec<u8>>,
@@ -180,6 +182,11 @@ enum ActivityTarget {
     Several,
 }
 
+/// Delay between automatic retries after a failed Apple reconnect, and how
+/// many to attempt before waiting for activity again.
+const RECONNECT_RETRY_DELAY_MS: u64 = 3_000;
+const RECONNECT_RETRY_LIMIT: u8 = 3;
+
 /// An incoming invitation held aside across a fleet reset (see
 /// [`Daemon::take_invitation`]).
 pub(crate) struct InvitationSave {
@@ -232,6 +239,8 @@ impl Daemon {
             pause_players: Vec::new(),
             seat: Seat::new(),
             reconnect: crate::pods::reconnect::Reconnect::new(),
+            reconnect_retry_at: None,
+            reconnect_retries: 0,
             codec_asked: None,
             transport_asked: false,
             staged_controls: Vec::new(),
@@ -481,6 +490,7 @@ impl Daemon {
         }
         self.consider_capture_stall(now.mono);
         self.advance_reconnect(now);
+        self.retry_failed_reconnect(now);
     }
 
     pub fn note_bluez(&mut self, up: bool) {
@@ -2727,6 +2737,8 @@ impl Daemon {
             Ok(()) => {
                 self.routing.release_audio();
                 self.background_requested = false;
+                self.reconnect_retry_at = None;
+                self.reconnect_retries = 0;
                 self.seat.begin_reconnect(now);
                 self.output.want = false;
                 self.transport_asked = false;
@@ -2793,6 +2805,49 @@ impl Daemon {
         self.background_requested = false;
         self.reconnect.cancel();
         self.seat.note_failure(reason, now);
+        // The attempt is over, but sitting disconnected until the next
+        // activity helps nobody: retry the background connection on a
+        // bounded schedule (see retry_failed_reconnect).
+        self.reconnect_retries = 0;
+        self.reconnect_retry_at = Some(now.mono.saturating_add(RECONNECT_RETRY_DELAY_MS));
+    }
+
+    /// Bounded automatic retry after a failed Apple reconnect: reopen the
+    /// background control connection a few times, then go back to waiting
+    /// for activity. Buds back in the case or a quiet radio end it sooner.
+    fn retry_failed_reconnect(&mut self, now: Clock) {
+        if self.connection.stage() == Stage::Ready {
+            self.reconnect_retry_at = None;
+            self.reconnect_retries = 0;
+            return;
+        }
+        let Some(at) = self.reconnect_retry_at else {
+            return;
+        };
+        if now.mono.0 < at.0 {
+            return;
+        }
+        if self.reconnect_retries >= RECONNECT_RETRY_LIMIT
+            || self.accessory.both_docked()
+            || self.radio_quiet()
+            || matches!(
+                self.connection.stage(),
+                Stage::Connecting | Stage::Handshake | Stage::Features | Stage::Notifications
+            )
+        {
+            self.reconnect_retry_at = None;
+            return;
+        }
+        self.reconnect_retries += 1;
+        self.reconnect_retry_at = Some(now.mono.saturating_add(RECONNECT_RETRY_DELAY_MS));
+        eprintln!(
+            "fleetpodsd: automatically retrying the AirPods connection after a failed reconnect (attempt {})",
+            self.reconnect_retries
+        );
+        self.open_background_connection(now);
+        if !self.background_requested {
+            self.reconnect_retry_at = None;
+        }
     }
 
     fn can_rearm_output(&self) -> bool {
@@ -4467,8 +4522,18 @@ mod tests {
         daemon.step(Input::Tick, Clock::new(now.mono.0 + 30_000, now.unix.0));
         assert_eq!(daemon.connection.stage(), Stage::Interrupted);
         assert!(!daemon.background_requested);
-        let later = daemon.step(Input::Tick, Clock::new(now.mono.0 + 60_000, now.unix.0));
-        assert!(!later.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
+        // After the failure the daemon retries the background connection on
+        // its own, a bounded number of times, then waits for activity again.
+        let retried = daemon.step(Input::Tick, Clock::new(now.mono.0 + 33_100, now.unix.0));
+        assert!(
+            retried.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })),
+            "a failed reconnect retries without waiting for activity"
+        );
+        assert_eq!(daemon.reconnect_retries, 1);
+        for elapsed in [36_100, 39_100, 42_100, 60_000, 120_000] {
+            daemon.step(Input::Tick, Clock::new(now.mono.0 + elapsed, now.unix.0));
+        }
+        assert!(daemon.reconnect_retry_at.is_none(), "automatic retries are bounded");
     }
 
     #[test]
@@ -4536,6 +4601,32 @@ mod tests {
             daemon.status_value(now)["control_connection"]["peer_reconnect_error"],
             PEER_STAYED
         );
+    }
+
+    #[test]
+    fn a_failed_reconnect_retries_the_background_connection_on_its_own() {
+        use crate::step::Input;
+
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.note_lid(true, now.mono);
+        let generation = daemon.connection().generation();
+        daemon.note_socket(false, generation);
+        daemon.fail_reconnect("link did not return", now);
+        assert!(daemon.reconnect_retry_at.is_some());
+
+        let early = Clock::new(now.mono.0 + 1_000, now.unix.0 + 1_000);
+        daemon.step(Input::Tick, early);
+        assert_eq!(daemon.reconnect_retries, 0, "no retry before the delay");
+
+        let due = Clock::new(
+            now.mono.0 + RECONNECT_RETRY_DELAY_MS + 100,
+            now.unix.0 + RECONNECT_RETRY_DELAY_MS + 100,
+        );
+        daemon.step(Input::Tick, due);
+        assert_eq!(daemon.reconnect_retries, 1, "the retry fires on its own");
+        assert!(daemon.background_requested, "the retry opens the background connection");
     }
 
     #[test]
