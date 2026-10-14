@@ -2,6 +2,8 @@
 
 ![FleetPods showing iPhone audio playback and an Omarchy machine connected to the AirPods](docs/images/fleetpods-connections.png)
 
+**FleetPods is in beta.** AirPods Pro 3 is the current tested hardware. Broader hardware support and complete fleet roster management are the goals for version 1.0.
+
 ## The Problem
 
 AirPods are some of the best earbuds on the market, and they work wonderfully so long as everything you own is made by Apple.
@@ -20,11 +22,15 @@ FleetPods adds that request and yield coordination between Omarchy machines, alo
 
 The Omarchy plugin shows the state of play: which devices currently hold the two AirPods connections, which fleet devices are nearby, when an Apple device can take over seamlessly, and when a manual connection is still required.
 
-## Where This Is Going
+## Road to 1.0
 
-Future versions may include a macOS daemon that speaks the FleetPods protocol, so every machine in the fleet, Apple or not, can request and yield the AirPods the same way.
+Version 1.0 targets:
 
-I’d also like to expand support to AirPods Max, other AirPods Pro models, and standard AirPods. I just need to buy them all so I can test them properly.
+- **Full AirPods hardware support:** Support the full Apple AirPods catalog, including AirPods, AirPods Pro, and AirPods Max, with each model tested on real hardware.
+- **Matching artwork:** Model-specific artwork for every supported AirPods device.
+- **Fleet roster management:** A clear view of fleet membership, with controls for adding and removing devices and leaving a fleet.
+
+Future versions may also include a macOS daemon that brings Apple computers into the FleetPods protocol, so every machine in the fleet can request and yield the AirPods the same way.
 
 FleetPods includes a Rust daemon and an Omarchy plugin. Behavior is specified in [REQUIREMENTS.md](REQUIREMENTS.md).
 
