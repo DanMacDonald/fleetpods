@@ -77,7 +77,21 @@ On Omarchy with shell plugin support, install Rust and Cargo and the [build depe
 
 This builds FleetPods, installs its user service and microphone support, and enables the plugin in the bar. Open the FleetPods icon to get started. Pair your AirPods through Bluetooth if this is their first connection to the machine.
 
-See the [installation guide](docs/installation.md) for cloning, first pairing, joining a fleet, upgrades, and removal. AirPods Pro 3 is the current tested hardware; see [support and known limitations](docs/support.md) for compatibility and troubleshooting.
+See the [installation guide](docs/installation.md) for cloning, first pairing, joining a fleet, and upgrades. AirPods Pro 3 is the current tested hardware; see [support and known limitations](docs/support.md) for compatibility and troubleshooting.
+
+## Remove
+
+To remove the service, plugin, binaries, and microphone support:
+
+```sh
+fleetpods fleet reset   # optional: leave the fleet first, while the daemon runs
+systemctl --user disable --now fleetpods.service
+omarchy plugin remove io.github.danmacdonald.fleetpods --yes
+rm -f ~/.local/bin/fleetpods ~/.local/bin/fleetpodsd
+systemctl --user daemon-reload
+```
+
+Saved fleet membership, keyring records, and Bluetooth pairing stay in place for a later reinstall; the full removal steps, including the microphone files, are in the [installation guide](docs/installation.md#remove-fleetpods).
 
 Check the connection with:
 
