@@ -58,13 +58,15 @@ The socket is `$XDG_RUNTIME_DIR/fleetpods.sock`. The status file is `${XDG_STATE
 
 ## Install
 
-On Omarchy, with Rust and Cargo installed, run:
+On Omarchy with shell plugin support, install Rust and Cargo and the [build dependencies](docs/installation.md#requirements), then run from this checkout:
 
 ```sh
 ./setup
 ```
 
 This builds FleetPods, installs its user service and microphone support, and enables the plugin in the bar. Open the FleetPods icon to get started. Pair your AirPods through Bluetooth if this is their first connection to the machine.
+
+See the [installation guide](docs/installation.md) for cloning, first pairing, joining a fleet, upgrades, and removal. AirPods Pro 3 is the current tested hardware; see [support and known limitations](docs/support.md) for compatibility and troubleshooting.
 
 Check the connection with:
 
