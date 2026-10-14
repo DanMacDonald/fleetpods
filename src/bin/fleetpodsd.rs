@@ -76,6 +76,10 @@ fn main() {
                 continue;
             }
         };
+        if !same_user(&stream) {
+            eprintln!("fleetpodsd: command socket connection from another user refused");
+            continue;
+        }
         if let Some(command) = read_command(&mut stream) {
             if let Some(body) = session.command(command, boot.clock()) {
                 let _ = stream.write_all(body.as_bytes());
@@ -166,6 +170,25 @@ fn publish(path: &Path, body: &str, previous: &mut String) -> io::Result<()> {
     fs::rename(&tmp, path)?;
     *previous = body.to_string();
     Ok(())
+}
+
+/// The socket lives in a per-user runtime directory and is mode 0600, but
+/// peer credentials make the boundary explicit rather than a consequence
+/// of directory permissions: only this user's own processes may command
+/// the daemon (fleet reset, AirPods forget, seat claims).
+fn same_user(stream: &UnixStream) -> bool {
+    let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast(),
+            &mut len,
+        )
+    };
+    rc == 0 && cred.uid == unsafe { libc::geteuid() }
 }
 
 fn read_command(stream: &mut UnixStream) -> Option<fleetpods::panel::ipc::Command> {
