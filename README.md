@@ -1,4 +1,4 @@
-# FleetPods
+# FleetPods <sup>beta v0.1.0</sup>
 
 ![FleetPods showing iPhone audio playback and an Omarchy machine connected to the AirPods](docs/images/fleetpods-connections.png)
 
