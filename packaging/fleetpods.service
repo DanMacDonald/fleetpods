@@ -6,6 +6,8 @@ After=pipewire.service wireplumber.service
 Type=simple
 ExecStart=%h/.local/bin/fleetpodsd
 UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
 Restart=on-failure
 RestartSec=2
 
