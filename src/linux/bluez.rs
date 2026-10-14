@@ -155,6 +155,18 @@ impl Bus {
         call_device(proxy, "ConnectProfile", (A2DP_SINK,))
     }
 
+    /// The unique bus name that currently owns a well-known name, if any.
+    pub fn name_owner(&self, name: &str) -> Option<String> {
+        let proxy = self.connection.with_proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            Duration::from_secs(2),
+        );
+        let (owner,): (String,) =
+            proxy.method_call("org.freedesktop.DBus", "GetNameOwner", (name,)).ok()?;
+        Some(owner)
+    }
+
     pub fn fd(&self) -> std::os::fd::RawFd {
         self.connection.channel().watch().fd
     }
@@ -267,6 +279,28 @@ pub struct Patch {
     pub fleet: Option<Vec<u8>>,
     /// Apple manufacturer payload, when this change included company id `0x004C`.
     pub apple: Option<Vec<u8>>,
+}
+
+/// May this sender's signal be believed? Broadcast match rules constrain
+/// `sender=`, but a unicast signal addressed straight to this daemon is
+/// delivered regardless of them, so the sender must be the unique name
+/// that owns the well-known service for the signal's interface: the bus
+/// itself for `NameOwnerChanged`, logind for `PrepareForSleep`, and BlueZ
+/// for everything else (device, adapter, and object-manager signals).
+pub fn sender_allowed(
+    sender: Option<&str>,
+    interface: &str,
+    bluez_owner: Option<&str>,
+    login1_owner: Option<&str>,
+) -> bool {
+    let Some(sender) = sender else {
+        return false;
+    };
+    match interface {
+        "org.freedesktop.DBus" => sender == "org.freedesktop.DBus",
+        "org.freedesktop.login1.Manager" => login1_owner.is_some_and(|owner| sender == owner),
+        _ => bluez_owner.is_some_and(|owner| sender == owner),
+    }
 }
 
 pub fn interpret(mut message: Message) -> Option<Notice> {
@@ -665,6 +699,29 @@ mod tests {
         };
         assert_eq!(patch.bonded, Some(true));
         assert_eq!(patch.paired, None);
+    }
+
+    #[test]
+    fn only_the_owning_service_may_send_its_signals() {
+        let bluez = Some(":1.7");
+        let login1 = Some(":1.3");
+        // Genuine senders pass, including the bus itself.
+        assert!(sender_allowed(Some(":1.7"), "org.freedesktop.DBus.Properties", bluez, login1));
+        assert!(sender_allowed(Some(":1.3"), "org.freedesktop.login1.Manager", bluez, login1));
+        assert!(sender_allowed(
+            Some("org.freedesktop.DBus"),
+            "org.freedesktop.DBus",
+            bluez,
+            login1
+        ));
+        // Another local user's unique name can forge the interface and
+        // member of a unicast signal, but not the owner comparison.
+        assert!(!sender_allowed(Some(":1.99"), "org.freedesktop.login1.Manager", bluez, login1));
+        assert!(!sender_allowed(Some(":1.99"), "org.freedesktop.DBus.Properties", bluez, login1));
+        assert!(!sender_allowed(Some(":1.7"), "org.freedesktop.login1.Manager", bluez, login1));
+        assert!(!sender_allowed(None, "org.freedesktop.DBus.Properties", bluez, login1));
+        // With no owner known, nothing is believed.
+        assert!(!sender_allowed(Some(":1.7"), "org.freedesktop.DBus.Properties", None, login1));
     }
 
     #[test]

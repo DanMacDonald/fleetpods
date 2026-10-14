@@ -616,6 +616,11 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         eprintln!("fleetpodsd: bluetooth signals are unavailable: {err}");
     }
     let mut live = Live::default();
+    // Unique bus names for the services whose signals we act on. A unicast
+    // signal addressed to us bypasses the sender filters in our broadcast
+    // match rules, so senders are checked against these owners instead.
+    let mut bluez_owner = bus.name_owner("org.bluez");
+    let mut login1_owner = bus.name_owner("org.freedesktop.login1");
     if let Ok(inventory) = bus.inventory() {
         remember_inventory(&reports, configured, &mut live, inventory);
         sync(&reports, configured, &mut live);
@@ -643,6 +648,41 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
                 break;
             }
             while let Some(message) = bus.pop() {
+                let interface =
+                    message.interface().map(|value| value.to_string()).unwrap_or_default();
+                let member = message.member().map(|value| value.to_string()).unwrap_or_default();
+                // Replies to our own calls are matched by serial and pass.
+                // Everything else must come from the service that owns the
+                // interface: signals (a forged unicast PrepareForSleep or
+                // PropertiesChanged must not suspend us or rewrite device
+                // state) and method calls to our advertisement object.
+                let trusted = message.get_reply_serial().is_some()
+                    || match message.msg_type() {
+                        dbus::message::MessageType::Signal => bluez::sender_allowed(
+                            message.sender().map(|sender| sender.to_string()).as_deref(),
+                            &interface,
+                            bluez_owner.as_deref(),
+                            login1_owner.as_deref(),
+                        ),
+                        dbus::message::MessageType::MethodCall => {
+                            bluez_owner.is_some()
+                                && message.sender().map(|sender| sender.to_string()).as_deref()
+                                    == bluez_owner.as_deref()
+                        }
+                        _ => false,
+                    };
+                if !trusted {
+                    eprintln!(
+                        "fleetpodsd: ignored bus message from untrusted sender (interface={interface} member={member})"
+                    );
+                    continue;
+                }
+                // A trusted NameOwnerChanged may mean BlueZ or logind
+                // restarted under a new unique name; refresh both owners.
+                if interface == "org.freedesktop.DBus" && member == "NameOwnerChanged" {
+                    bluez_owner = bus.name_owner("org.bluez");
+                    login1_owner = bus.name_owner("org.freedesktop.login1");
+                }
                 if serve_advertisement(&bus, &mut live, &message) {
                     continue;
                 }
