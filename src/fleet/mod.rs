@@ -3,6 +3,7 @@
 //! A nearby host is not a member. An invitation is not a saved fleet.
 //! A route may ask `pods::link` to connect. It does not start its own retry.
 
+pub mod airtime;
 pub mod commit;
 pub mod cppmsg;
 pub mod crypto;

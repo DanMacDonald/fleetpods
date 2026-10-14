@@ -38,17 +38,6 @@ fn placement(sight: &crate::pods::air::Frame, right: bool) -> (Option<bool>, Opt
     (Some(in_ear), in_case)
 }
 
-/// What the last presence slot actually sealed. A fleet id or session change
-/// reseals on the next free slot.
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct PresenceMark {
-    address: Address,
-    name: String,
-    fleet: Option<FleetId>,
-    session: Option<[u8; 16]>,
-    handoff: bool,
-}
-
 pub struct Daemon {
     pub(crate) local_name: String,
     pub(crate) local_address: Option<Address>,
@@ -102,10 +91,7 @@ pub struct Daemon {
     pub(crate) radio_inbox: crate::fleet::radio::Inbox,
     /// Letter frames waiting to be split. The daemon chooses each fragment.
     pub(crate) outbound: crate::fleet::radio::Schedule,
-    pub(crate) presence_aired: Option<MonoMs>,
-    presence_public_aired: Option<MonoMs>,
-    pub(crate) presence_mark: Option<PresenceMark>,
-    presence_public_next: bool,
+    pub(crate) presence_air: crate::fleet::airtime::PresenceAir,
     /// Discovery has been asked to stay up.
     pub(crate) listening: bool,
     pub(crate) suspending: bool,
@@ -115,10 +101,8 @@ pub struct Daemon {
     pub(crate) follow_link: bool,
     air_session: [u8; 16],
     session_fleet: Option<FleetId>,
-    roster_air_seq: u64,
-    roster_aired: Option<MonoMs>,
+    roster_air: crate::fleet::airtime::RosterAir,
     roster_change_queued: Option<MonoMs>,
-    roster_mark: Option<RosterAirMark>,
     roster_dirty: bool,
     /// Unix time of the latest local source report. Sealing a roster does not move it.
     local_use: Option<UnixMs>,
@@ -187,17 +171,6 @@ struct PlannedRoster {
     pending: bool,
     audio_idle: bool,
     air: crate::fleet::roster_air::Snapshot,
-}
-
-#[derive(Clone, PartialEq, Eq)]
-struct RosterAirMark {
-    fleet: FleetId,
-    session: [u8; 16],
-    accessory: Address,
-    peers: Vec<Address>,
-    audio_source: Option<Address>,
-    pending: bool,
-    audio_idle: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -272,10 +245,7 @@ impl Daemon {
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
             outbound: crate::fleet::radio::Schedule::new(),
-            presence_aired: None,
-            presence_public_aired: None,
-            presence_mark: None,
-            presence_public_next: false,
+            presence_air: crate::fleet::airtime::PresenceAir::new(),
             listening: false,
             suspending: false,
             adapter_down: false,
@@ -287,10 +257,8 @@ impl Daemon {
                 bytes
             },
             session_fleet: None,
-            roster_air_seq: 0,
-            roster_aired: None,
+            roster_air: crate::fleet::airtime::RosterAir::new(),
             roster_change_queued: None,
-            roster_mark: None,
             roster_dirty: false,
             local_use: None,
             held_peers: Vec::new(),
@@ -842,17 +810,11 @@ impl Daemon {
             return;
         };
         let mark = self.presence_plan(address, now.mono);
-        let changed = self.presence_mark.as_ref() != Some(&mark);
-        let refresh_ms = crate::fleet::presence::REFRESH_MS;
-        let aged = self.presence_aired.is_none_or(|at| now.mono.saturating_since(at) >= refresh_ms);
-        if !changed && !aged {
+        let Some(private) =
+            self.presence_air.due(&mark, now.mono, crate::fleet::presence::REFRESH_MS)
+        else {
             return;
-        }
-        let public_due = self.presence_public_aired.is_none_or(|at| {
-            now.mono.saturating_since(at) >= crate::fleet::presence::REFRESH_MS * 2
-        });
-        let private =
-            changed || if mark.handoff { !public_due } else { !self.presence_public_next };
+        };
         let frame = match self.membership.fleet() {
             Some(fleet) if private => {
                 let keys = crate::fleet::presence::FleetKeys {
@@ -881,11 +843,21 @@ impl Daemon {
         }
     }
 
-    fn presence_plan(&mut self, address: Address, now: MonoMs) -> PresenceMark {
+    fn presence_plan(
+        &mut self,
+        address: Address,
+        now: MonoMs,
+    ) -> crate::fleet::airtime::PresenceMark {
         let fleet = self.membership.fleet().map(|fleet| fleet.id);
         let session = fleet.map(|id| self.routing_session(Some(id)));
         let handoff = self.routing.phase().busy() || self.outbound.has_live_route(now);
-        PresenceMark { address, name: self.local_name.clone(), fleet, session, handoff }
+        crate::fleet::airtime::PresenceMark {
+            address,
+            name: self.local_name.clone(),
+            fleet,
+            session,
+            handoff,
+        }
     }
 
     fn routing_session(&mut self, fleet: Option<FleetId>) -> [u8; 16] {
@@ -907,7 +879,7 @@ impl Daemon {
             self.outbound.clear_roster();
             return;
         };
-        let mark = RosterAirMark {
+        let mark = crate::fleet::airtime::RosterMark {
             fleet: snapshot.fleet,
             session: snapshot.session,
             accessory: snapshot.accessory,
@@ -916,18 +888,15 @@ impl Daemon {
             pending: snapshot.pending,
             audio_idle: snapshot.audio_idle,
         };
-        let peers_changed =
-            self.roster_mark.as_ref().is_none_or(|previous| previous.peers != snapshot.peers);
-        let changed = self.roster_mark.as_ref() != Some(&mark);
-        let aged = self
-            .roster_aired
-            .is_none_or(|at| now.mono.saturating_since(at) >= crate::fleet::presence::REFRESH_MS);
-        if !changed && (!aged || self.outbound.has_roster()) {
+        let assessment =
+            self.roster_air.assess(&mark, now.mono, crate::fleet::presence::REFRESH_MS);
+        let peers_changed = assessment.peers_changed;
+        let changed = assessment.changed;
+        if !changed && (!assessment.aged || self.outbound.has_roster()) {
             return;
         }
-        self.roster_air_seq = self.roster_air_seq.saturating_add(1);
         let mut air = snapshot.air;
-        air.sequence = self.roster_air_seq;
+        air.sequence = self.roster_air.next_seq();
         let Some(fleet) = self.membership.fleet() else {
             self.outbound.clear_roster();
             return;
@@ -945,13 +914,13 @@ impl Daemon {
                         .join(" ");
                     eprintln!("fleetpodsd: telling the fleet the roster is {names}");
                 }
-                if changed && self.roster_mark.is_some() {
+                if changed && self.roster_air.has_mark() {
                     self.roster_change_queued = Some(now.mono);
                     self.outbound.offer_roster_change(frame);
                 } else {
                     self.outbound.offer_roster(frame);
                 }
-                self.roster_mark = Some(mark);
+                self.roster_air.note_queued(mark);
             }
             None => self.outbound.clear_roster(),
         }
@@ -1004,11 +973,11 @@ impl Daemon {
     }
 
     pub(crate) fn note_roster_aired(&mut self, now: MonoMs) {
-        self.roster_aired = Some(now);
+        self.roster_air.note_aired(now);
         if let Some(queued) = self.roster_change_queued.take() {
             eprintln!(
                 "fleetpodsd: changed roster published sequence={} queue_ms={}",
-                self.roster_air_seq,
+                self.roster_air.seq(),
                 now.saturating_since(queued)
             );
         }
@@ -1850,12 +1819,8 @@ impl Daemon {
         let Some(address) = self.local_address else {
             return;
         };
-        self.presence_aired = Some(now);
-        if public {
-            self.presence_public_aired = Some(now);
-        }
-        self.presence_mark = Some(self.presence_plan(address, now));
-        self.presence_public_next = !public;
+        let mark = self.presence_plan(address, now);
+        self.presence_air.note_aired(mark, now, public);
     }
 
     pub fn set_profiles(&mut self, profiles: Vec<Profile>) {
@@ -2113,14 +2078,9 @@ impl Daemon {
         self.route_connection = None;
         self.routing_session(None);
         self.roster_seq = 0;
-        self.roster_air_seq = 0;
-        self.roster_aired = None;
+        self.roster_air.reset();
         self.roster_change_queued = None;
-        self.roster_mark = None;
-        self.presence_aired = None;
-        self.presence_public_aired = None;
-        self.presence_mark = None;
-        self.presence_public_next = false;
+        self.presence_air.reset();
         self.announce_dirty = true;
         eprintln!("fleetpodsd: local fleet reset; AirPods pairing preserved");
     }
