@@ -116,6 +116,8 @@ pub struct Daemon {
     pub(crate) restore_pending: Vec<StreamSnap>,
     pub(crate) output: crate::audio::route::Router,
     pub(crate) last_graph: Option<crate::audio::route::Graph>,
+    pub(crate) output_health: crate::audio::health::Health,
+    pub(crate) rearm_output: Option<crate::audio::health::Output>,
     pub(crate) resume_output_on_grant: bool,
     pub(crate) output_restart_serial: u64,
     pub(crate) radio_inbox: crate::fleet::radio::Inbox,
@@ -304,6 +306,8 @@ impl Daemon {
             restore_pending: Vec::new(),
             output: crate::audio::route::Router::new(),
             last_graph: None,
+            output_health: crate::audio::health::Health::default(),
+            rearm_output: None,
             resume_output_on_grant: false,
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
@@ -424,6 +428,11 @@ impl Daemon {
         let resolved = self.resolved(now);
         let mut value = status::project(&self.snapshot(now, &resolved));
         value["nearby_airpods"] = self.nearby_pods.status(now.mono);
+        value["audio_output_health"] = serde_json::json!({
+            "state": self.config.accessory.and_then(|a| self.output_health.output(a)).map(|o| o.state),
+            "resets": self.output_health.resets,
+            "last_reset_ok": self.output_health.last_ok,
+        });
         value["pairing_candidates"] = serde_json::json!(if self.config.accessory.is_none() {
             self.nearby_pods.pairing_count(now.mono)
         } else {
@@ -445,6 +454,7 @@ impl Daemon {
             Command::FleetReset => Response::line("error: fleet reset requires the keyring worker"),
             Command::Activity => self.activity(now),
             Command::Connect => self.connect(now),
+            Command::AudioReset => self.reset_audio_output(now),
             Command::ReconnectPeer => self.reconnect_peer(now),
             Command::HandoffRelease => self.release(now),
             Command::HandoffClaim => self.claim_handoff(now),
@@ -2860,6 +2870,54 @@ impl Daemon {
         self.seat.note_failure(reason, now);
     }
 
+    fn can_rearm_output(&self) -> bool {
+        self.connection.stage() == Stage::Ready
+            && !self.suspending
+            && !self.adapter_down
+            && !self.routing.phase().busy()
+            && !self.accessory.both_docked()
+            && self.output.want
+            && self.output.held.is_empty()
+            && !self.output.holding_takeover()
+            && self.accessory.ownership.as_fresh() == Some(&true)
+            && !(self.output_health.resets > 0 && self.output_health.last_ok.is_none())
+    }
+
+    fn reset_audio_output(&mut self, now: Clock) -> Response {
+        if !self.can_rearm_output() {
+            return Response::line("error: this machine must own the ready AirPods output, with no handoff or reset in progress");
+        }
+        let Some(output) =
+            self.config.accessory.and_then(|a| self.output_health.output(a)).cloned()
+        else {
+            return Response::line("error: no AirPods audio output");
+        };
+        self.output_health.started(now.mono);
+        self.rearm_output = Some(output);
+        Response::line("accepted: reopening AirPods audio output")
+    }
+
+    pub(crate) fn pace_output_health(&mut self, now: Clock) -> Option<crate::step::Effect> {
+        let eligible = self.can_rearm_output() && self.audio.local_playing();
+        let output = self.rearm_output.take().or_else(|| {
+            self.output_health.check(
+                self.config.accessory,
+                self.last_graph.as_ref(),
+                eligible,
+                now.mono,
+            )
+        })?;
+        eprintln!(
+            "fleetpodsd: reopening audio output sink={:?} state={} reset={}",
+            output.name, output.state, self.output_health.resets
+        );
+        Some(crate::step::Effect::RearmOutput {
+            id: self.output_health.resets,
+            index: output.index,
+            name: output.name,
+        })
+    }
+
     pub(crate) fn pace_audio(&mut self) -> Vec<crate::step::Effect> {
         use crate::step::Effect;
         let mut effects = Vec::new();
@@ -4961,6 +5019,119 @@ mod tests {
             0x45, 0x85,
         ]);
         frame
+    }
+
+    #[test]
+    fn output_recovery_is_local_bounded_and_preserves_pairing() {
+        use crate::audio::health::Output;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+        for scenario in ["fault", "healthy", "paused", "peer", "sleep"] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Bonded { address: addr(3), saved: true }, now);
+            daemon.step(Input::Ownership(true), now);
+            daemon.step(
+                Input::Player {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: Some(false),
+                },
+                now,
+            );
+            daemon.step(
+                Input::Player {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: Some(true),
+                },
+                now,
+            );
+            let graph = Graph {
+                default_sink: "pods".into(),
+                sinks: vec![Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                }],
+                cards: vec![],
+                streams: vec![LiveStream {
+                    id: 9,
+                    generation: 9,
+                    sink: "pods".into(),
+                    role: "".into(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            daemon.step(Input::Audio(graph), now);
+            assert!(daemon.can_rearm_output());
+            daemon.step(
+                Input::Outputs(vec![Output {
+                    name: "pods".into(),
+                    index: 7,
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                    state: if scenario == "healthy" { 0 } else { 2 },
+                    muted: false,
+                    audible_volume: true,
+                }]),
+                now,
+            );
+            match scenario {
+                "paused" => {
+                    daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(false));
+                }
+                "peer" => {
+                    daemon.step(Input::Ownership(false), now);
+                }
+                "sleep" => {
+                    daemon.step(Input::Suspend, now);
+                }
+                _ => {}
+            }
+            daemon.step(Input::Tick, now);
+            let later = Clock::new(now.mono.0 + 3_100, now.unix.0 + 3_100);
+            let result = daemon.step(Input::Tick, later);
+            assert_eq!(
+                result.effects.iter().any(|e| matches!(e, Effect::RearmOutput { index: 7, .. })),
+                scenario == "fault",
+                "{scenario}"
+            );
+            assert!(
+                !result.effects.iter().any(|e| matches!(
+                    e,
+                    Effect::RemoveDevice { .. }
+                        | Effect::Disconnect { .. }
+                        | Effect::WriteSecret { .. }
+                )),
+                "{scenario}"
+            );
+            assert_eq!(daemon.config.accessory, Some(addr(3)));
+            assert_eq!(daemon.status_value(later)["bluetooth_bonded"], true);
+            if scenario == "healthy" {
+                let manual = daemon.step(Input::Command(Command::AudioReset), later);
+                assert!(manual.reply.unwrap().starts_with("accepted:"));
+                assert!(manual
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RearmOutput { index: 7, .. })));
+                assert!(!manual
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Disconnect { .. } | Effect::RemoveDevice { .. })));
+            }
+            if scenario == "fault" {
+                let duplicate = daemon.step(Input::Command(Command::AudioReset), later);
+                assert!(duplicate.reply.unwrap().starts_with("error:"));
+                assert!(!duplicate.effects.iter().any(|e| matches!(e, Effect::RearmOutput { .. })));
+                daemon.step(Input::OutputRearmed { id: 99, ok: true }, later);
+                assert_eq!(daemon.output_health.last_ok, None);
+                daemon.step(Input::OutputRearmed { id: 1, ok: true }, later);
+                assert_eq!(daemon.output_health.last_ok, Some(true));
+            }
+        }
     }
 
     fn ready_link(daemon: &mut Daemon, now: Clock) {

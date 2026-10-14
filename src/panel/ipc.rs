@@ -27,6 +27,7 @@ pub enum Command {
     FleetReset,
     Activity,
     Connect,
+    AudioReset,
     Disconnect,
     ReconnectPeer,
     Forget,
@@ -81,6 +82,7 @@ pub fn cli_waits(command: &str) -> bool {
         "fleet"
             | "fleet-reset"
             | "connect"
+            | "audio-reset"
             | "reconnect-peer"
             | "activity"
             | "handoff:claim"
@@ -137,6 +139,7 @@ fn parse_text(text: &str) -> Command {
         "fleet-reset" => Command::FleetReset,
         "activity" => Command::Activity,
         "connect" => Command::Connect,
+        "audio-reset" => Command::AudioReset,
         "disconnect" => Command::Disconnect,
         "reconnect-peer" => Command::ReconnectPeer,
         "forget" => Command::Forget,

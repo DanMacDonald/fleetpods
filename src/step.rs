@@ -16,6 +16,12 @@ use crate::daemon::{host_id, Daemon};
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
+    /// Pulse's raw output states, independent of ownership or PCM content.
+    Outputs(Vec<crate::audio::health::Output>),
+    OutputRearmed {
+        id: u64,
+        ok: bool,
+    },
     OutputRestarted {
         id: u64,
         ok: bool,
@@ -217,6 +223,12 @@ pub enum Effect {
     StartOutput {
         name: String,
     },
+    /// Briefly suspend/resume only this Pulse sink. No Bluetooth unpairing.
+    RearmOutput {
+        id: u64,
+        index: u32,
+        name: String,
+    },
     /// Pause these MPRIS players. The daemon already decided the seat was given away.
     PausePlayers(Vec<String>),
     /// The daemon is not holding the link. Attach the control socket if the accessory is already up.
@@ -289,6 +301,17 @@ impl Daemon {
 
     fn apply(&mut self, input: Input, now: Clock) -> Option<String> {
         match input {
+            Input::Outputs(outputs) => {
+                self.output_health.outputs = outputs;
+                None
+            }
+            Input::OutputRearmed { id, ok } => {
+                if id == self.output_health.resets {
+                    self.output_health.last_ok = Some(ok);
+                    eprintln!("fleetpodsd: audio output reset {id} completed (ok={ok})");
+                }
+                None
+            }
             Input::OutputRestarted { id, ok } => {
                 if self.output.finish_recovery(id, ok) {
                     eprintln!("fleetpodsd: AirPods sink restart {id} completed (ok={ok})");
@@ -523,6 +546,7 @@ impl Daemon {
             }
             Input::AudioLost => {
                 self.output.forget_server();
+                self.output_health.forget_server();
                 self.audio.set_routed(false);
                 None
             }
@@ -945,6 +969,9 @@ impl Daemon {
                     eprintln!("fleetpodsd: re-arming AirPods playback after ownership grant");
                 }
             }
+        }
+        if let Some(effect) = self.pace_output_health(now) {
+            effects.push(effect);
         }
         if self.announce_dirty {
             self.announce_dirty = false;

@@ -339,6 +339,9 @@ impl Session {
                 }
                 Effect::SetDefaultSink { name } => ops.push(Op::Default(name.clone())),
                 Effect::StartOutput { name } => ops.push(Op::StartOutput(name.clone())),
+                Effect::RearmOutput { id, index, name } => {
+                    ops.push(Op::RearmOutput { id: *id, index: *index, name: name.clone() })
+                }
                 Effect::MoveStreams(move_streams) => {
                     for stream in &move_streams.streams {
                         ops.push(Op::Move { sink: move_streams.sink.clone(), stream: *stream });
@@ -417,6 +420,7 @@ impl Session {
                 }
             }
             Effect::MuteStreams(_)
+            | Effect::RearmOutput { .. }
             | Effect::StartOutput { .. }
             | Effect::SetDefaultSink { .. }
             | Effect::MoveStreams(_)

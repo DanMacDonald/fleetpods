@@ -39,3 +39,11 @@ A raw `paplay` stream started on a laptop that did not own the AirPods did not r
 Reconnect was exercised with both buds in an open case and an iPhone holding the other connection. For the shared-seat, playback, and microphone checks, the user wore both buds and disconnected the Apple devices. These checks did not establish uninterrupted Apple playback during a handoff or microphone quality in a real call. Microphone PCM was measured in memory and discarded; no recording was saved.
 
 The tests paused the browsers on completion and restored the playback stream volumes they temporarily reduced. No Bluetooth bond, keyring item, fleet membership, or saved preference was reset.
+
+## Playback output recovery follow-up
+
+Later on 2026-10-13, the user reported Brave going silent during playback on XPS. Brave had an uncorked, unmuted stream linked to the AirPods sink. The sink reported running, BlueZ reported an active transport, and both laptops agreed XPS owned playback. A brief suspend/resume of that sink restored audible playback, confirmed by the user. These observations locate recovery in the audio output path but do not establish the original cause.
+
+The daemon now observes raw sink states and can reopen an idle, suspended or failed output after three seconds of active, unmuted playback on a locally owned connection. Pauses, muted streams, sleep and handoffs are excluded. Recovery is rate-limited and bounded. `fleetpods audio reset` requests the same operation for failures that continue reporting a running output.
+
+The follow-up build passed 269 unit tests, 32 acceptance scenarios and Clippy. Simulated daemon tests cover the recovery delay, repeated failures, peer ownership, pause, suspend and unchanged Bluetooth pairing. The command completed on XPS with the control link ready, AirPods keys intact and fleet membership preserved. Attempts to inject a sustained hardware failure by suspending the sink returned it to running before the watchdog confirmed a persistent fault. They do not establish hardware validation of automatic recovery or reproduce the original silent-but-running failure. Long uninterrupted playback and capture at the next recurrence remain necessary to investigate its cause.

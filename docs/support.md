@@ -27,6 +27,8 @@ AirPods have two connections. Apple switching still depends on which Apple devic
 
 Reconnect can take several seconds and may retry. All six repeated hardware checks completed, with one recovered transport failure taking about 15 seconds. This release does not promise instant or retry-free reconnects.
 
+If playback goes silent while this computer still owns the AirPods, `fleetpods audio reset` briefly reopens its audio output without changing pairing or fleet membership. The daemon also does this automatically when an unmuted playing stream remains on an idle, suspended or failed output for three seconds. Recovery has a 30-second cooldown and a maximum of three attempts per sustained failure. It skips sleep, handoffs, pauses and muted playback. An output that incorrectly reports itself as running can still need the command; the daemon cannot verify what the listener hears. Reset completion confirms the output commands succeeded, not that sound reached the buds.
+
 ## Microphone and case display
 
 AirPods Pro 3 microphone capture was tested at 64 kHz mono while retaining stereo playback. Capture starts with roughly half a second of silence before decoded audio arrives. Real call quality, long recording sessions, and microphone support for other models still need validation.

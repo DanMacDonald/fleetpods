@@ -43,6 +43,8 @@ fn main() {
     };
     let command = if command == "fleet" && rest == ["reset"] {
         "fleet-reset".to_string()
+    } else if command == "audio" && rest == ["reset"] {
+        "audio-reset".to_string()
     } else if rest.is_empty() || remove.is_some() {
         command
     } else {
@@ -125,6 +127,7 @@ Commands:
   fleet reset         Reset this machine's fleet; preserve AirPods pairing
   fleet remove ADDR   Remove one member from this machine's saved fleet
   status              Print one-line JSON status snapshot to stdout
+  audio reset         Reopen the local AirPods audio output; preserve pairing
   noise:off           Request noise control off
   noise:anc           Request active noise cancellation
   noise:transparency  Request transparency

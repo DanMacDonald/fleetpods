@@ -21,6 +21,7 @@ use libpulse_binding::mainloop::standard::Mainloop;
 use libpulse_binding::operation::Operation;
 use libpulse_binding::volume::{ChannelVolumes, Volume, VolumeLinear};
 
+use crate::audio::health::Output;
 use crate::audio::play::StreamSnap;
 use crate::audio::route::{Card, Graph, LiveStream, Sink, StreamTarget};
 use crate::linux::wake::Wake;
@@ -29,6 +30,11 @@ use crate::types::Address;
 
 pub enum Op {
     StartOutput(String),
+    RearmOutput {
+        id: u64,
+        index: u32,
+        name: String,
+    },
     Mute(StreamTarget),
     Default(String),
     Move {
@@ -82,6 +88,7 @@ struct StreamChannels {
 
 struct Sample {
     graph: Graph,
+    outputs: Vec<Output>,
     cache: HashMap<u32, StreamChannels>,
     levels: HashMap<String, SinkLevel>,
 }
@@ -151,6 +158,7 @@ struct RawSink {
     name: String,
     address: Option<Address>,
     profile: Option<String>,
+    state: i32,
     level: SinkLevel,
 }
 
@@ -211,8 +219,8 @@ struct Query {
 /// pulse module sends `PA_SINK_UNLINKED` (-3) and `PA_SINK_INIT` (-2) while a node is
 /// in error or being created. Rust treats that transmute as a nounwind panic, so
 /// `catch_unwind` around the binding's callback cannot stop the process aborting.
-/// This list reads the name, index, and proplist through the C API and does not load
-/// the state field.
+/// This list reads fields through the C API, decoding the state bytes as a raw
+/// integer so values outside the binding's Rust enum remain safe.
 struct SinkList {
     op: *mut libpulse_sys::pa_operation,
     userdata: *mut SinkWatch,
@@ -354,6 +362,19 @@ impl Query {
             .collect();
         Some(Sample {
             graph: Graph { default_sink: picture.default_sink.clone(), sinks, streams, cards },
+            outputs: picture
+                .sinks
+                .iter()
+                .map(|sink| Output {
+                    name: sink.name.clone(),
+                    index: sink.index,
+                    address: sink.address,
+                    profile: sink.profile.clone(),
+                    state: sink.state,
+                    muted: sink.level.mute,
+                    audible_volume: sink.level.volume_percent.iter().any(|v| *v > 0.0),
+                })
+                .collect(),
             cache,
             levels: picture
                 .sinks
@@ -392,6 +413,8 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
     let mut cached: HashMap<u32, StreamChannels> = HashMap::new();
     let mut soft_mutes = HashMap::new();
     let mut last: Option<Graph> = None;
+    let mut last_outputs: Vec<Output> = Vec::new();
+    let mut refreshed = std::time::Instant::now();
     let mut media_trace = MediaTrace::default();
     let mut query: Option<Query> = None;
     let mut profile_op: Option<ProfileOp> = None;
@@ -436,6 +459,8 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
                 }
                 subscribed = false;
                 soft_mutes.clear();
+                last_outputs.clear();
+                last = None;
                 media_trace = MediaTrace::default();
                 query = None;
                 profile_op = None;
@@ -455,6 +480,18 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
         if query.as_ref().is_some_and(|query| query.ready()) {
             if let Some(mut sample) = query.take().and_then(Query::finish) {
                 media_trace.observe(&sample);
+                if last_outputs != sample.outputs {
+                    for output in &sample.outputs {
+                        if output.address.is_some() && !last_outputs.contains(output) {
+                            eprintln!(
+                                "fleetpodsd: audio output state sink={:?} raw_state={}",
+                                output.name, output.state
+                            );
+                        }
+                    }
+                    last_outputs.clone_from(&sample.outputs);
+                    let _ = reports.send(Input::Outputs(sample.outputs));
+                }
                 cached = sample.cache;
                 for stream in &mut sample.graph.streams {
                     stream.mute |= soft_mutes.contains_key(&(stream.id, stream.generation));
@@ -464,6 +501,10 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
                     let _ = reports.send(Input::Audio(sample.graph));
                 }
             }
+        }
+        if refreshed.elapsed() >= std::time::Duration::from_secs(1) {
+            refreshed = std::time::Instant::now();
+            dirty.store(true, Ordering::Relaxed);
         }
         if query.is_none()
             && pulse.context.get_state() == State::Ready
@@ -500,6 +541,8 @@ extern "C" fn poll_with_wake(
         fds.extend_from_slice(unsafe { std::slice::from_raw_parts(ufds, count) });
     }
     fds.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
+    // Refresh health once a second even if subscriptions miss a state change.
+    let timeout = if timeout < 0 { 1_000 } else { timeout.min(1_000) };
     let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
     if !ufds.is_null() && count > 0 {
         unsafe { std::ptr::copy_nonoverlapping(fds.as_ptr(), ufds, count) };
@@ -548,6 +591,9 @@ fn apply(
     for op in ops {
         match op {
             Op::StartOutput(name) => start_output_node(name.clone()),
+            Op::RearmOutput { id, index, name } => {
+                rearm_output(*id, *index, name.clone(), reports.clone())
+            }
             Op::Default(_) => {}
             Op::Mute(stream) => {
                 if generation_ok(cached, stream) {
@@ -643,6 +689,53 @@ fn set_soft_mute(object_id: u32, muted: bool) -> bool {
                 let _ = child.kill();
                 let _ = child.wait();
                 eprintln!("fleetpodsd: temporary stream mute failed for node {object_id}");
+                return false;
+            }
+        }
+    }
+}
+
+/// Off the event loop. Always attempt resume, even if suspension fails.
+/// The sink index addresses one output; never pass Pulse's all-sinks sentinel.
+fn rearm_output(id: u64, index: u32, name: String, reports: Sender<Input>) {
+    let failed = reports.clone();
+    let worker = std::thread::Builder::new().name("fleetpods-output-reset".into()).spawn(move || {
+        let ok = index != u32::MAX && {
+            let sink = index.to_string();
+            let suspended = bounded_pactl(&["suspend-sink", &sink, "1"]);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let resumed = bounded_pactl(&["suspend-sink", &sink, "0"])
+                || bounded_pactl(&["suspend-sink", &sink, "0"]);
+            eprintln!("fleetpodsd: audio output reset sink={name:?} suspended={suspended} resumed={resumed}");
+            suspended && resumed
+        };
+        let _ = reports.send(Input::OutputRearmed { id, ok });
+    });
+    if worker.is_err() {
+        let _ = failed.send(Input::OutputRearmed { id, ok: false });
+    }
+}
+
+fn bounded_pactl(args: &[&str]) -> bool {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let Ok(mut child) = Command::new("pactl")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
                 return false;
             }
         }
@@ -810,7 +903,14 @@ fn read_sink(info: *const libpulse_sys::pa_sink_info) -> Option<RawSink> {
     if info.is_null() {
         return None;
     }
-    // Field reads only. `state` is not loaded: -2 and -3 are not `SinkState` variants.
+    // Read the ABI bytes as an integer, never construct a Rust SinkState enum:
+    // PipeWire's -2 and -3 values are not valid enum variants.
+    let state = unsafe {
+        info.cast::<u8>()
+            .add(std::mem::offset_of!(libpulse_sys::pa_sink_info, state))
+            .cast::<i32>()
+            .read_unaligned()
+    };
     let name = unsafe { (*info).name };
     if name.is_null() {
         return None;
@@ -831,7 +931,7 @@ fn read_sink(info: *const libpulse_sys::pa_sink_info) -> Option<RawSink> {
             .map(|value| f64::from(*value) * 100.0 / f64::from(Volume::NORMAL.0))
             .collect(),
     };
-    Some(RawSink { index, name, address, profile, level })
+    Some(RawSink { index, name, address, profile, state, level })
 }
 
 fn prop(list: *mut libpulse_sys::pa_proplist, key: &CStr) -> Option<String> {
@@ -873,7 +973,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_unlinked_sink_is_recorded_without_reading_its_state() {
+    fn unknown_sink_states_are_read_as_integers_without_constructing_an_enum() {
         let name = c"bluez_output.CC_22_FE_54_DF_C7.1";
         let mut info = std::mem::MaybeUninit::<libpulse_sys::pa_sink_info>::zeroed();
         let ptr = info.as_mut_ptr();
@@ -893,12 +993,17 @@ mod tests {
             );
             state.write(-3);
             let sink = read_sink(ptr).expect("unlinked sink");
+            assert_eq!(sink.state, -3);
             assert_eq!(sink.index, 7);
             assert_eq!(sink.name, "bluez_output.CC_22_FE_54_DF_C7.1");
             assert!(sink.address.is_none());
             assert_eq!(sink.level, SinkLevel { mute: true, volume_percent: vec![50.0, 100.0] });
             state.write(-2);
-            assert_eq!(read_sink(ptr).expect("init sink").name, sink.name);
+            let init = read_sink(ptr).expect("init sink");
+            assert_eq!(init.name, sink.name);
+            assert_eq!(init.state, -2);
+            state.write(99);
+            assert_eq!(read_sink(ptr).unwrap().state, 99);
         }
     }
 

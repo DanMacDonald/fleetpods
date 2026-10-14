@@ -5,6 +5,7 @@
 //! fleet and answers who is playing.
 
 pub mod eld;
+pub mod health;
 pub mod mic;
 pub mod play;
 pub mod queue;
