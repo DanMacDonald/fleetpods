@@ -502,7 +502,7 @@ check('missing pairing key reads as ready', Model.parseStatus('{"schema_version"
 check('pairing keys not ready', Model.parseStatus('{"schema_version":1,"pairing_keys_ready":false}').pairingKeysReady, false)
 check('pairing mode defaults to off', Model.parseStatus('{"schema_version":1}').pairingMode, false)
 check('pairing mode comes from daemon evidence', Model.parseStatus('{"schema_version":1,"pairing_mode":true}').pairingMode, true)
-check('pairing mode advances the setup instruction', Model.emptyGuidance(true, false, 11, true, true), 'Your AirPods are ready to pair. Select them in the Bluetooth panel.')
+check('pairing mode advances the setup instruction', Model.emptyGuidance(true, false, 11, true, true), 'Your AirPods are ready to pair. Select them in the Bluetooth plugin.')
 check('learn sentence while the key is missing', Model.emptyGuidance(true, false), 'Open the case lid with both AirPods inside.')
 check('away sentence once the key is stored', Model.emptyGuidance(true, true), 'Open the lid on the AirPods case to allow Bluetooth connections to the pods.')
 check('stopped daemon sentence', Model.emptyGuidance(false, false), 'Start the FleetPods service to see the Apple and Omarchy seats.')
@@ -2247,7 +2247,7 @@ check('a pair lights only the named source', [Model.seatDeviceLit(XPS, named, tr
 
 
 
-check('multiple pairing candidates direct selection to Bluetooth', Model.emptyGuidance(true, false, 11, true, true, 2), 'More than one pair of AirPods is ready to pair. Select your AirPods in the Bluetooth panel.')
+check('multiple pairing candidates direct selection to Bluetooth', Model.emptyGuidance(true, false, 11, true, true, 2), 'More than one pair of AirPods is ready to pair. Select your AirPods in the Bluetooth plugin.')
 check('pairing candidate count comes from daemon', Model.parseStatus('{"schema_version":1,"pairing_candidates":2}').pairingCandidates, 2)
 
 for (const model of [1, 2, 3, 4, 5, 6, 9, 10, 11]) {

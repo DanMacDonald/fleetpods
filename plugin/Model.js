@@ -117,7 +117,7 @@ function iconVariant(isHeadset, isProSeries, modelInt) {
 
 function pairingWarning(status) {
   return status.daemonReachable && status.bluetoothPaired && status.bluetoothBonded === false
-    ? "Pairing hasn’t been saved. Put your AirPods in pairing mode and pair them again in the Bluetooth panel before using Reconnect."
+    ? "Pairing hasn’t been saved. Put your AirPods in pairing mode and pair them again in the Bluetooth plugin before using Reconnect."
     : ""
 }
 
@@ -126,18 +126,18 @@ function emptyGuidance(daemonReachable, pairingKeysReady, modelInt, nearby, pair
     return "Start the FleetPods service to see the Apple and Omarchy seats."
   if (!pairingKeysReady) {
     if (pairingCandidates > 1)
-      return "More than one pair of AirPods is ready to pair. Select your AirPods in the Bluetooth panel."
+      return "More than one pair of AirPods is ready to pair. Select your AirPods in the Bluetooth plugin."
     if (pairingMode)
-      return "Your AirPods are ready to pair. Select them in the Bluetooth panel."
+      return "Your AirPods are ready to pair. Select them in the Bluetooth plugin."
     if ([7, 8, 12].indexOf(modelInt) >= 0)
-      return "Pair your AirPods in the Bluetooth panel."
+      return "Pair your AirPods in the Bluetooth plugin."
     if (!nearby || caseReady !== true)
       return "Open the case lid with both AirPods inside."
     if ([9, 10, 11].indexOf(modelInt) >= 0)
-      return "Double-tap the front of the case until the light flashes white, then select your AirPods in the Bluetooth panel."
+      return "Double-tap the front of the case until the light flashes white, then select your AirPods in the Bluetooth plugin."
     if ([1, 2, 3, 4, 5, 6].indexOf(modelInt) >= 0)
-      return "Hold the button on the back of the case until the light flashes white, then select your AirPods in the Bluetooth panel."
-    return "Put your AirPods in pairing mode, then select them in the Bluetooth panel."
+      return "Hold the button on the back of the case until the light flashes white, then select your AirPods in the Bluetooth plugin."
+    return "Put your AirPods in pairing mode, then select them in the Bluetooth plugin."
   }
   return "Open the lid on the AirPods case to allow Bluetooth connections to the pods."
 }

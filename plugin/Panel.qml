@@ -14,6 +14,16 @@ Panel {
   ipcTarget: "fleetpods"
   manageIpc: false
 
+  property string pluginVersion: ""
+  FileView {
+    path: Qt.resolvedUrl("../manifest.json")
+    printErrors: false
+    onLoaded: {
+      try { root.pluginVersion = String(JSON.parse(text()).version || "") }
+      catch (error) { root.pluginVersion = "" }
+    }
+  }
+
   property string shownFleetId: ""
   property string dismissedFleetId: "-"
   property bool fleetAutoOpened: false
@@ -299,6 +309,7 @@ Panel {
         caseState: root.barCaseState, reportedLid: pods.view.lidState,
         pairingMode: pods.view.pairingMode, batteriesVisible: seats.showBattery,
         panelAvailable: true, panelOpen: root.opened, seatsVisible: root.showSeats,
+        pluginVersion: root.pluginVersion,
         diagram: { visible: seats.visible, height: seats.height, contentHeight: panelContent.height,
           scale: column.scale, connectorPhase: seats.connectorPhase, connectorProgress: seats.connectionProgress },
         telemetryUnavailable: root.telemetryUnavailable, ownershipUnknown: root.ownershipUnknown, description: root.domainDescription,
@@ -472,15 +483,29 @@ Panel {
               anchors.verticalCenter: parent.verticalCenter
               spacing: Style.space(2)
 
-              Text {
-                textFormat: Text.PlainText
+              RowLayout {
                 width: parent.width
-                text: pods.view.modelName !== "" ? pods.view.modelName : (pods.view.deviceName !== "" ? pods.view.deviceName : "FleetPods")
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.title
-                font.bold: true
-                elide: Text.ElideRight
+                spacing: Style.space(12)
+
+                Text {
+                  textFormat: Text.PlainText
+                  Layout.fillWidth: true
+                  text: pods.view.modelName !== "" ? pods.view.modelName : (pods.view.deviceName !== "" ? pods.view.deviceName : "FleetPods")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.title
+                  font.bold: true
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  textFormat: Text.PlainText
+                  visible: root.pluginVersion !== ""
+                  text: "beta v" + root.pluginVersion
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
               }
 
               Text {
