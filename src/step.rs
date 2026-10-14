@@ -740,8 +740,8 @@ impl Daemon {
                 self.note_letter_peer(from, name, now);
                 self.deliver(from, body, now);
             }
-            Some(Postcard::Announce { from, name, seated, .. }) => {
-                self.hear_announce(from, name, seated, now);
+            Some(Postcard::Announce { from, name, .. }) => {
+                self.hear_announce(from, name, now);
             }
             None => {
                 if let (Some(from), Some(letter)) =
@@ -757,21 +757,15 @@ impl Daemon {
         }
     }
 
-    fn hear_announce(&mut self, from: Address, name: String, seated: bool, now: Clock) {
+    fn hear_announce(&mut self, from: Address, name: String, now: Clock) {
         if self.local_address == Some(from) {
             return;
         }
         // A plaintext announcement is only a nearby hint. It carries no
-        // fleet-key proof, so its embedded roster is never ingested;
-        // rosters are accepted only from the authenticated roster path.
+        // fleet-key proof, so neither its embedded roster nor its seated
+        // flag can alter connection state: rosters and seated peers are
+        // accepted only from authenticated roster and pod-list paths.
         self.observe_nearby(host_id(Some(from)), from, name, now.unix, false, None);
-        if seated {
-            if !self.peers_seated.contains(&from) {
-                self.peers_seated.push(from);
-            }
-        } else {
-            self.peers_seated.retain(|peer| *peer != from);
-        }
     }
 
     fn harvest(&mut self, now: Clock) -> Vec<Effect> {

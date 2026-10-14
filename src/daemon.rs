@@ -7608,7 +7608,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plaintext_announcement_cannot_supply_a_roster() {
+    fn a_plaintext_announcement_cannot_supply_a_roster_or_seat() {
         use crate::fleet::members::{Fleet, GroupKey, Member};
         use crate::fleet::postcard;
         use crate::step::Input;
@@ -7645,6 +7645,11 @@ mod tests {
         daemon.step(Input::Radio(frame), now);
         assert!(daemon.peers.fresh(now, pods).is_none());
         assert!(daemon.status_value(now)["fleet"]["roster"].as_object().unwrap().is_empty());
+        assert!(!daemon.peers_seated.contains(&addr(2)));
+        daemon.peers_seated.push(addr(2));
+        let frame = postcard::encode_announce(addr(2), "gram", false, None);
+        daemon.step(Input::Radio(frame), now);
+        assert!(daemon.peers_seated.contains(&addr(2)));
     }
 
     #[test]
