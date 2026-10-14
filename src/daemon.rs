@@ -234,6 +234,14 @@ enum Reconnect {
     },
 }
 
+/// An incoming invitation held aside across a fleet reset (see
+/// [`Daemon::take_invitation`]).
+pub(crate) struct InvitationSave {
+    enrollment: Enrollment,
+    offer: Option<Vec<u8>>,
+    pake: Option<Pake>,
+}
+
 impl Daemon {
     pub fn load_apple_names(&mut self) {
         self.apple_labels = crate::devices::load();
@@ -2054,6 +2062,45 @@ impl Daemon {
         self.introduced_peers.1.retain(|address| *address != peer);
         self.roster_dirty = true;
         self.announce_dirty = true;
+    }
+
+    /// An incoming invitation the adapter is holding aside across a local
+    /// fleet reset. Which invitation may be held, and putting it back, are
+    /// decided here — the adapter only runs the keyring deletion between.
+    pub(crate) fn take_invitation(
+        &mut self,
+        id: InvitationId,
+    ) -> Result<InvitationSave, &'static str> {
+        if self.enrollment.id() != Some(id)
+            || self.enrollment.phase() != crate::fleet::enroll::Phase::Incoming
+            || self.commit.is_staged()
+        {
+            return Err("error: this invitation is no longer awaiting a code\n");
+        }
+        Ok(InvitationSave {
+            enrollment: std::mem::take(&mut self.enrollment),
+            offer: self.offer.take(),
+            pake: self.pake.take(),
+        })
+    }
+
+    pub(crate) fn restore_invitation(&mut self, save: InvitationSave) {
+        self.enrollment = save.enrollment;
+        self.offer = save.offer;
+        self.pake = save.pake;
+    }
+
+    /// Whether this machine may drop its fleet and immediately invite `peer`.
+    pub(crate) fn check_rejoin(&self, peer: Address) -> Result<(), &'static str> {
+        if self.enrollment.phase().active()
+            || self.local_address.is_none()
+            || self.local_address == Some(peer)
+        {
+            return Err(
+                "error: finish the current fleet operation and enable Bluetooth before leaving\n",
+            );
+        }
+        Ok(())
     }
 
     /// Called only after the serialized keyring worker confirms deletion.

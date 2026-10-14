@@ -134,21 +134,16 @@ impl Session {
         }
         if let Command::Fleet(Ok(crate::panel::ipc::FleetCommand::LeaveInvitation { id })) = command
         {
-            if self.daemon.enrollment.id() != Some(id)
-                || self.daemon.enrollment.phase() != crate::fleet::enroll::Phase::Incoming
-                || self.daemon.commit.is_staged()
-            {
-                return Some("error: this invitation is no longer awaiting a code\n".into());
-            }
             // The user explicitly chose to leave, but the incoming invitation
-            // and its offer must survive the durable local fleet reset.
-            let enrollment = std::mem::take(&mut self.daemon.enrollment);
-            let offer = self.daemon.offer.take();
-            let pake = self.daemon.pake.take();
+            // and its offer must survive the durable local fleet reset. The
+            // daemon decides which invitation may be held aside; this adapter
+            // only runs the deletion between taking and restoring it.
+            let save = match self.daemon.take_invitation(id) {
+                Ok(save) => save,
+                Err(error) => return Some(error.into()),
+            };
             let result = self.reset_fleet(now);
-            self.daemon.enrollment = enrollment;
-            self.daemon.offer = offer;
-            self.daemon.pake = pake;
+            self.daemon.restore_invitation(save);
             return Some(if result.starts_with("error:") { result } else { "ok\n".into() });
         }
         if let Command::Fleet(Ok(crate::panel::ipc::FleetCommand::Join {
@@ -157,14 +152,8 @@ impl Session {
             leave: true,
         })) = command
         {
-            if self.daemon.enrollment().phase().active()
-                || self.daemon.local_address.is_none()
-                || self.daemon.local_address == Some(address)
-            {
-                return Some(
-                    "error: finish the current fleet operation and enable Bluetooth before leaving\n"
-                    .into(),
-                );
+            if let Err(error) = self.daemon.check_rejoin(address) {
+                return Some(error.into());
             }
             let result = self.reset_fleet(now);
             if result.starts_with("error:") {
