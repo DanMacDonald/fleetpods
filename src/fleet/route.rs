@@ -306,6 +306,13 @@ impl Routing {
         if tx != self.tx || !self.phase.busy() {
             return false;
         }
+        // An admitted requester is terminal on the admission question: a
+        // delayed or replayed failure for the same transaction must not
+        // rewind a handoff the peer already granted. The helper side keeps
+        // its fail: its own admission prerequisite can still collapse.
+        if !self.helper && self.admission == "ok" {
+            return false;
+        }
         let Some(peer) = self.peer else {
             return false;
         };
@@ -384,6 +391,31 @@ mod tests {
         assert!(routing.note_connecting(tx));
         assert_eq!(routing.admit(tx, true, Some(peer())), Admit::Stale);
         assert_eq!(routing.phase(), Phase::WaitingCompletion);
+    }
+
+    #[test]
+    fn a_failure_after_admission_does_not_rewind_the_requester() {
+        let mut routing = Routing::new();
+        let Start::Sent { tx } = routing.start(peer()) else { panic!("start") };
+        // Before admission, a failure is a failure.
+        assert!(routing.fail(tx, "unavailable", UnixMs(1)));
+        assert_eq!(routing.phase(), Phase::Failed);
+
+        let mut routing = Routing::new();
+        let Start::Sent { tx } = routing.start(peer()) else { panic!("start") };
+        assert_eq!(routing.admit(tx, true, None), Admit::Beside);
+        assert!(!routing.fail(tx, "unavailable", UnixMs(2)));
+        assert_eq!(routing.phase(), Phase::Connecting);
+        assert!(routing.note_connecting(tx));
+        assert!(!routing.fail(tx, "unavailable", UnixMs(3)));
+        assert_eq!(routing.phase(), Phase::WaitingCompletion);
+
+        // The helper side can still fail its own admission prerequisite.
+        let mut helper = Routing::new();
+        assert!(helper.accept_request(peer(), 9));
+        assert!(helper.grant(9, None));
+        assert!(helper.fail(9, "unavailable", UnixMs(4)));
+        assert_eq!(helper.phase(), Phase::Failed);
     }
 
     #[test]
