@@ -3297,6 +3297,13 @@ impl Daemon {
         if self.hold_pairing_connection(now.mono) {
             return;
         }
+        // Pods stowed in a closed case cannot take audio, and no link will
+        // be opened for them. Claiming anyway would soft-mute the speaker
+        // streams for the whole takeover hold while nothing can arrive, so
+        // local playback would sit silent for seconds before falling back.
+        if self.accessory.stowed() {
+            return;
+        }
         // Fleet admission only blocks opening a new link. A ready local link
         // can route a genuine play immediately, even before admission completes.
         if self.config.accessory.is_none()
@@ -6109,6 +6116,27 @@ mod tests {
         daemon.note_lid(false, now.mono);
         let started = daemon.step(Input::Command(Command::Connect), now);
         assert!(started.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+    }
+
+    #[test]
+    fn playback_with_pods_stowed_in_a_closed_case_does_not_claim_the_seat() {
+        let mut daemon = Daemon::new("omarchy-xps");
+        let now = clock();
+        daemon.select_accessory(Some(addr(9)));
+        let docked = Pod {
+            battery: Battery::new(50, false).unwrap(),
+            in_ear: Some(false),
+            in_case: Some(true),
+        };
+        daemon.note_pod(false, docked, now.mono);
+        daemon.note_pod(true, docked, now.mono);
+        daemon.note_lid(false, now.mono);
+        assert!(daemon.accessory.stowed());
+        daemon.claim_playback(now);
+        // No claim: the speaker streams must never be soft-muted waiting
+        // for a sink that cannot appear.
+        assert!(!daemon.output.want);
+        assert_eq!(daemon.status_value(now)["want_omarchy_seat"], false);
     }
 
     #[test]
