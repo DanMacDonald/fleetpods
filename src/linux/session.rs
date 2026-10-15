@@ -651,13 +651,22 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
                 let interface =
                     message.interface().map(|value| value.to_string()).unwrap_or_default();
                 let member = message.member().map(|value| value.to_string()).unwrap_or_default();
-                // Replies to our own calls are matched by serial and pass.
+                // A reply is trusted only if it answers a call that is
+                // actually outstanding and it comes from the BlueZ owner:
+                // merely bearing a reply-serial header proves nothing, as
+                // any sender can stamp one onto a forged message.
                 // Everything else must come from the service that owns the
                 // interface: signals (a forged unicast PrepareForSleep or
                 // PropertiesChanged must not suspend us or rewrite device
                 // state) and method calls to our advertisement object.
-                let trusted = message.get_reply_serial().is_some()
-                    || match message.msg_type() {
+                let trusted = match message.get_reply_serial() {
+                    Some(serial) => {
+                        bluez_owner.is_some()
+                            && message.sender().map(|sender| sender.to_string()).as_deref()
+                                == bluez_owner.as_deref()
+                            && live.calls.iter().any(|call| call.serial == serial)
+                    }
+                    None => match message.msg_type() {
                         dbus::message::MessageType::Signal => bluez::sender_allowed(
                             message.sender().map(|sender| sender.to_string()).as_deref(),
                             &interface,
@@ -670,7 +679,8 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
                                     == bluez_owner.as_deref()
                         }
                         _ => false,
-                    };
+                    },
+                };
                 if !trusted {
                     eprintln!(
                         "fleetpodsd: ignored bus message from untrusted sender (interface={interface} member={member})"
