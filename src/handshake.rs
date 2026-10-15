@@ -162,6 +162,12 @@ impl Daemon {
     }
 
     fn on_response(&mut self, id: InvitationId, attempt: u8, public: &[u8], confirm: [u8; 32]) {
+        // A response for another attempt (stale, duplicated, or forged)
+        // must not touch the live SPAKE state: finish() is one-shot, so
+        // consuming it here would stall the real attempt until the TTL.
+        if attempt != self.enrollment.code_attempt() {
+            return;
+        }
         let Some(pake) = self.pake.as_mut() else {
             return;
         };
@@ -358,6 +364,29 @@ mod tests {
         inviter.send(to, Letter::Grant { id, confirm, proposal });
         transfer(&mut inviter, &mut joiner, now);
         (inviter, joiner, now)
+    }
+
+    #[test]
+    fn a_response_for_another_attempt_leaves_the_live_pake_alone() {
+        let now = Clock::new(1000, 1000);
+        let mut inviter = Daemon::new("xps");
+        inviter.set_local_address(Some(address(1)));
+        let id = InvitationId::new([5; 16]);
+        let code = Code::parse("123456").unwrap();
+        assert!(inviter.invite(address(2), "gram", code, id, now));
+        assert!(inviter.deliver_invite(id));
+        inviter.send_offer();
+        inviter.take_letters();
+        // A forged response naming a different attempt must not consume
+        // the one-shot SPAKE state or burn the attempt budget.
+        inviter.deliver(
+            address(2),
+            Letter::Response { id, attempt: 99, public: vec![0x42; 32], confirm: [0; 32] },
+            now,
+        );
+        assert!(inviter.pake.is_some());
+        assert_eq!(inviter.enrollment.phase(), Phase::Inviting);
+        assert_eq!(inviter.enrollment.code_attempt(), 0);
     }
 
     #[test]
