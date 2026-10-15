@@ -92,8 +92,31 @@ impl Peers {
         if mismatched {
             return Ingest::Mismatched;
         }
+        let reporter = report.reporter_address;
         self.reports.push(report);
+        self.cap_reports(reporter);
         Ingest::Stored
+    }
+
+    /// Only the freshest few reports per reporter are ever consulted
+    /// (`fresh` scans from the newest), so older ones are dead weight.
+    /// Without a cap, a fleet insider flooding authenticated rosters at
+    /// radio cadence grows this Vec for the life of the process.
+    fn cap_reports(&mut self, reporter: Address) {
+        const KEEP_PER_REPORTER: usize = 4;
+        let total = self.reports.iter().filter(|r| r.reporter_address == reporter).count();
+        if total <= KEEP_PER_REPORTER {
+            return;
+        }
+        // Reports arrive oldest-first per reporter, so drop from the front.
+        let mut drop = total - KEEP_PER_REPORTER;
+        self.reports.retain(|report| {
+            if drop > 0 && report.reporter_address == reporter {
+                drop -= 1;
+                return false;
+            }
+            true
+        });
     }
 
     /// Newest fresh report for this accessory. An air roster expires 15 s after
@@ -166,7 +189,9 @@ impl Peers {
         if mismatched {
             return Ingest::Mismatched;
         }
+        let reporter = report.reporter_address;
         self.reports.push(report);
+        self.cap_reports(reporter);
         Ingest::Stored
     }
 
@@ -279,6 +304,19 @@ mod tests {
         assert!(peers.fresh(now, other).is_none());
         peers.invalidate();
         assert!(peers.fresh(now, pods).is_none());
+    }
+
+    #[test]
+    fn old_reports_from_one_reporter_are_capped() {
+        let pods = Address::parse("AA:AA:AA:AA:AA:AA").unwrap();
+        let mut peers = Peers::new();
+        for seq in 1..=12 {
+            assert_eq!(peers.ingest(report(seq, pods), Some(pods)), Ingest::Stored);
+        }
+        assert_eq!(peers.reports.len(), 4);
+        assert_eq!(peers.reports.first().unwrap().seq, 9);
+        // The newest is still the fresh one.
+        assert_eq!(peers.fresh(Clock::new(0, 0), pods).unwrap().seq, 12);
     }
 
     #[test]
