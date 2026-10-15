@@ -141,6 +141,10 @@ pub struct Daemon {
     /// A failed route, a closed case, and an idle link do not set this.
     displaced: bool,
     pub(crate) background_requested: bool,
+    /// A play pressed while the pods had never been seen this session. The
+    /// claim waits until they are seen or connect, so the speakers are not
+    /// soft-muted for a takeover that may never happen.
+    deferred_playback_claim: Option<MonoMs>,
     case_opened_at: Option<MonoMs>,
     apple_labels: std::collections::HashMap<Address, String>,
     apple_labels_dirty: bool,
@@ -316,6 +320,7 @@ impl Daemon {
             pod_peers_at: None,
             displaced: false,
             background_requested: false,
+            deferred_playback_claim: None,
             case_opened_at: None,
             apple_labels: std::collections::HashMap::new(),
             apple_labels_dirty: false,
@@ -490,6 +495,14 @@ impl Daemon {
         self.accessory.expire(now.mono, self.connection.stage() == Stage::Ready);
         self.discovery.expire(now.unix);
         self.enrollment.on_tick(now.mono);
+        if let Some(at) = self.deferred_playback_claim {
+            if now.mono.saturating_since(at) > 30_000 || !self.audio.local_playing() {
+                self.deferred_playback_claim = None;
+            } else if self.accessory.seen() || self.connection.stage() == Stage::Ready {
+                self.deferred_playback_claim = None;
+                self.claim_playback(now);
+            }
+        }
         if let Some(pending) = &self.pending_admission {
             let failure = if pending.release.is_none() && self.connection.stage() != Stage::Ready {
                 Some(crate::fleet::route_air::Answer::Unavailable)
@@ -2905,6 +2918,7 @@ impl Daemon {
 
     pub(crate) fn step_back(&mut self, now: Clock) {
         self.background_requested = false;
+        self.deferred_playback_claim = None;
         self.resume_output_on_grant = false;
         self.output.clear_work();
         self.seat.step_back(now);
@@ -3304,6 +3318,23 @@ impl Daemon {
         if self.accessory.stowed() {
             return;
         }
+        if self.connection.stage() != Stage::Ready
+            && self.connection.bluez() == Some(false)
+            && !self.accessory.seen()
+        {
+            // BlueZ says the pods are not connected and there has been no
+            // sign of them this session — for instance the daemon
+            // restarted after they were put away, and a closed case does
+            // not advertise, so there is not even stowed evidence. Do not
+            // claim yet: try the link in the background and let the
+            // speakers keep playing. The deferred claim fires on the
+            // first sign of the pods (or when the link lands), and the
+            // normal takeover takes it from there.
+            self.deferred_playback_claim = Some(now.mono);
+            self.open_connection(now.mono);
+            return;
+        }
+        self.deferred_playback_claim = None;
         // Fleet admission only blocks opening a new link. A ready local link
         // can route a genuine play immediately, even before admission completes.
         if self.config.accessory.is_none()
@@ -6137,6 +6168,27 @@ mod tests {
         // for a sink that cannot appear.
         assert!(!daemon.output.want);
         assert_eq!(daemon.status_value(now)["want_omarchy_seat"], false);
+    }
+
+    #[test]
+    fn playback_with_no_sign_of_the_pods_defers_the_claim_until_they_appear() {
+        let mut daemon = Daemon::new("omarchy-xps");
+        let now = clock();
+        daemon.select_accessory(Some(addr(9)));
+        daemon.connection.note_bluez(false);
+        assert!(!daemon.accessory.seen());
+        daemon.handle(play("deferred"), now);
+        // Playing, but never seen this session: no claim, no muted speakers.
+        assert!(!daemon.output.want);
+        assert!(daemon.deferred_playback_claim.is_some());
+        // Still nothing seen: a tick does not claim either.
+        daemon.step(crate::step::Input::Tick, now);
+        assert!(!daemon.output.want);
+        // The first sign of the pods fires the deferred claim.
+        daemon.note_lid(true, now.mono);
+        daemon.step(crate::step::Input::Tick, now);
+        assert!(daemon.output.want);
+        assert!(daemon.deferred_playback_claim.is_none());
     }
 
     #[test]

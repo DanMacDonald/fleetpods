@@ -152,6 +152,17 @@ impl Accessory {
         self.lid.observe(state, at);
     }
 
+    /// Any sign of life this session: an accepted proximity advertisement,
+    /// a lid report, or a placement report. A daemon that restarted after
+    /// the pods were put away has none of these, because a closed case
+    /// stops advertising.
+    pub fn seen(&self) -> bool {
+        self.advertised_at.is_some()
+            || self.lid.last_known.is_some()
+            || self.left_placement.known().is_some()
+            || self.right_placement.known().is_some()
+    }
+
     /// A closed case stops advertising. Keep the connection hold until a newer
     /// lid or placement report contradicts it, without calling old telemetry fresh.
     pub fn stowed(&self) -> bool {
