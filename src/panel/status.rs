@@ -448,6 +448,10 @@ fn insert_fleet(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>) {
     fleet.insert("error".into(), json!(enrollment.error()));
     fleet.insert("code_attempt".into(), json!(enrollment.code_attempt()));
     fleet.insert("enrolled".into(), json!(matches!(snapshot.membership.store(), Store::Open(_))));
+    fleet.insert(
+        "waiting_for_keyring".into(),
+        json!(matches!(snapshot.membership.store(), Store::Unavailable)),
+    );
     if let Some(code) = enrollment.displayed_code() {
         fleet.insert("code".into(), json!(code));
     }

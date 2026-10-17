@@ -77,6 +77,7 @@ pub struct Daemon {
     pub(crate) outbox: Vec<Outbound>,
     pub(crate) pake: Option<Pake>,
     pub(crate) offer: Option<Vec<u8>>,
+    /// Also holds off enrollment after a failed startup read, until a retry succeeds.
     pub(crate) keyring_locked: bool,
     pub(crate) roster_seq: u64,
     pub(crate) link_asked: Option<Generation>,

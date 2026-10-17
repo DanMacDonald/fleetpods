@@ -50,6 +50,7 @@ fleetpods status
 - **No bar icon:** Enable it with `omarchy plugin enable io.github.danmacdonald.fleetpods`. After an upgrade, `omarchy restart shell` reloads cached plugin components. The plugin can also hide its icon when disconnected, according to its settings.
 - **Bluetooth connected but an empty seat:** The AirPods control connection may still be opening. Wait for setup to finish. If it stays pending, keep the buds available and inspect the logs; a disconnected control session does not by itself mean pairing was lost.
 - **Fleet joining or reset reports a keyring error:** Unlock the login keyring and retry. Joining needs access to save membership. Reset reports success only after saved membership is deleted.
+- **Waiting for keyring after reboot:** FleetPods retries locked or failed startup reads every five seconds and restores saved membership automatically when the keyring becomes available. If the message persists, unlock your login keyring. Rejoining the fleet is unnecessary.
 - **Wrong fleet code:** Correct it in the same invitation while it remains valid. If it expires, start a new invitation. Joining another fleet may require confirming that you want to leave the current one.
 - **No microphone input:** Confirm the daemon is connected, select the AirPods input in the application, and check that WirePlumber is running. If capture stops, close and reopen the application's input.
 

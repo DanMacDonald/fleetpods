@@ -36,6 +36,28 @@ TestCase {
     compare(enroll.signalArguments[0][1], "XPS")
   }
 
+  function test_keyringWaitHidesEnrollmentUntilMembershipIsKnown_data() {
+    return [{ tag: "join", enrolled: true }, { tag: "invite", enrolled: false }]
+  }
+
+  function test_keyringWaitHidesEnrollmentUntilMembershipIsKnown(data) {
+    var item = createTemporaryObject(view, this, {
+      availableOmarchy: [{ address: "02:00:00:00:00:04", label: "Gram", kind: "omarchy",
+        discovered: true, fleetEnrolled: data.enrolled }],
+      fleetWaitingForKeyring: true
+    })
+    var button = findChild(item, "fleetEnrollButton")
+    verify(button !== null)
+    verify(!button.visible, "unknown membership must not offer re-enrollment")
+    item.fleetWaitingForKeyring = false
+    verify(button.visible, "a discovered peer can be enrolled after a successful read")
+    compare(button.text, data.enrolled ? "Join fleet" : "+ Add to fleet")
+    item.availableOmarchy = [{ address: "02:00:00:00:00:04", label: "Gram", kind: "omarchy",
+      discovered: false, nearby: true }]
+    button = findChild(item, "fleetEnrollButton")
+    verify(!button.visible, "a restored fleet member does not need re-enrollment")
+  }
+
   function test_quickConnectionFinishesConnector_data() {
     return [{ tag: "ready first", readyFirst: true }, { tag: "attempt ends first", readyFirst: false }]
   }

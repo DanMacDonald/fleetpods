@@ -58,6 +58,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `fleet.phase`, `.id`, `.peer_address`, `.peer_name`, `.initiator`, `.expires_ms`, `.error`, `.code_attempt` | `fleet::enroll` |
 | `fleet.code` | Inviter only, and only while the code is on screen |
 | `fleet.enrolled` | Membership holds an open fleet |
+| `fleet.waiting_for_keyring` | Saved membership cannot be read because the keyring is locked or unavailable. The daemon retries every five seconds; the panel shows “Waiting for keyring” and hides enrollment actions until a read succeeds. `enrolled: false` during this wait does not mean the saved fleet is absent |
 | `devices[].fleet_enrolled` | Optional public discovery hint: `true` means the peer advertises an existing fleet, `false` means unjoined, and `null` means unknown. This unauthenticated hint selects setup wording and never authorizes membership or key replacement |
 | `fleet.available` | `false` until routing advertisements are interpreted. A presence sighting is a discovered device for 30 s from its own timestamp |
 | `fleet.routing` | `fleet::route`: phase, busy, admission, error, peer, retain |

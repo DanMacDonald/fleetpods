@@ -32,7 +32,7 @@ Panel {
     && String(pods.view.fleet.id || "") !== dismissedFleetId)
 
   function chooseFleet(address, name, peerEnrolled) {
-    if (pods.fleetBusy) return
+    if (pods.fleetBusy || pods.view.fleetWaitingForKeyring) return
     if (peerEnrolled && pods.view.fleet.enrolled === true) {
       fleetChoice.stage = "leave"
       fleetChoice.error = ""
@@ -560,6 +560,17 @@ Panel {
             wrapMode: Text.WordWrap
           }
 
+          Text {
+            visible: pods.view.fleetWaitingForKeyring
+            width: parent.width
+            text: "Waiting for keyring…\nFleet membership will load automatically once it is available."
+            textFormat: Text.PlainText
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            wrapMode: Text.WordWrap
+          }
+
           SeatsView {
             id: seats
             enabled: !root.pairingRequired
@@ -568,6 +579,7 @@ Panel {
             height: implicitHeight
             captionGap: Style.space(12)
             presentation: root.seatPresentation
+            fleetWaitingForKeyring: pods.view.fleetWaitingForKeyring
             // The pulse runs only while the panel is open.
             audioPlaying: root.opened && root.seatPresentation.audioPlaying
             localAddress: pods.view && pods.view.localAddress ? String(pods.view.localAddress) : ""

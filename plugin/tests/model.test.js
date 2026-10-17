@@ -2285,11 +2285,6 @@ const enrolledPeer = Model.devicesMap([{ address: "AA:BB:CC:DD:EE:FF", label: "g
 check('enrollment hint reaches tray peer', Model.availableDevices("omarchy", [], enrolledPeer)[0].fleetEnrolled, true);
 check('public enrollment hint remains discovery only', Model.availableDevices("omarchy", [], enrolledPeer)[0].discovered, true);
 
-if (failures > 0) {
-  console.log(failures + " failed")
-  Deno.exit(1)
-}
-console.log("model.test.js: all checks passed")
 
 // A temporary Bluetooth connection must not masquerade as saved pairing.
 for (const bonded of [true, false, null]) {
@@ -2303,3 +2298,14 @@ for (const bonded of [true, false, null]) {
   check('unpaired setup keeps ordinary instructions: ' + bonded, Model.pairingWarning(status), '')
 }
 check('old daemons do not invent missing bonds', Model.parseStatus('{"schema_version":1}').bluetoothBonded, null)
+check('old daemons do not invent a keyring wait', Model.parseStatus('{"schema_version":1}').fleetWaitingForKeyring, false)
+check('unavailable membership waits for the keyring',
+  Model.parseStatus('{"schema_version":1,"fleet":{"enrolled":false,"waiting_for_keyring":true}}').fleetWaitingForKeyring, true)
+check('restored membership clears the keyring wait',
+  Model.parseStatus('{"schema_version":1,"fleet":{"enrolled":true,"waiting_for_keyring":false}}').fleetWaitingForKeyring, false)
+
+if (failures > 0) {
+  console.log(failures + " failed")
+  Deno.exit(1)
+}
+console.log("model.test.js: all checks passed")

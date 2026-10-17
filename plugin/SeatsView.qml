@@ -69,6 +69,7 @@ Item {
 
   property bool reconnectBusy: false
   property bool reconnectEnabled: true
+  property bool fleetWaitingForKeyring: false
 
   signal enrollClicked(string address, string name, bool peerEnrolled)
   signal reconnectClicked
@@ -893,6 +894,7 @@ Item {
             id: enrollButton
             objectName: seat.title === "Omarchy" ? "fleetEnrollButton" : ""
             visible: seat.title === "Omarchy" && waitingDevice.device.discovered === true
+              && !root.fleetWaitingForKeyring
             width: Math.min(waitingStack.slotWidth + seat.labelGutter - 4, contentItem.implicitWidth + 12)
             x: (parent.width - width) / 2
             height: root.enrollButtonHeight

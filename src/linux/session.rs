@@ -71,7 +71,7 @@ pub struct Session {
     mic_source: Option<super::micsource::Running>,
     /// Last streaming and mute report taken from the hidden source.
     mic_picture: Option<(bool, bool)>,
-    /// When a locked keyring was last asked for the fleet again.
+    /// When an unavailable keyring was last asked for the fleet again.
     keyring_retry_at: Option<crate::types::MonoMs>,
 }
 
@@ -263,7 +263,7 @@ impl Session {
         self.retry_locked_keyring(now);
     }
 
-    /// A locked keyring at start is retried until it opens, so a restart while locked recovers.
+    /// Retry locked or failed startup reads until the keyring can be read.
     fn retry_locked_keyring(&mut self, now: Clock) {
         const RETRY_MS: u64 = 5_000;
         if !self.daemon.keyring_locked() {
@@ -484,18 +484,26 @@ impl Drop for Session {
 }
 
 fn remember_fleet(daemon: &mut Daemon) {
-    match keyring::load() {
+    restore_saved_fleet(daemon, keyring::load());
+    if let Some(keys) = load_accessory_keys() {
+        daemon.set_accessory_keys(keys);
+    }
+}
+
+fn restore_saved_fleet(daemon: &mut Daemon, loaded: Result<Load, String>) {
+    match loaded {
         Ok(Load::Open(fleet)) => daemon.restore_fleet(fleet),
         Ok(Load::Missing) => {}
         Ok(Load::Locked) => {
             eprintln!("fleetpodsd: the keyring is locked; the fleet loads once it is unlocked");
             daemon.set_keyring_locked(true);
-            daemon.membership.mark_unavailable();
+            daemon.mark_secrets_unavailable();
         }
-        Err(err) => eprintln!("fleetpodsd: keyring is not available: {err}"),
-    }
-    if let Some(keys) = load_accessory_keys() {
-        daemon.set_accessory_keys(keys);
+        Err(err) => {
+            eprintln!("fleetpodsd: keyring is not available; retrying every five seconds: {err}");
+            daemon.set_keyring_locked(true);
+            daemon.mark_secrets_unavailable();
+        }
     }
 }
 
@@ -519,7 +527,7 @@ enum SecretJob {
         name: String,
         bytes: Vec<u8>,
     },
-    /// Ask a locked keyring for the fleet again. Nothing is reported while it stays locked.
+    /// Retry reading the keyring. Nothing is reported while locked or unavailable.
     Reload,
     Stop,
 }
@@ -1987,6 +1995,61 @@ mod fleet_reset_tests {
             mic_source: None,
             mic_picture: None,
             keyring_retry_at: Some(MonoMs(1)),
+        }
+    }
+
+    #[test]
+    fn locked_and_failed_startup_reads_retry_until_membership_is_restored() {
+        for loaded in [Ok(Load::Locked), Err("Secret Service is not ready".into())] {
+            let (reports, rx) = mpsc::channel();
+            let (jobs, worker) = mpsc::channel();
+            let mut session = session(rx, jobs);
+            session.daemon = Daemon::new("test-host");
+            session.keyring_retry_at = None;
+            restore_saved_fleet(&mut session.daemon, loaded);
+
+            let status = session.daemon.status_value(Clock::new(1000, 1000));
+            assert_eq!(status["fleet"]["waiting_for_keyring"], true);
+            assert_eq!(status["fleet"]["enrolled"], false);
+            assert!(session.daemon.keyring_locked());
+            assert!(session.daemon.saved_fleet().is_none());
+
+            session.retry_locked_keyring(Clock::new(1000, 1000));
+            assert!(matches!(worker.try_recv(), Ok(SecretJob::Reload)));
+            session.retry_locked_keyring(Clock::new(5999, 5999));
+            assert!(worker.try_recv().is_err(), "no busy-loop while waiting");
+            session.retry_locked_keyring(Clock::new(6000, 6000));
+            assert!(matches!(worker.try_recv(), Ok(SecretJob::Reload)));
+            session.retry_locked_keyring(Clock::new(11000, 11000));
+            assert!(matches!(worker.try_recv(), Ok(SecretJob::Reload)));
+
+            reports.send(Input::KeyringUnlocked { fleet: Some(fleet()), keys: None }).unwrap();
+            session.poll(Clock::new(16000, 16000));
+            assert_eq!(session.daemon.saved_fleet(), Some(fleet()));
+            let status = session.daemon.status_value(Clock::new(16000, 16000));
+            assert_eq!(status["fleet"]["waiting_for_keyring"], false);
+            assert_eq!(status["fleet"]["enrolled"], true);
+            assert!(!session.daemon.keyring_locked());
+            assert!(session.keyring_retry_at.is_none());
+            assert!(worker.try_recv().is_err(), "successful recovery stops retries");
+        }
+    }
+
+    #[test]
+    fn successful_startup_reads_do_not_wait_for_the_keyring() {
+        for loaded in [Ok(Load::Missing), Ok(Load::Open(fleet()))] {
+            let (_reports, rx) = mpsc::channel();
+            let (jobs, worker) = mpsc::channel();
+            let mut session = session(rx, jobs);
+            session.daemon = Daemon::new("test-host");
+            restore_saved_fleet(&mut session.daemon, loaded);
+            session.retry_locked_keyring(Clock::new(6000, 6000));
+            assert!(worker.try_recv().is_err());
+            assert!(!session.daemon.keyring_locked());
+            assert_eq!(
+                session.daemon.status_value(Clock::new(6000, 6000))["fleet"]["waiting_for_keyring"],
+                false
+            );
         }
     }
 

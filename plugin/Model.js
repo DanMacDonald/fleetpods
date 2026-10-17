@@ -93,6 +93,7 @@ function defaultStatus() {
     lidUpdatedMs: 0,
     devices: {},
     fleetOutcome: null,
+    fleetWaitingForKeyring: false,
     left: defaultPod(),
     right: defaultPod(),
     caseBattery: { level: LEVEL_UNKNOWN, charging: false },
@@ -359,6 +360,7 @@ function parseStatus(raw) {
   status.wantOmarchySeat = parsed.want_omarchy_seat === true
   status.holdingOmarchySeat = parsed.holding_omarchy_seat === true
   status.fleet = parsed.fleet && typeof parsed.fleet === "object" ? parsed.fleet : { phase: "idle" }
+  status.fleetWaitingForKeyring = status.fleet.waiting_for_keyring === true
   var outcome = parsed.fleet_outcome
   status.fleetOutcome = outcome && typeof outcome === "object" && outcome.at_ms > 0 && outcome.result
     ? { atMs: outcome.at_ms, result: String(outcome.result), peer: normalizeAddress(outcome.peer),
