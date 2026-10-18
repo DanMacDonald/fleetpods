@@ -97,21 +97,23 @@ fn main() {
 
 struct Boot {
     started: Instant,
-    unix_ms: u64,
 }
 
 impl Boot {
     fn now() -> Self {
-        let unix_ms = SystemTime::now()
+        Self { started: Instant::now() }
+    }
+
+    /// `Instant` stops while the machine sleeps, so wall time is read fresh
+    /// rather than derived from it. Otherwise every published timestamp and
+    /// every cross-host freshness check would lag by the time spent asleep.
+    fn clock(&self) -> Clock {
+        let mono = self.started.elapsed().as_millis() as u64;
+        let unix = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
-        Self { started: Instant::now(), unix_ms }
-    }
-
-    fn clock(&self) -> Clock {
-        let mono = self.started.elapsed().as_millis() as u64;
-        Clock::new(mono, self.unix_ms.saturating_add(mono))
+        Clock::new(mono, unix)
     }
 }
 
