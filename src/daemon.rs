@@ -142,8 +142,8 @@ pub struct Daemon {
     /// A failed route, a closed case, and an idle link do not set this.
     displaced: bool,
     pub(crate) background_requested: bool,
-    /// A play pressed while the pods had never been seen this session. The
-    /// claim waits until they are seen or connect, so the speakers are not
+    /// A play pressed without evidence the pods can play. The
+    /// claim waits until they are available or connect, so the speakers are not
     /// soft-muted for a takeover that may never happen.
     deferred_playback_claim: Option<MonoMs>,
     case_opened_at: Option<MonoMs>,
@@ -499,7 +499,11 @@ impl Daemon {
         if let Some(at) = self.deferred_playback_claim {
             if now.mono.saturating_since(at) > 30_000 || !self.audio.local_playing() {
                 self.deferred_playback_claim = None;
-            } else if self.accessory.seen() || self.connection.stage() == Stage::Ready {
+            } else if !self.accessory.stowed()
+                && !self.accessory.both_docked()
+                && (self.accessory.playback_available(now.mono)
+                    || self.connection.stage() == Stage::Ready)
+            {
                 self.deferred_playback_claim = None;
                 self.claim_playback(now);
             }
@@ -3316,21 +3320,17 @@ impl Daemon {
         // be opened for them. Claiming anyway would soft-mute the speaker
         // streams for the whole takeover hold while nothing can arrive, so
         // local playback would sit silent for seconds before falling back.
-        if self.accessory.stowed() {
+        if self.accessory.stowed() || self.accessory.both_docked() {
+            self.deferred_playback_claim = Some(now.mono);
             return;
         }
         if self.connection.stage() != Stage::Ready
             && self.connection.bluez() == Some(false)
-            && !self.accessory.seen()
+            && !self.accessory.playback_available(now.mono)
         {
-            // BlueZ says the pods are not connected and there has been no
-            // sign of them this session — for instance the daemon
-            // restarted after they were put away, and a closed case does
-            // not advertise, so there is not even stowed evidence. Do not
-            // claim yet: try the link in the background and let the
-            // speakers keep playing. The deferred claim fires on the
-            // first sign of the pods (or when the link lands), and the
-            // normal takeover takes it from there.
+            // A historical sighting or an open case is not evidence that the
+            // buds can play. Probe the link without muting speaker playback;
+            // claim only when a bud is out or the control link becomes ready.
             self.deferred_playback_claim = Some(now.mono);
             self.open_connection(now.mono);
             return;
@@ -6177,7 +6177,7 @@ mod tests {
         let now = clock();
         daemon.select_accessory(Some(addr(9)));
         daemon.connection.note_bluez(false);
-        assert!(!daemon.accessory.seen());
+        assert!(!daemon.accessory.playback_available(now.mono));
         daemon.handle(play("deferred"), now);
         // Playing, but never seen this session: no claim, no muted speakers.
         assert!(!daemon.output.want);
@@ -6185,11 +6185,83 @@ mod tests {
         // Still nothing seen: a tick does not claim either.
         daemon.step(crate::step::Input::Tick, now);
         assert!(!daemon.output.want);
-        // The first sign of the pods fires the deferred claim.
+        // Opening the case alone must not silence the speakers.
         daemon.note_lid(true, now.mono);
+        daemon.step(crate::step::Input::Tick, now);
+        assert!(!daemon.output.want);
+        daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
         daemon.step(crate::step::Input::Tick, now);
         assert!(daemon.output.want);
         assert!(daemon.deferred_playback_claim.is_none());
+    }
+
+    #[test]
+    fn unavailable_pods_leave_speaker_playback_audible_through_connection_retries() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+
+        for scenario in ["old sighting", "incomplete closed case", "open docked case"] {
+            let mut daemon = Daemon::new("xps");
+            let before = clock();
+            let now = Clock::new(before.mono.0 + 20_000, before.unix.0 + 20_000);
+            daemon.select_accessory(Some(addr(9)));
+            daemon.connection.note_bluez(false);
+            daemon.accessory.note_advertisement(before.mono, 0);
+            if scenario == "old sighting" {
+                daemon.accessory.note_placement(false, Some(true), Some(false), before.mono);
+            } else {
+                daemon.accessory.note_placement(false, Some(false), Some(true), now.mono);
+                daemon.accessory.note_placement(
+                    true,
+                    Some(false),
+                    (scenario == "open docked case").then_some(true),
+                    now.mono,
+                );
+                daemon.note_lid(scenario == "open docked case", now.mono);
+            }
+            let graph = Graph {
+                default_sink: "speakers".into(),
+                sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "speakers".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 0.5,
+                    corked: false,
+                }],
+            };
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon.step(Input::Players(Vec::new()), now);
+            let playing = daemon.step(
+                Input::Player {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: Some(true),
+                },
+                now,
+            );
+            assert!(!daemon.output.want, "{scenario}");
+            assert!(!playing.effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))));
+            let generation = daemon.connection.generation();
+            daemon.step(Input::LinkFailed { generation, busy: false }, now);
+            for elapsed in [1_000, 6_000, 9_000] {
+                let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
+                for input in [Input::Tick, Input::Audio(graph.clone())] {
+                    let result = daemon.step(input, at);
+                    assert!(!daemon.output.want, "{scenario}: {elapsed}");
+                    assert!(daemon.output.held.is_empty());
+                    assert!(!result.effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))));
+                }
+            }
+            // Taking a bud out supplies the missing evidence and permits takeover.
+            let at = Clock::new(now.mono.0 + 10_000, now.unix.0 + 10_000);
+            daemon.accessory.note_placement(false, Some(true), Some(false), at.mono);
+            daemon.step(Input::Tick, at);
+            assert!(daemon.output.want, "{scenario}");
+        }
     }
 
     #[test]

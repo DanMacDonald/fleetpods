@@ -152,15 +152,19 @@ impl Accessory {
         self.lid.observe(state, at);
     }
 
-    /// Any sign of life this session: an accepted proximity advertisement,
-    /// a lid report, or a placement report. A daemon that restarted after
-    /// the pods were put away has none of these, because a closed case
-    /// stops advertising.
-    pub fn seen(&self) -> bool {
-        self.advertised_at.is_some()
-            || self.lid.last_known.is_some()
-            || self.left_placement.known().is_some()
-            || self.right_placement.known().is_some()
+    /// Evidence that disconnected pods can play now. Case advertisements and
+    /// old placement reports do not justify silencing the laptop's speakers.
+    pub fn playback_available(&self, now: MonoMs) -> bool {
+        let recent = |at| now.saturating_since(at) <= 10_000;
+        if self.model.is_headset() {
+            return self.advertised_at.is_some_and(recent);
+        }
+        [&self.left_placement, &self.right_placement].into_iter().any(|pod| {
+            pod.at().is_some_and(recent)
+                && pod
+                    .as_fresh()
+                    .is_some_and(|pod| pod.in_ear == Some(true) || pod.in_case == Some(false))
+        })
     }
 
     /// A closed case stops advertising. Keep the connection hold until a newer
