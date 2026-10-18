@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+study_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
+qml_runner="${QML_BIN:-/usr/lib/qt6/bin/qml}"
+
+if [[ "${1:-}" == --help ]]; then
+  cat <<'USAGE'
+Usage: tools/artwork/preview [--light] [--open | --closed] [--capture]
+
+Open the standalone FleetPods artwork study. No daemon or connected pods needed.
+Use QML_BIN to override the Qt 6 qml executable.
+
+For a headless still:
+  QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software tools/artwork/preview --light --open --capture
+
+Captures: /tmp/fleetpods-dotmesh-light.png or /tmp/fleetpods-dotmesh.png
+USAGE
+  exit 0
+fi
+
+exec "$qml_runner" "$study_root/plugin/previews/DotPodsPreview.qml" -- "$@"

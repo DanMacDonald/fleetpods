@@ -8,6 +8,11 @@ The panel reads `$XDG_STATE_HOME/fleetpods/status.json` and sends commands throu
 
 Plugin tests stay under `plugin/tests`. `cargo test` does not run them.
 
+The standalone [dot-mesh artwork study](previews/README.md) is kept alongside
+the plugin for visual iteration. Launch it with
+`./tools/artwork/preview --light --open` from the repository root; it needs no
+running daemon or connected earbuds.
+
 ```
 deno run --allow-read plugin/tests/model.test.js
 deno run --allow-read plugin/tests/replay.test.js
