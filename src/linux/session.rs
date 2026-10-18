@@ -635,7 +635,14 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
     }
     loop {
         let retry_scan = live.air.want_scan && !live.air.scanned;
-        let timeout = if live.calls.is_empty() && !retry_scan { -1 } else { 1_000 };
+        let timeout = if !live.calls.is_empty() || retry_scan {
+            1_000
+        } else if live.air.want_scan {
+            // A running scan is rechecked; see verify_scan.
+            SCAN_CHECK.as_millis() as i32
+        } else {
+            -1
+        };
         let polled_socket = live.link.identity();
         let (dbus_ready, socket_ready) = wait(&wake, &bus, &live.link, timeout);
         expire_calls(&bus, &reports, &mut live);
@@ -716,6 +723,7 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
             eprintln!("fleetpodsd: discarded readiness for a replaced control socket");
         }
         if live.air.want_scan {
+            verify_scan(&bus, &mut live);
             ensure_scan(&bus, &mut live);
         }
     }
@@ -777,6 +785,9 @@ impl Default for Live {
     }
 }
 
+/// How often a scan believed to be running is confirmed with BlueZ.
+const SCAN_CHECK: Duration = Duration::from_secs(30);
+
 #[derive(Default)]
 struct Air {
     current: Vec<u8>,
@@ -786,6 +797,8 @@ struct Air {
     /// The daemon asked discovery to stay up.
     want_scan: bool,
     scanned: bool,
+    /// When BlueZ last confirmed, or was last asked, that discovery is running.
+    scan_checked_at: Option<Instant>,
     scan_retry_at: Option<Instant>,
     /// Yield our scan while the user pairs through the Bluetooth panel.
     pairing_until: Option<Instant>,
@@ -819,7 +832,14 @@ impl Air {
 
     fn scan_result(&mut self, accepted: bool, now: Instant) {
         self.scanned = accepted;
+        self.scan_checked_at = accepted.then_some(now);
         self.scan_retry_at = (!accepted).then_some(now + Duration::from_secs(1));
+    }
+
+    fn scan_check_due(&self, now: Instant) -> bool {
+        self.want_scan
+            && self.scanned
+            && self.scan_checked_at.is_none_or(|at| now.duration_since(at) >= SCAN_CHECK)
     }
 
     fn scan_due(&self, now: Instant) -> bool {
@@ -1194,6 +1214,9 @@ fn on_notice(
         }
         Notice::DiscoveryStopped(path) => {
             if live.adapter_path.as_deref() == Some(path.as_str()) {
+                if live.air.want_scan {
+                    eprintln!("fleetpodsd: Bluetooth discovery stopped; restarting");
+                }
                 live.air.scan_result(false, Instant::now());
             }
         }
@@ -1709,6 +1732,34 @@ fn set_scan_filter(bus: &Bus, live: &Live, transport: Option<&str>) {
         "SetDiscoveryFilter",
     ) {
         let _ = bus.submit(message.append1(filter));
+    }
+}
+
+/// BlueZ can end discovery without this client seeing a `Discovering`
+/// change, for instance across a bluetoothd restart or a failed scan
+/// restart in the controller. Trusting `scanned` alone then leaves the
+/// daemon deaf to case and ear reports until something else stops a scan.
+fn verify_scan(bus: &Bus, live: &mut Live) {
+    let now = Instant::now();
+    if !live.air.scan_check_due(now)
+        || live.air.pairing_paused(now)
+        || live
+            .calls
+            .iter()
+            .any(|call| matches!(call.kind, CallKind::StartDiscovery | CallKind::StopDiscovery))
+    {
+        return;
+    }
+    let Some(path) = live.adapter_path.as_deref() else { return };
+    match bus.discovering(path) {
+        Ok(true) => live.air.scan_checked_at = Some(now),
+        Ok(false) => {
+            eprintln!("fleetpodsd: Bluetooth discovery stopped without notice; restarting");
+            live.air.scan_result(false, now);
+            live.air.scan_retry_at = None;
+        }
+        // bluetoothd may be restarting; its name change resets the scan.
+        Err(_) => live.air.scan_checked_at = Some(now),
     }
 }
 
@@ -2332,6 +2383,22 @@ mod advertisement_tests {
         air.scan_result(false, now + Duration::from_secs(10));
         assert!(air.want_scan);
         assert!(air.scan_due(now + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn a_running_scan_is_rechecked_with_bluez() {
+        let now = Instant::now();
+        let mut air = Air { want_scan: true, ..Air::default() };
+        assert!(!air.scan_check_due(now));
+        air.scan_result(true, now);
+        assert!(!air.scan_check_due(now + SCAN_CHECK - Duration::from_millis(1)));
+        assert!(air.scan_check_due(now + SCAN_CHECK));
+        // A confirmation pushes the next check out.
+        air.scan_checked_at = Some(now + SCAN_CHECK);
+        assert!(!air.scan_check_due(now + SCAN_CHECK + Duration::from_secs(1)));
+        // A scan the daemon no longer wants is not checked.
+        air.want_scan = false;
+        assert!(!air.scan_check_due(now + SCAN_CHECK * 3));
     }
 
     fn pairing_frame() -> Vec<u8> {

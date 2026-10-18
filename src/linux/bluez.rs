@@ -145,6 +145,13 @@ impl Bus {
         Ok(())
     }
 
+    /// Whether the adapter reports any discovery session running right now.
+    pub fn discovering(&self, adapter: &str) -> Result<bool, String> {
+        use dbus::blocking::stdintf::org_freedesktop_dbus::Properties;
+        let proxy = self.connection.with_proxy("org.bluez", adapter, Duration::from_secs(2));
+        proxy.get("org.bluez.Adapter1", "Discovering").map_err(|err| err.to_string())
+    }
+
     pub fn disconnect(&self, path: &str) -> Result<(), String> {
         let proxy = self.connection.with_proxy("org.bluez", path, Duration::from_secs(8));
         call_device(proxy, "Disconnect", ())
