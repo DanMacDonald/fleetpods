@@ -1303,7 +1303,11 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 || matches!(&result, CallResult::Failed { name, .. } if name.ends_with("InProgress"));
             live.air.scan_result(accepted, Instant::now());
             if accepted {
-                eprintln!("fleetpodsd: Bluetooth discovery started");
+                if matches!(&result, CallResult::Done) {
+                    eprintln!("fleetpodsd: Bluetooth discovery started");
+                } else {
+                    eprintln!("fleetpodsd: Bluetooth discovery already running");
+                }
                 if (!live.air.want_scan && !live.air.wanted)
                     || live.air.pairing_paused(Instant::now())
                 {
@@ -1735,10 +1739,11 @@ fn set_scan_filter(bus: &Bus, live: &Live, transport: Option<&str>) {
     }
 }
 
-/// BlueZ can end discovery without this client seeing a `Discovering`
-/// change, for instance across a bluetoothd restart or a failed scan
-/// restart in the controller. Trusting `scanned` alone then leaves the
-/// daemon deaf to case and ear reports until something else stops a scan.
+/// BlueZ can stop scanning while still holding this client's discovery
+/// session, without this client seeing a `Discovering` change. Another
+/// StartDiscovery then only answers InProgress, so trusting `scanned` left
+/// the daemon deaf to case and ear reports. Release the session and start
+/// a new one instead.
 fn verify_scan(bus: &Bus, live: &mut Live) {
     let now = Instant::now();
     if !live.air.scan_check_due(now)
@@ -1755,8 +1760,9 @@ fn verify_scan(bus: &Bus, live: &mut Live) {
         Ok(true) => live.air.scan_checked_at = Some(now),
         Ok(false) => {
             eprintln!("fleetpodsd: Bluetooth discovery stopped without notice; restarting");
-            live.air.scan_result(false, now);
-            live.air.scan_retry_at = None;
+            live.air.scan_checked_at = Some(now);
+            // The stop reply clears `scanned`, and ensure_scan starts again.
+            stop_discovery(bus, live);
         }
         // bluetoothd may be restarting; its name change resets the scan.
         Err(_) => live.air.scan_checked_at = Some(now),
