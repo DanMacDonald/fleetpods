@@ -24,6 +24,41 @@ Panel {
     }
   }
 
+  // Each seat's drawn device order, so a shell restart redraws a pair on the
+  // sides it had. Nothing is written until the saved file has been read.
+  property var seatOrders: ({})
+  property bool seatOrdersRead: false
+  FileView {
+    id: seatOrderFile
+    path: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state")
+      + "/fleetpods/panel-seats.json"
+    blockLoading: true
+    printErrors: false
+    onLoaded: {
+      try { root.seatOrders = JSON.parse(text()) || {} }
+      catch (error) { root.seatOrders = {} }
+      root.seatOrdersRead = true
+    }
+    onLoadFailed: root.seatOrdersRead = true
+  }
+  // Seats report their order while their own bindings are evaluating, so
+  // the saved order changes on the next turn rather than mid-evaluation.
+  // An order drawn before the file was read is a guess and is dropped, even
+  // though its write would only run once the file has loaded.
+  function saveSeatOrder(seatName, slot, keys) {
+    if (seatOrdersRead) Qt.callLater(writeSeatOrder, seatName, slot, keys)
+  }
+  function writeSeatOrder(seatName, slot, keys) {
+    const current = seatOrders && seatOrders[seatName] && seatOrders[seatName][slot]
+    if (current && JSON.stringify(current) === JSON.stringify(keys)) return
+    const next = JSON.parse(JSON.stringify(seatOrders || {}))
+    const entry = next[seatName] || {}
+    entry[slot] = keys
+    next[seatName] = entry
+    seatOrders = next
+    seatOrderFile.setText(JSON.stringify(next))
+  }
+
   property string shownFleetId: ""
   property string dismissedFleetId: "-"
   property bool fleetAutoOpened: false
@@ -583,6 +618,8 @@ Panel {
             // The pulse runs only while the panel is open.
             audioPlaying: root.opened && root.seatPresentation.audioPlaying
             localAddress: pods.view && pods.view.localAddress ? String(pods.view.localAddress) : ""
+            savedOrders: root.seatOrders
+            onOrderDrawn: function (seatName, slot, keys) { root.saveSeatOrder(seatName, slot, keys) }
             accent: Commons.Color.accent
             foreground: root.foreground
             dim: root.dim

@@ -314,6 +314,60 @@ TestCase {
     verify(!findChild(item, "deviceApple1").selected)
   }
 
+  SignalSpy { id: orderDrawn; signalName: "orderDrawn" }
+
+  function test_restartKeepsTheSavedPairOrder() {
+    var first = { address: "02:00:00:00:00:01", label: "Laptop A", onAcl: true }
+    var second = { address: "02:00:00:00:00:02", label: "Laptop B", onAcl: true }
+    var keys = [Model.normalizeAddress(first.address), Model.normalizeAddress(second.address)]
+    // Both devices are already seated at startup, so no arrival orders them.
+    var fresh = createTemporaryObject(view, this, { omarchyDevices: [first, second] })
+    compare(findChild(fresh, "omarchySeat").occupant.address, first.address)
+
+    var item = createTemporaryObject(view, this, {
+      savedOrders: { omarchy: { pair: [keys[1], keys[0]] } }, omarchyDevices: [first, second]
+    })
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupant.address, second.address)
+    compare(seat.occupantTwo.address, first.address)
+  }
+
+  function test_aLateSavedOrderReplacesOnlyAGuessedPairOrder() {
+    var first = { address: "02:00:00:00:00:01", label: "Laptop A", onAcl: true }
+    var second = { address: "02:00:00:00:00:02", label: "Laptop B", onAcl: true }
+    var keys = [Model.normalizeAddress(first.address), Model.normalizeAddress(second.address)]
+    var item = createTemporaryObject(view, this, { omarchyDevices: [first, second] })
+    var seat = findChild(item, "omarchySeat")
+    item.savedOrders = { omarchy: { pair: [keys[1], keys[0]] } }
+    compare(seat.occupant.address, second.address)
+
+    // An arrival decides the order; a saved order cannot override it.
+    var arrived = createTemporaryObject(view, this, { omarchyDevices: [first] })
+    seat = findChild(arrived, "omarchySeat")
+    orderDrawn.target = arrived; orderDrawn.clear()
+    arrived.omarchyDevices = [first, second]
+    compare(seat.occupant.address, second.address, "the newcomer takes the left slot")
+    compare(orderDrawn.count, 1)
+    compare(orderDrawn.signalArguments[0][0], "omarchy")
+    compare(orderDrawn.signalArguments[0][1], "pair")
+    compare(orderDrawn.signalArguments[0][2], [keys[1], keys[0]])
+    arrived.savedOrders = { omarchy: { pair: [keys[0], keys[1]] } }
+    compare(seat.occupant.address, second.address)
+  }
+
+  function test_restartKeepsARisenPairOnItsSeatSides() {
+    var first = { address: "02:00:00:00:00:01", label: "Laptop A" }
+    var second = { address: "02:00:00:00:00:02", label: "Laptop B" }
+    var keys = [Model.normalizeAddress(first.address), Model.normalizeAddress(second.address)]
+    var item = createTemporaryObject(view, this, {
+      savedOrders: { omarchy: { pair: [keys[1], keys[0]], tray: [keys[0], keys[1]] } },
+      availableOmarchy: [first, second]
+    })
+    // The last seated pair outranks an older tray order, as it does before a restart.
+    compare(findChild(item, "waitingOmarchy0").device.address, second.address)
+    compare(findChild(item, "waitingOmarchy1").device.address, first.address)
+  }
+
   function test_haloFollowsDeviceWithinSharedSeat() {
     var first = { address: "02:00:00:00:00:01", label: "Laptop A", onAcl: true }
     var second = { address: "02:00:00:00:00:02", label: "Laptop B", onAcl: true }

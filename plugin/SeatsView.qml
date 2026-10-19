@@ -30,6 +30,20 @@ Item {
   property bool omarchyOwnsAudio: presentation ? presentation.omarchyOwnsAudio : false
   property string activeDeviceAddress: presentation ? presentation.audioDeviceAddress : ""
   property string localAddress: ""
+  /// Pair and tray orders the panel saved, keyed by seat name:
+  /// { omarchy: { pair: [key, key], tray: [key, key] }, apple: ... }, where
+  /// pair is the seat's last pair order (lastPairOrder). After a
+  /// restart nothing has arrived or departed yet, so these keep each device
+  /// on the side it was last drawn instead of falling back to address order.
+  property var savedOrders: ({})
+  signal orderDrawn(string seatName, string slot, var keys)
+  function restoredOrder(saved, keys) {
+    return saved && saved.length === 2 && keys.length === 2
+      && keys.every(function (key) { return saved.indexOf(key) >= 0 }) ? saved.slice() : null
+  }
+  function sameOrder(a, b) {
+    return !!a && !!b && a.length === b.length && a.every(function (key, at) { return b[at] === key })
+  }
   property color foreground: "#e6e6e6"
   property color accent: "#7aa2f7"
   property color dim: "#888888"
@@ -163,6 +177,7 @@ Item {
     id: appleSeat
     objectName: "appleSeat"
     title: "Apple"
+    orderName: "apple"
     waitingUnconfirmed: root.rememberedAppleTray
     // A tray Apple device can come forward by smart routing only when the
     // seated Apple device is the idle audio owner: the routing request
@@ -192,6 +207,7 @@ Item {
     id: omarchySeat
     objectName: "omarchySeat"
     title: "Omarchy"
+    orderName: "omarchy"
     statusText: root.omarchyTransitionLabel
     switching: root.attemptKind === "switching"
     connecting: root.attemptActive
@@ -479,6 +495,8 @@ Item {
   component SeatChannel: Item {
     id: seat
     required property var layout
+    property string orderName: ""
+    readonly property var savedOrder: root.savedOrders && root.savedOrders[orderName] || ({})
     readonly property string actionLabel: layout.actionLabel
     readonly property bool actionEnabled: layout.actionEnabled
     readonly property bool showWaiting: layout.showWaiting
@@ -493,7 +511,10 @@ Item {
     /// treatment like "Waiting…".
     property bool connecting: false
     readonly property bool connectorConnected: drawnConnected || switching || connecting || (linkConnected && arriving)
-    Component.onCompleted: drawnConnected = linkConnected
+    Component.onCompleted: {
+      drawnConnected = linkConnected
+      restoreSavedPair()
+    }
     function holdTray() { waitingStack.captureHold() }
     function syncDrawn() { if (linkConnected && !arriving) drawnConnected = true }
     onLinkConnectedChanged: { if (!linkConnected) drawnConnected = false; else drawnSync.restart() }
@@ -581,6 +602,24 @@ Item {
     /// tray places the risen pair on the sides they sat on.
     property var lastPairOrder: []
     property var previousSeatedKeys: []
+    /// Nothing this session has decided the pair order (no arrival, no
+    /// break-up), so the saved last pair may still be restored.
+    property bool pairOrderGuessed: true
+    function restoreSavedPair() {
+      const saved = savedOrder.pair
+      if (!pairOrderGuessed || !saved || saved.length !== 2) return
+      if (pairOrder.length === 2) {
+        const restored = root.restoredOrder(saved, pairOrder)
+        if (!restored) return
+        pairOrder = restored
+      }
+      if (lastPairOrder.length === 0 || root.restoredOrder(saved, lastPairOrder)) lastPairOrder = saved.slice()
+    }
+    onSavedOrderChanged: restoreSavedPair()
+    onLastPairOrderChanged: {
+      if (orderName && !root.sameOrder(lastPairOrder, savedOrder.pair || []))
+        root.orderDrawn(orderName, "pair", lastPairOrder.slice())
+    }
     function seatedKey(device) { return Model.normalizeAddress(device && device.address || "") }
     onSeatedChanged: {
       const list = seated || []
@@ -592,17 +631,22 @@ Item {
           const fresh = list.filter(function (device) {
             return previousSeatedKeys.indexOf(seatedKey(device)) < 0
           })
+          const restored = fresh.length === 1 ? null : root.restoredOrder(savedOrder.pair, keys)
+          if (fresh.length === 1 || restored) pairOrderGuessed = false
           pairOrder = fresh.length === 1
             ? [seatedKey(fresh[0]), keys.find(function (key) { return key !== seatedKey(fresh[0]) })]
-            : keys.slice()
+            : restored || keys.slice()
         }
-        if (pairOrder.length === 2) lastPairOrder = pairOrder.slice()
+        if (pairOrder.length === 2 && !root.sameOrder(pairOrder, lastPairOrder)) lastPairOrder = pairOrder.slice()
       } else {
         pairOrder = []
         // One member of the pair is back in the seat on its own: the tray
         // episode is over and the other re-centres to the lone left slot.
         if (list.length === 1 && !list[0].standIn && lastPairOrder.length === 2
-          && lastPairOrder.indexOf(keys[0]) >= 0) lastPairOrder = []
+          && lastPairOrder.indexOf(keys[0]) >= 0) {
+          pairOrderGuessed = false
+          lastPairOrder = []
+        }
       }
       previousSeatedKeys = keys
     }
@@ -716,6 +760,17 @@ Item {
           })
           base = base.concat(extras).slice(0, 2)
         }
+        // Nothing has departed since a restart: keep the tray's saved sides.
+        if (base.length === 2 && !(Model.normalizeAddress(base[0].address || "") in motionHistory.departedAt)
+          && !(Model.normalizeAddress(base[1].address || "") in motionHistory.departedAt)) {
+          const restored = root.restoredOrder(seat.savedOrder.tray,
+            base.map(function (d) { return Model.normalizeAddress(d.address || "") }))
+          if (restored)
+            base.sort(function (a, b) {
+              return restored.indexOf(Model.normalizeAddress(a.address || ""))
+                - restored.indexOf(Model.normalizeAddress(b.address || ""))
+            })
+        }
         // A pair that rose from the seat keeps its seat sides in the tray,
         // whichever of them left first: left seat to left tray, right to right.
         if (base.length === 2 && seat.lastPairOrder.length === 2) {
@@ -796,6 +851,10 @@ Item {
               break
             }
           }
+        }
+        if (seat.orderName && waitingModel.count === 2) {
+          const drawn = [waitingModel.get(0).key, waitingModel.get(1).key]
+          if (!root.sameOrder(drawn, seat.savedOrder.tray)) root.orderDrawn(seat.orderName, "tray", drawn)
         }
       }
       ListModel { id: waitingModel; dynamicRoles: true }
