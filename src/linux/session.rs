@@ -1228,6 +1228,11 @@ fn on_notice(
                 live.air.scan_result(false, Instant::now());
             }
         }
+        Notice::Transport { device, active } => {
+            if device.is_some() && (device == live.accessory || device == configured) {
+                let _ = reports.send(Input::Transport { active });
+            }
+        }
         Notice::Patch(patch) => {
             observe_pairing(bus, live, patch.apple.as_deref());
             report_advertisement(

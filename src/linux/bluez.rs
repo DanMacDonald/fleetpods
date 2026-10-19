@@ -245,6 +245,11 @@ pub enum Notice {
         result: CallResult,
     },
     Removed(String),
+    /// A2DP transport `State` of a device: true once audio is streaming.
+    Transport {
+        device: Option<Address>,
+        active: bool,
+    },
     Upsert {
         device: Device,
         fleet: Option<Vec<u8>>,
@@ -376,7 +381,12 @@ fn properties(message: &Message) -> Option<Notice> {
     let (interface, changed, _invalid): (String, Props, Vec<String>) = message.read3().ok()?;
     if interface == "org.bluez.MediaTransport1" {
         trace_transport(&path, &changed, "event");
-        return None;
+        let state = prop_string(&changed, "State")?;
+        let device = path
+            .split('/')
+            .find(|part| part.starts_with("dev_"))
+            .and_then(|part| Address::parse(&part["dev_".len()..].replace('_', ":")));
+        return Some(Notice::Transport { device, active: state == "active" });
     }
     if interface == "org.bluez.Adapter1" {
         if let Some(address) =

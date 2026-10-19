@@ -111,6 +111,13 @@ pub struct Daemon {
     pub(crate) resume_output_on_grant: bool,
     /// The pods took ownership away since this laptop last relinked its output.
     pub(crate) rearm_after_loss: bool,
+    /// Whether the accessory's A2DP transport is streaming.
+    pub(crate) transport_active: bool,
+    /// When to check that a rebuilt output actually started.
+    pub(crate) rearm_verify_at: Option<MonoMs>,
+    pub(crate) rearm_retries: u8,
+    /// Rebuild again even though Pulse reports the sink running.
+    pub(crate) force_rearm: bool,
     pub(crate) output_restart_serial: u64,
     pub(crate) radio_inbox: crate::fleet::radio::Inbox,
     /// Letter frames waiting to be split. The daemon chooses each fragment.
@@ -304,6 +311,10 @@ impl Daemon {
             rearm_output: None,
             resume_output_on_grant: false,
             rearm_after_loss: false,
+            transport_active: false,
+            rearm_verify_at: None,
+            rearm_retries: 0,
+            force_rearm: false,
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
             outbound: crate::fleet::radio::Schedule::new(),
@@ -3230,15 +3241,6 @@ impl Daemon {
         self.output_health.started(now.mono);
         self.rearm_output = Some(output);
         Response::line("accepted: reopening AirPods audio output")
-    }
-
-    /// Whether the accessory's sink is currently running (Pulse state 0).
-    pub(crate) fn accessory_output_running(&self) -> bool {
-        let Some(address) = self.config.accessory else { return false };
-        self.output_health
-            .outputs
-            .iter()
-            .any(|output| output.address == Some(address) && output.state == 0)
     }
 
     /// The accessory's card and its active A2DP playback profile.
@@ -7129,12 +7131,80 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_after_losing_the_pods_relinks_unless_the_sink_already_runs() {
-        use crate::audio::health::Output;
+    fn a_rebuilt_output_that_never_streams_is_rebuilt_again_a_bounded_number_of_times() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::pods::observe::Observation;
         use crate::step::{Effect, Input};
-        for state in [2, 0] {
+        for streamed in [false, true] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_local_address(Some(addr(2)));
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            let playing = Graph {
+                default_sink: "pods".into(),
+                sinks: vec![
+                    Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    },
+                    Sink { name: "speakers".into(), address: None, profile: None },
+                ],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "pods".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            let mut parked = playing.clone();
+            parked.streams[0].mute = true;
+            parked.streams[0].sink = "speakers".into();
+            daemon.step(Input::Audio(playing.clone()), now);
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            daemon.output.want = true;
+            daemon.audio.set_local_playing_for_test(true);
+            let mut serial = daemon.output_restart_serial;
+            let mut rebuilds = 0;
+            for round in 0..4u64 {
+                let base = round * 2_000;
+                if round == 0 {
+                    daemon.step(Input::Observation(Observation::Ownership(true)), at(base));
+                } else {
+                    daemon.step(Input::Tick, at(base));
+                }
+                if daemon.output_restart_serial == serial {
+                    continue;
+                }
+                serial = daemon.output_restart_serial;
+                rebuilds += 1;
+                let reset = daemon.step(Input::Audio(parked.clone()), at(base + 10));
+                assert!(reset.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })));
+                daemon.step(Input::OutputRestarted { id: serial, ok: true }, at(base + 20));
+                daemon.step(Input::Audio(playing.clone()), at(base + 30));
+                daemon.step(Input::Transport { active: streamed }, at(base + 40));
+                // Before the check is due nothing happens.
+                daemon.step(Input::Tick, at(base + 1_000));
+                assert_eq!(daemon.output_restart_serial, serial);
+            }
+            // The grant's rebuild, then at most two more when audio never flows.
+            assert_eq!(rebuilds, if streamed { 1 } else { 3 });
+        }
+    }
+
+    #[test]
+    fn a_grant_after_losing_the_pods_relinks_unless_audio_already_streams() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for (state, flagged) in [(2, false), (0, false), (2, true), (0, true)] {
             let mut daemon = Daemon::new("gram");
             let now = clock();
             daemon.set_local_address(Some(addr(2)));
@@ -7165,21 +7235,12 @@ mod tests {
             daemon.step(Input::Audio(graph.clone()), now);
             // The other laptop took the pods, which ended this one's A2DP stream.
             daemon.step(Input::Observation(Observation::Ownership(false)), now);
-            daemon.step(
-                Input::Outputs(vec![Output {
-                    name: "pods".into(),
-                    index: 7,
-                    address: Some(addr(3)),
-                    profile: Some("a2dp-sink".into()),
-                    state,
-                    muted: false,
-                    audible_volume: true,
-                }]),
-                now,
-            );
-            // A claim that did not arm the older grant flag.
+            if state == 0 {
+                daemon.step(Input::Transport { active: true }, now);
+            }
+            // With or without the older grant flag, a running sink is kept.
             daemon.output.want = true;
-            daemon.resume_output_on_grant = false;
+            daemon.resume_output_on_grant = flagged;
             let grant = daemon.step(Input::Observation(Observation::Ownership(true)), now);
             // Recovery parks the muted stream on the speakers before restarting.
             let mut parked = graph.clone();
@@ -7189,8 +7250,9 @@ mod tests {
             let restarted = [&grant.effects, &settled.effects].iter().any(|effects| {
                 effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. }))
             });
-            assert_eq!(restarted, state != 0, "sink state {state}");
+            assert_eq!(restarted, state != 0, "sink state {state} flagged {flagged}");
             assert!(!daemon.rearm_after_loss);
+            assert!(!daemon.resume_output_on_grant);
         }
     }
 

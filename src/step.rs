@@ -13,6 +13,11 @@ use crate::types::{Address, Battery, Clock, Generation, MonoMs};
 
 use crate::daemon::{host_id, Daemon};
 
+/// How long after an output rebuild audio must be streaming to the pods.
+const REARM_VERIFY_MS: u64 = 1_500;
+/// Rebuilds after a failed start, per grant.
+const REARM_RETRY_LIMIT: u8 = 2;
+
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
     /// Pulse's raw output states, independent of ownership or PCM content.
@@ -24,6 +29,10 @@ pub enum Input {
     OutputRestarted {
         id: u64,
         ok: bool,
+    },
+    /// The accessory's A2DP transport started (`active`) or stopped streaming.
+    Transport {
+        active: bool,
     },
     Command(Command),
     Tick,
@@ -287,11 +296,22 @@ impl Daemon {
                 }
                 None
             }
+            Input::Transport { active } => {
+                if self.transport_active != active {
+                    eprintln!("fleetpodsd: AirPods audio transport active={active}");
+                }
+                self.transport_active = active;
+                None
+            }
             Input::OutputRestarted { id, ok } => {
                 if self.output.finish_recovery(id, ok) {
                     eprintln!("fleetpodsd: AirPods sink restart {id} completed (ok={ok})");
                     if !ok {
                         self.seat_audio_failure("audio sink restart failed", now);
+                    } else {
+                        // A rebuilt node can fail to start if the pods were not
+                        // ready yet; check that audio actually flows.
+                        self.rearm_verify_at = Some(now.mono.saturating_add(REARM_VERIFY_MS));
                     }
                     self.replan(now);
                 }
@@ -874,11 +894,35 @@ impl Daemon {
         let granted = self.output.want
             && self.connection.stage() == Stage::Ready
             && self.accessory.ownership.as_fresh() == Some(&true);
-        if granted && self.rearm_after_loss && self.accessory_output_running() {
-            // A running sink took the stream; there is nothing to relink.
-            self.rearm_after_loss = false;
+        if !granted {
+            self.force_rearm = false;
         }
-        if granted && (self.resume_output_on_grant || self.rearm_after_loss) {
+        if self.rearm_verify_at.is_some_and(|at| now.mono.0 >= at.0) {
+            self.rearm_verify_at = None;
+            if granted
+                && !self.transport_active
+                && self.audio.local_playing()
+                && self.rearm_retries < REARM_RETRY_LIMIT
+            {
+                // Pulse can report the sink running while its node failed.
+                self.rearm_retries += 1;
+                self.force_rearm = true;
+                eprintln!("fleetpodsd: AirPods output did not start; re-arming again");
+            }
+        }
+        if granted
+            && !self.force_rearm
+            && (self.rearm_after_loss || self.resume_output_on_grant)
+            && self.transport_active
+        {
+            // Audio already streams to the pods; there is nothing to relink.
+            // Rebuilding now would cut it. Pulse's sink state is not used:
+            // it reads running even while the node has failed.
+            self.rearm_after_loss = false;
+            self.resume_output_on_grant = false;
+            self.replan(now);
+        }
+        if granted && (self.resume_output_on_grant || self.rearm_after_loss || self.force_rearm) {
             if let (Some(address), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
             {
                 let id = self.output_restart_serial + 1;
@@ -895,6 +939,9 @@ impl Daemon {
                     self.output_restart_serial = id;
                     self.resume_output_on_grant = false;
                     self.rearm_after_loss = false;
+                    if !std::mem::take(&mut self.force_rearm) {
+                        self.rearm_retries = 0;
+                    }
                     self.replan(now);
                     eprintln!("fleetpodsd: re-arming AirPods playback after ownership grant");
                 }

@@ -210,6 +210,11 @@ impl Audio {
         self.yielded
     }
 
+    #[cfg(test)]
+    pub fn set_local_playing_for_test(&mut self, playing: bool) {
+        self.local_playing = playing;
+    }
+
     pub fn local_playing(&self) -> bool {
         self.local_playing
     }
