@@ -1879,6 +1879,15 @@ impl Daemon {
         } else {
             (Answer::RosterChanged, None, false)
         };
+        if !take {
+            eprintln!(
+                "fleetpodsd: fleet seat request from {} refused answer={answer:?} holder={:?} seated={seated:?} pod_peers={:?} known={}",
+                message.source,
+                self.resolved(now).holder,
+                self.pod_peers,
+                self.pod_peers_known
+            );
+        }
         if take {
             let tx = u64::from_be_bytes(message.transaction);
             if !self.routing.accept_request(message.source, tx) || !self.routing.grant(tx, retain) {
@@ -2794,11 +2803,24 @@ impl Daemon {
         }
         // Input on an established link can claim idle audio immediately. Input
         // after a slot loss must not evict the device still taking that slot.
-        if self.background_reopen_blocked(now.mono) {
+        if self.slot_hold_until.is_some_and(|until| now.mono.0 < until.0) {
+            eprintln!("fleetpodsd: activity ignored while a yielded slot is held");
             return Response::line("ignored");
         }
+        self.slot_hold_until = None;
         // Use a connected helper when present; otherwise open only the control link.
-        match self.activity_target(now) {
+        let target = self.activity_target(now);
+        // The reopen hold lets the pair's audio owner land first. A connected
+        // fleet helper means it already has, so input asks that helper for a
+        // seat instead of waiting out the hold.
+        if matches!(target, ActivityTarget::One(_)) {
+            self.reopen_wait = false;
+            self.reopen_hold_until = None;
+        } else if self.reopen_blocked(now.mono) {
+            eprintln!("fleetpodsd: activity ignored while the audio owner reconnects first");
+            return Response::line("ignored");
+        }
+        match target {
             ActivityTarget::Several => Response::line("ignored"),
             ActivityTarget::One(peer) => {
                 self.connection.prepare();
@@ -6218,6 +6240,66 @@ mod tests {
                 daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_000, now.unix.0 + 2_000));
             assert!(retry.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
             assert!(!retry.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        }
+    }
+
+    #[test]
+    fn activity_asks_the_connected_audio_owner_instead_of_waiting_out_the_reopen_hold() {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::step::Input;
+        for owner_connected in [true, false] {
+            let now = clock();
+            let local = addr(1);
+            let xps = addr(2);
+            let pods = addr(9);
+            let mut daemon = Daemon::new("gram");
+            daemon.set_local_address(Some(local));
+            daemon.select_accessory(Some(pods));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "gram".into() },
+                    Member { address: xps, label: "xps".into() },
+                ],
+            });
+            daemon.observe_nearby(host_id(Some(xps)), xps, "xps", now.unix, true, Some([4; 16]));
+            daemon.note_roster(RosterReport {
+                reporter: host_id(Some(xps)),
+                reporter_address: xps,
+                accessory: pods,
+                session: crate::types::SessionId(0),
+                seq: 1,
+                at: now.mono,
+                sent: now.unix,
+                peers: if owner_connected { vec![xps] } else { Vec::new() },
+                audio_source: owner_connected.then_some(xps),
+                pending: false,
+                audio_idle: false,
+                wire_session: Some([4; 16]),
+                last_use: UnixMs(0),
+            });
+            // This laptop's link dropped while the XPS owned the pair's audio.
+            daemon.reopen_wait = true;
+            daemon.accessory.left = crate::types::Evidence::fresh(
+                Pod {
+                    battery: crate::types::Battery::new(60, false).unwrap(),
+                    in_ear: Some(true),
+                    in_case: Some(false),
+                },
+                now.mono,
+            );
+            daemon.step(Input::Command(Command::Activity), now);
+            if owner_connected {
+                // The owner already landed: ask it for a seat alongside it.
+                assert_eq!(daemon.routing.phase(), Phase::WaitingAdmission);
+                assert!(!daemon.reopen_wait);
+            } else {
+                // The owner is not back yet, so it still gets to land first.
+                assert!(!daemon.routing.phase().busy());
+                assert!(daemon.reopen_wait);
+                assert!(!daemon.background_requested);
+            }
         }
     }
 
