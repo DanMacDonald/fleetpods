@@ -186,10 +186,13 @@ pub enum Effect {
         accessory: Address,
     },
     /// Rebuild A2DP after detaching muted streams, preserving the control link.
+    /// With the card known, its profile is refreshed (off, then this profile),
+    /// which rebuilds the audio nodes without a Bluetooth reconnect.
     RestartOutput {
         id: u64,
         name: String,
         accessory: Address,
+        card: Option<(String, String)>,
     },
     /// Start the relinked PipeWire node once, after recovery has restored streams.
     StartOutput {
@@ -668,6 +671,9 @@ impl Daemon {
         );
         self.note_ownership(local, now.mono);
         if !local {
+            // The pods end this laptop's A2DP stream, which can leave its
+            // audio node failed. The next grant relinks unless the sink runs.
+            self.rearm_after_loss = true;
             self.yield_to_remote_report(now);
         }
         self.effects.announce_dirty = true;
@@ -677,7 +683,9 @@ impl Daemon {
         eprintln!("fleetpodsd: media event source=airpods audio_local={local} kind={kind} remote={remote:?} mono_ms={}", now.mono.0);
         self.note_source(local, kind, now.mono);
         if local && kind > 0 {
+            // Audio already reaches the pods from here; nothing to relink.
             self.resume_output_on_grant = false;
+            self.rearm_after_loss = false;
         }
         if let Some(address) = remote {
             self.note_remote(address, now.mono);
@@ -863,11 +871,14 @@ impl Daemon {
             effects.push(effect);
         }
         effects.extend(self.pace_audio());
-        if self.resume_output_on_grant
-            && self.output.want
+        let granted = self.output.want
             && self.connection.stage() == Stage::Ready
-            && self.accessory.ownership.as_fresh() == Some(&true)
-        {
+            && self.accessory.ownership.as_fresh() == Some(&true);
+        if granted && self.rearm_after_loss && self.accessory_output_running() {
+            // A running sink took the stream; there is nothing to relink.
+            self.rearm_after_loss = false;
+        }
+        if granted && (self.resume_output_on_grant || self.rearm_after_loss) {
             if let (Some(address), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
             {
                 let id = self.output_restart_serial + 1;
@@ -883,6 +894,7 @@ impl Daemon {
                     });
                     self.output_restart_serial = id;
                     self.resume_output_on_grant = false;
+                    self.rearm_after_loss = false;
                     self.replan(now);
                     eprintln!("fleetpodsd: re-arming AirPods playback after ownership grant");
                 }
@@ -920,6 +932,7 @@ impl Daemon {
                             id: restart.id,
                             name: restart.name,
                             accessory,
+                            card: self.playback_card(),
                         });
                     }
                 }

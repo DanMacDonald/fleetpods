@@ -49,6 +49,13 @@ pub enum Op {
         card: String,
         name: String,
     },
+    /// Rebuild the card's nodes: profile off, then this profile again, and
+    /// report completion as output restart `restart`.
+    Refresh {
+        card: String,
+        name: String,
+        restart: u64,
+    },
 }
 
 enum Job {
@@ -630,6 +637,24 @@ fn apply(
                         }
                     })),
                 ));
+            }
+            Op::Refresh { card, name, restart } => {
+                // The server applies these in order, so the second call
+                // brings the card back with fresh nodes.
+                let _ = intro.set_card_profile_by_name(card, "off", None);
+                let reports = reports.clone();
+                let card_name = card.clone();
+                let restart = *restart;
+                let _ = intro.set_card_profile_by_name(
+                    card,
+                    name,
+                    Some(Box::new(move |ok| {
+                        if !ok {
+                            eprintln!("fleetpodsd: audio output refresh on {card_name} failed");
+                        }
+                        let _ = reports.send(Input::OutputRestarted { id: restart, ok });
+                    })),
+                );
             }
             Op::Restore(snap) => {
                 let Some(saved) = cached.get(&snap.id) else {

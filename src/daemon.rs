@@ -109,6 +109,8 @@ pub struct Daemon {
     pub(crate) output_health: crate::audio::health::Health,
     pub(crate) rearm_output: Option<crate::audio::health::Output>,
     pub(crate) resume_output_on_grant: bool,
+    /// The pods took ownership away since this laptop last relinked its output.
+    pub(crate) rearm_after_loss: bool,
     pub(crate) output_restart_serial: u64,
     pub(crate) radio_inbox: crate::fleet::radio::Inbox,
     /// Letter frames waiting to be split. The daemon chooses each fragment.
@@ -301,6 +303,7 @@ impl Daemon {
             output_health: crate::audio::health::Health::default(),
             rearm_output: None,
             resume_output_on_grant: false,
+            rearm_after_loss: false,
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
             outbound: crate::fleet::radio::Schedule::new(),
@@ -3227,6 +3230,24 @@ impl Daemon {
         self.output_health.started(now.mono);
         self.rearm_output = Some(output);
         Response::line("accepted: reopening AirPods audio output")
+    }
+
+    /// Whether the accessory's sink is currently running (Pulse state 0).
+    pub(crate) fn accessory_output_running(&self) -> bool {
+        let Some(address) = self.config.accessory else { return false };
+        self.output_health
+            .outputs
+            .iter()
+            .any(|output| output.address == Some(address) && output.state == 0)
+    }
+
+    /// The accessory's card and its active A2DP playback profile.
+    pub(crate) fn playback_card(&self) -> Option<(String, String)> {
+        let address = self.config.accessory?;
+        let card =
+            self.last_graph.as_ref()?.cards.iter().find(|card| card.address == Some(address))?;
+        let profile = card.active.as_deref().filter(|profile| profile.starts_with("a2dp-sink"))?;
+        Some((card.name.clone(), profile.to_string()))
     }
 
     pub(crate) fn pace_output_health(&mut self, now: Clock) -> Option<crate::step::Effect> {
@@ -7105,6 +7126,137 @@ mod tests {
         assert!(play.effects.iter().any(|effect| matches!(effect,
             Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true)
         )));
+    }
+
+    #[test]
+    fn a_grant_after_losing_the_pods_relinks_unless_the_sink_already_runs() {
+        use crate::audio::health::Output;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for state in [2, 0] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            daemon.set_local_address(Some(addr(2)));
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            let graph = Graph {
+                default_sink: "pods".into(),
+                sinks: vec![
+                    Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    },
+                    Sink { name: "speakers".into(), address: None, profile: None },
+                ],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "pods".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            daemon.step(Input::Audio(graph.clone()), now);
+            // The other laptop took the pods, which ended this one's A2DP stream.
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            daemon.step(
+                Input::Outputs(vec![Output {
+                    name: "pods".into(),
+                    index: 7,
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                    state,
+                    muted: false,
+                    audible_volume: true,
+                }]),
+                now,
+            );
+            // A claim that did not arm the older grant flag.
+            daemon.output.want = true;
+            daemon.resume_output_on_grant = false;
+            let grant = daemon.step(Input::Observation(Observation::Ownership(true)), now);
+            // Recovery parks the muted stream on the speakers before restarting.
+            let mut parked = graph.clone();
+            parked.streams[0].mute = true;
+            parked.streams[0].sink = "speakers".into();
+            let settled = daemon.step(Input::Audio(parked), now);
+            let restarted = [&grant.effects, &settled.effects].iter().any(|effects| {
+                effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. }))
+            });
+            assert_eq!(restarted, state != 0, "sink state {state}");
+            assert!(!daemon.rearm_after_loss);
+        }
+    }
+
+    #[test]
+    fn a_rearm_refreshes_the_known_card_instead_of_reconnecting_bluetooth() {
+        use crate::audio::route::{Card, Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+        for card_known in [true, false] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            daemon.set_local_address(Some(addr(2)));
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            let mut graph = Graph {
+                default_sink: "speakers".into(),
+                sinks: vec![
+                    Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    },
+                    Sink { name: "speakers".into(), address: None, profile: None },
+                ],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "speakers".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            if card_known {
+                graph.cards.push(Card {
+                    name: "bluez_card.pods".into(),
+                    address: Some(addr(3)),
+                    profiles: vec!["a2dp-sink".into()],
+                    active: Some("a2dp-sink".into()),
+                });
+            }
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(false)), now);
+            daemon.step(
+                Input::Player {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: Some(true),
+                },
+                now,
+            );
+            daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
+            let mut muted = graph;
+            muted.streams[0].mute = true;
+            let reset = daemon.step(Input::Audio(muted), now);
+            let card = reset.effects.iter().find_map(|effect| match effect {
+                Effect::RestartOutput { card, .. } => Some(card.clone()),
+                _ => None,
+            });
+            let expected =
+                card_known.then(|| ("bluez_card.pods".to_string(), "a2dp-sink".to_string()));
+            assert_eq!(card, Some(expected));
+        }
     }
 
     #[test]

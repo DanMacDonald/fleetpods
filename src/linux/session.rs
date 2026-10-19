@@ -381,9 +381,17 @@ impl Session {
             Effect::ConnectTransport { accessory } => {
                 self.radio(Job::ConnectTransport { address: *accessory })
             }
-            Effect::RestartOutput { id, accessory, .. } => {
-                self.radio(Job::RestartOutput { id: *id, address: *accessory })
-            }
+            Effect::RestartOutput { id, accessory, card, .. } => match (card, &self.audio) {
+                // Rebuilding the card's nodes is local and quick; a Bluetooth
+                // profile reconnect is slower and the pods can refuse it.
+                (Some((card, profile)), Some(audio)) => audio.send(vec![pipewire::Op::Refresh {
+                    card: card.clone(),
+                    name: profile.clone(),
+                    restart: *id,
+                }]),
+                _ => self.radio(Job::RestartOutput { id: *id, address: *accessory }),
+            },
+
             Effect::PausePlayers(names) => {
                 if let Some(players) = &self.players {
                     players.pause(names.clone());

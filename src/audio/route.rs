@@ -169,8 +169,21 @@ impl RouteState {
             .or_else(|| graph.sinks.iter().find(|s| s.name == "omarchy_speaker_tuning"))
             .or_else(|| {
                 graph.sinks.iter().find(|s| s.address.is_none() && follows_seat(&s.name, None))
+            })
+            // Built-in outputs are not always named "speaker" (an analog-stereo
+            // sink, for instance). Any local output other than a display will do
+            // to park muted streams briefly.
+            .or_else(|| {
+                graph.sinks.iter().find(|s| {
+                    let name = s.name.to_ascii_lowercase();
+                    s.address.is_none()
+                        && s.name != sink.name
+                        && !name.contains("hdmi")
+                        && !name.contains("displayport")
+                })
             });
         let Some(via) = via else {
+            eprintln!("fleetpodsd: no local output to park streams on; cannot re-arm AirPods");
             return false;
         };
         self.from = Some(via.name.clone());
@@ -1086,6 +1099,39 @@ mod tests {
         let moves = action.move_streams.expect("the speaker playback follows");
         assert_eq!(moves.sink, pods_sink);
         assert_eq!(moves.streams, vec![StreamTarget { id: 4, generation: 12 }]);
+    }
+
+    #[test]
+    fn recovery_parks_on_a_built_in_output_not_named_speaker() {
+        let pods = Address::parse("AA:BB:CC:DD:EE:FF").unwrap();
+        let graph = Graph {
+            default_sink: "bluez_output.pods".into(),
+            sinks: vec![
+                Sink {
+                    name: "alsa_output.pci-0000_00_1f.3.hdmi-stereo".into(),
+                    address: None,
+                    profile: None,
+                },
+                Sink {
+                    name: "alsa_output.pci-0000_00_1f.3.analog-stereo".into(),
+                    address: None,
+                    profile: None,
+                },
+                Sink {
+                    name: "bluez_output.pods".into(),
+                    address: Some(pods),
+                    profile: Some("a2dp-sink".into()),
+                },
+            ],
+            cards: Vec::new(),
+            streams: Vec::new(),
+        };
+        let mut state = RouteState { want: true, ..RouteState::default() };
+        assert!(state.begin_recovery(1, pods, &graph, MonoMs(0)));
+        assert_eq!(
+            state.recovery.as_ref().unwrap().via,
+            "alsa_output.pci-0000_00_1f.3.analog-stereo"
+        );
     }
 
     #[test]
