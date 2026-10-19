@@ -231,9 +231,13 @@ function composeSurfaceShading(layers, groups, surfaces, columns, rows, scale, s
   for (var group = 0; group < layers.length; group++) {
     var layer = layers[group]
     if (!layer) continue
-    var tone = surfaceShading(null, layer.depth, layer.normals, layer.materials, columns, rows, scale, settings)
+    // Only cells where this group is the visible surface keep its tone, and
+    // each cell's tone depends on inputs alone, so shade just those cells.
+    var mask = new Uint8Array(surfaces.length)
+    for (var i = 0; i < result.length; i++) mask[i] = groups[surfaces[i]] === group ? 1 : 0
+    var tone = surfaceShading(null, layer.depth, layer.normals, layer.materials, columns, rows, scale, settings, mask)
     for (var i = 0; i < result.length; i++) {
-      if (groups[surfaces[i]] === group) result[i] = tone[i]
+      if (mask[i]) result[i] = tone[i]
     }
   }
   return result
@@ -412,8 +416,18 @@ function matteTone(nx, ny, nz, settings) {
 // difference is smaller than one grid cell. Only inward-bending normals add
 // tone; flat and convex surfaces remain unchanged. Integrating nearby radii
 // keeps shallow relief visible without separate rings at each sample distance.
-function recessTone(depth, normals, columns, rows, scale) {
+function recessTone(depth, normals, columns, rows, scale, mask) {
   var tones = new Float32Array(depth.length)
+  // With a mask, the softening pass below reads tones one cell around it.
+  var need = null
+  if (mask) {
+    need = new Uint8Array(depth.length)
+    for (var y = 0; y < rows; y++) for (var x = 0; x < columns; x++) {
+      if (!mask[y * columns + x]) continue
+      for (var dy = Math.max(0, y - 1); dy <= Math.min(rows - 1, y + 1); dy++)
+        for (var dx = Math.max(0, x - 1); dx <= Math.min(columns - 1, x + 1); dx++) need[dy * columns + dx] = 1
+    }
+  }
   var radius = Math.max(1, Math.round(scale * 0.10))
   function nearby(i, j) {
     // A sharp ledge is a separate face, not the wall of a shallow depression.
@@ -424,7 +438,7 @@ function recessTone(depth, normals, columns, rows, scale) {
   for (var y = radius; y < rows - radius; y++) {
     for (var x = radius; x < columns - radius; x++) {
       var i = y * columns + x
-      if (depth[i] === -100) continue
+      if (depth[i] === -100 || (need && !need[i])) continue
       var bend = 0, weight = 0
       for (var r = 1; r <= radius; r++) {
         var left = i - r, right = i + r
@@ -445,7 +459,7 @@ function recessTone(depth, normals, columns, rows, scale) {
   for (var y = 1; y < rows - 1; y++) {
     for (var x = 1; x < columns - 1; x++) {
       var i = y * columns + x
-      if (depth[i] === -100) continue
+      if (depth[i] === -100 || (mask && !mask[i])) continue
       var total = 0, weight = 0
       for (var dy = -1; dy <= 1; dy++) {
         for (var dx = -1; dx <= 1; dx++) {
@@ -465,17 +479,18 @@ function recessTone(depth, normals, columns, rows, scale) {
 // Local occlusion comes from visible geometry rising above the surface's
 // tangent plane. Convex shells and flat faces do not occlude themselves.
 // This is a small screen-space approximation, not a baked lighting texture.
-function surfaceShading(light, depth, normals, materials, columns, rows, scale, settings) {
+// With a mask, only masked cells are shaded; the rest stay 0.
+function surfaceShading(light, depth, normals, materials, columns, rows, scale, settings, mask) {
   settings = settings || defaults()
   var density = new Float32Array(depth.length)
-  var relief = recessTone(depth, normals, columns, rows, scale)
+  var relief = recessTone(depth, normals, columns, rows, scale, mask)
   var radius = Math.max(2, Math.round(scale * 0.18))
   var reach = 0.50
   var directions = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
   for (var y = 0; y < rows; y++) {
     for (var x = 0; x < columns; x++) {
       var i = y * columns + x, z = depth[i]
-      if (z === -100) continue
+      if (z === -100 || (mask && !mask[i])) continue
       // Vents and holes are dark materials, not dense shell shading.
       if (materials[i] <= 0.2) { density[i] = 1; continue }
       var nx = normals[i * 3], ny = normals[i * 3 + 1], nz = normals[i * 3 + 2]

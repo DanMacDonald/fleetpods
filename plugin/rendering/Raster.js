@@ -13,6 +13,62 @@ function rotate(x, y, z, ax, ay, az) {
   return [x, y, z]
 }
 
+// The same arithmetic as rotate(), with each angle's cosine and sine computed
+// once per part instead of once per vertex, and no array per call. Results
+// are bit-identical to rotate() for the same angles.
+function turns(ax, ay, az) {
+  return [Math.cos(az), Math.sin(az), Math.cos(ax), Math.sin(ax), Math.cos(ay), Math.sin(ay)]
+}
+
+function turn(out, x, y, z, r) {
+  var t = x * r[0] - y * r[1]
+  y = x * r[1] + y * r[0]; x = t
+  t = y * r[2] - z * r[3]
+  z = y * r[3] + z * r[2]; y = t
+  t = x * r[4] + z * r[5]
+  z = -x * r[5] + z * r[4]; x = t
+  out[0] = x; out[1] = y; out[2] = z
+}
+
+// Screen position before the sample offset, depth, tone, normal and cavity
+// for each vertex of one part. A part's projection depends only on its
+// transform, the camera and the tone function, so it is kept on the mesh and
+// reused: by the four smooth-sampling passes, which differ only by a sub-cell
+// offset, and by later frames in which this part did not move (the case body
+// while the lid swings, for instance).
+function projection(part, view, vertexTone) {
+  var a = part.angle, at = part.at
+  var key = [a[0], a[1], a[2], at[0], at[1], at[2], part.mirror, part.scale, part.shade,
+    view.pitch, view.yaw, view.columns, view.rows, view.scale].join(",")
+  // Both pods share one mesh, mirrored, so keep a few placements per mesh.
+  var mesh = part.mesh, cache = mesh.projections || (mesh.projections = [])
+  for (var i = 0; i < cache.length; i++)
+    if (cache[i].tone === vertexTone && cache[i].key === key) return cache[i]
+  if (cache.length >= 6) cache.shift()
+  cache.push(projectPart(part, view, vertexTone, key))
+  return cache[cache.length - 1]
+}
+
+function projectPart(part, view, vertexTone, key) {
+  var columns = view.columns, rows = view.rows, scale = view.scale, a = part.angle
+  var local = turns(a[0], a[1], a[2]), camera = turns(view.pitch, view.yaw, 0)
+  var pos = [0, 0, 0], n = [0, 0, 0], points = []
+  var vertices = part.mesh.vertices, matte = !!part.mesh.matte, cavity = part.mesh.cavity
+  for (var k = 0; k < vertices.length; k++) {
+    var v = vertices[k]
+    turn(pos, v[0] * part.mirror * part.scale, v[1] * part.scale, v[2] * part.scale, local)
+    turn(n, v[3] * part.mirror, v[4], v[5], local)
+    turn(pos, pos[0] + part.at[0], pos[1] + part.at[1], pos[2] + part.at[2], camera)
+    turn(n, n[0], n[1], n[2], camera)
+    var perspective = 6 / (6 - pos[2])
+    var brightness = vertexTone([n[0], n[1], n[2]], part.shade, matte)
+    points.push([columns / 2 + pos[0] * scale * perspective,
+      rows / 2 - pos[1] * scale * perspective, pos[2], brightness, n[2], n[0], n[1],
+      cavity ? cavity[k] : 0])
+  }
+  return { tone: vertexTone, key: key, points: points }
+}
+
 function rasterize(scene, view, options) {
   var columns = view.columns, rows = view.rows, scale = view.scale
   var pitch = view.pitch, yaw = view.yaw, captureSurfaces = !!options.surfaceData
@@ -47,18 +103,13 @@ function rasterize(scene, view, options) {
       }
       layer = layers[group]
     }
-    for (var k = 0; k < part.mesh.vertices.length; k++) {
-      var v = part.mesh.vertices[k]
-      var pos = rotate(v[0] * part.mirror * part.scale, v[1] * part.scale, v[2] * part.scale, a[0], a[1], a[2])
-      var n = rotate(v[3] * part.mirror, v[4], v[5], a[0], a[1], a[2])
-      pos = [pos[0] + part.at[0], pos[1] + part.at[1], pos[2] + part.at[2]]
-      pos = rotate(pos[0], pos[1], pos[2], pitch, yaw, 0)
-      n = rotate(n[0], n[1], n[2], pitch, yaw, 0)
-      var perspective = 6 / (6 - pos[2])
-      var brightness = options.vertexTone(n, part.shade, !!part.mesh.matte)
-      projected.push([columns / 2 + pos[0] * scale * perspective + (view.sampleX || 0),
-        rows / 2 - pos[1] * scale * perspective + (view.sampleY || 0), pos[2], brightness, n[2], n[0], n[1],
-        captureSurfaces && part.mesh.cavity ? part.mesh.cavity[k] : 0])
+    // Cavity (index 7) is read only when surface data is captured.
+    var cached = projection(part, view, options.vertexTone).points
+    var offsetX = view.sampleX || 0, offsetY = view.sampleY || 0
+    if (offsetX === 0 && offsetY === 0) projected = cached
+    else for (var k = 0; k < cached.length; k++) {
+      var b = cached[k]
+      projected.push([b[0] + offsetX, b[1] + offsetY, b[2], b[3], b[4], b[5], b[6], b[7]])
     }
     if (captureSurfaces && part.mesh.contours) {
       for (var c = 0; c < part.mesh.contours.length; c++) {
@@ -82,14 +133,19 @@ function rasterize(scene, view, options) {
       var x1 = Math.min(columns - 1, Math.ceil(Math.max(v0[0], v1[0], v2[0])))
       var y0 = Math.max(0, Math.floor(Math.min(v0[1], v1[1], v2[1])))
       var y1 = Math.min(rows - 1, Math.ceil(Math.max(v0[1], v1[1], v2[1])))
+      // Per-triangle terms of the barycentric weights, hoisted unchanged.
+      var x2 = v2[0], y2 = v2[1], du1 = v1[1] - v2[1], dv1 = v2[0] - v1[0]
+      var du2 = v2[1] - v0[1], dv2 = v0[0] - v2[0]
       for (var y = y0; y <= y1; y++) {
+        var cy = y + 0.5 - y2
         for (var x = x0; x <= x1; x++) {
-          var u = ((v1[1] - v2[1]) * (x + 0.5 - v2[0]) + (v2[0] - v1[0]) * (y + 0.5 - v2[1])) / area
-          var w = ((v2[1] - v0[1]) * (x + 0.5 - v2[0]) + (v0[0] - v2[0]) * (y + 0.5 - v2[1])) / area
+          var cx = x + 0.5 - x2
+          var u = (du1 * cx + dv1 * cy) / area
+          var w = (du2 * cx + dv2 * cy) / area
           var t = 1 - u - w
           var outside = u < 0 || w < 0 || t < 0
           if (outside) {
-            if (Math.max(-u * altitude0, -w * altitude1, -t * altitude2) > 0.25) continue
+            if (-u * altitude0 > 0.25 || -w * altitude1 > 0.25 || -t * altitude2 > 0.25) continue
             // Clamp to the triangle itself, rather than inventing shading
             // by extrapolating across the silhouette.
             u = Math.max(0, u); w = Math.max(0, w); t = Math.max(0, t)
