@@ -36,6 +36,15 @@ const HANDOFF_DRAIN_MS: u64 = 500;
 /// HANDOFF_DRAIN_MS plus the few tens of milliseconds a player takes to
 /// report Paused.
 const HANDOFF_MUTE_MS: u64 = 1_000;
+/// After a claim sent as a new link becomes ready (or just after, by a play
+/// that waited for it), the rest of the pods' opening reports still
+/// describe who played before it. A remote owner in
+/// them is not a takeover. The pods answer a claim well within this.
+pub(crate) const SETUP_CLAIM_SETTLE_MS: u64 = 1_500;
+/// The pods can send one more report naming the previous owner just before
+/// they grant a claim (2026-10-19: 1 ms apart). A remote report this soon
+/// after a claim waits this long for the grant before it ends the claim.
+const CLAIM_ANSWER_MS: u64 = 300;
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
@@ -288,7 +297,8 @@ impl Daemon {
     /// Request local playback when this machine is playing and no newer remote
     /// report has arrived. A remote report stored before the claim is older
     /// intent, even when both timestamps are the same millisecond. A remote
-    /// report that shows up after the claim wins.
+    /// report that shows up after the claim wins unless the pods grant the
+    /// claim within [`CLAIM_ANSWER_MS`].
     pub(crate) fn wants_local_confirm(&self, now: MonoMs) -> bool {
         self.seat.wants_local_confirm(
             self.output.want,
@@ -301,12 +311,14 @@ impl Daemon {
 
     /// Ask on the existing control link. Ownership and source remain observations
     /// from the accessory; sending CLAIM is not confirmation of playback.
-    pub(crate) fn request_playback_ownership(&mut self, now: Clock) {
+    pub(crate) fn request_playback_ownership(&mut self, now: Clock) -> bool {
         if !self.wants_local_confirm(now.mono) {
-            return;
+            return false;
         }
         self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
         eprintln!("fleetpodsd: claiming AirPods audio on the existing control link");
+        self.claim_sent_at = Some(now.mono);
+        true
     }
 
     fn apply(&mut self, input: Input, now: Clock) -> Option<String> {
@@ -627,7 +639,15 @@ impl Daemon {
         if let Some(peer) = self.peers_seated.first().copied() {
             self.note_alongside(peer, now.unix);
         }
-        self.request_playback_ownership(now);
+        self.link_ready_at = Some(now.mono);
+        // A play waiting for this link asked before anything the pods
+        // reported during setup, so those reports cannot override it.
+        if self.output.want {
+            self.seat.note_claim(self.accessory.ownership.at());
+        }
+        if self.request_playback_ownership(now) {
+            self.setup_claim_at = Some(now.mono);
+        }
         self.flush_settings();
         self.effects.announce_dirty = true;
     }
@@ -736,6 +756,10 @@ impl Daemon {
             now.mono.0
         );
         self.note_ownership(local, now.mono);
+        if local {
+            self.setup_claim_at = None;
+            self.yield_pending = false;
+        }
         if !local {
             // The pods end this laptop's A2DP stream, which can leave its
             // audio node failed. The next grant relinks unless the sink runs.
@@ -770,10 +794,40 @@ impl Daemon {
             eprintln!("fleetpodsd: holding the seat for an explicit user switch");
             return;
         }
+        if self
+            .setup_claim_at
+            .is_some_and(|at| now.mono.saturating_since(at) < SETUP_CLAIM_SETTLE_MS)
+        {
+            eprintln!("fleetpodsd: ignoring a remote report that predates this laptop's claim");
+            return;
+        }
+        if self.output.want
+            && self.claim_sent_at.is_some_and(|at| now.mono.saturating_since(at) < CLAIM_ANSWER_MS)
+        {
+            if !self.yield_pending {
+                eprintln!("fleetpodsd: waiting for the pods to answer this laptop's claim");
+            }
+            self.yield_pending = true;
+            return;
+        }
         if self.connection.stage() == Stage::Ready && self.output.want {
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
             self.mute_for_handoff(now);
             self.step_back(now);
+            // Streams a pending takeover had muted are still playing until
+            // the pause lands. Keep them muted until it has drained.
+            for saved in std::mem::take(&mut self.effects.restore_pending) {
+                if !self
+                    .handoff_muted
+                    .iter()
+                    .any(|s| (s.id, s.generation) == (saved.id, saved.generation))
+                {
+                    self.handoff_muted.push(saved);
+                }
+            }
+            if !self.handoff_muted.is_empty() {
+                self.handoff_muted_at.get_or_insert(now.mono);
+            }
             self.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
         }
     }
@@ -892,6 +946,16 @@ impl Daemon {
     }
 
     fn harvest(&mut self, now: Clock) -> Vec<Effect> {
+        // A remote report that arrived just after our claim and was never
+        // answered by a grant ends the claim now.
+        if self.yield_pending
+            && self.claim_sent_at.is_none_or(|at| now.mono.saturating_since(at) >= CLAIM_ANSWER_MS)
+        {
+            self.yield_pending = false;
+            if self.accessory.ownership.as_fresh() != Some(&true) {
+                self.yield_to_remote_report(now);
+            }
+        }
         let mut effects = Vec::new();
         self.introduce_peers();
         self.claim_idle_on_activity(now);

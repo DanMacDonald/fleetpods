@@ -366,7 +366,9 @@ impl std::ops::DerefMut for Router {
 }
 
 const RETRY_MS: u64 = 1_000;
-const TAKEOVER_HOLD_MS: u64 = 8_000;
+/// How long speaker playback stays muted waiting for the pods. A play that
+/// first needs fleet admission and a new link took 6-8 s on 2026-10-19.
+const TAKEOVER_HOLD_MS: u64 = 12_000;
 
 /// Hold speaker playback while ownership or the AirPods output is still pending.
 pub fn hold_for_takeover(
@@ -983,13 +985,13 @@ mod tests {
             if cancel {
                 state.want = false;
             }
-            let released = plan(state, Some(pods), &picture, MonoMs(8_000));
+            let released = plan(state, Some(pods), &picture, MonoMs(TAKEOVER_HOLD_MS));
             assert_eq!(released.restore.len(), 1);
             assert!(!released.restore[0].mute);
             assert!(!released.state.want);
             assert!(released.state.held.is_empty());
             assert_eq!(released.failure.is_some(), !cancel);
-            let again = plan(released.state, Some(pods), &picture, MonoMs(8_100));
+            let again = plan(released.state, Some(pods), &picture, MonoMs(TAKEOVER_HOLD_MS + 100));
             assert!(again.quiet.is_empty());
         }
     }

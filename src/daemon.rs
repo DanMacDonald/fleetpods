@@ -132,6 +132,15 @@ pub struct Daemon {
     pub(crate) handoff_muted_at: Option<MonoMs>,
     /// When every local player was last seen paused since that mute.
     pub(crate) handoff_quiet_since: Option<MonoMs>,
+    /// When a claim was sent as a new link became ready.
+    pub(crate) setup_claim_at: Option<MonoMs>,
+    /// When the control link last became ready.
+    pub(crate) link_ready_at: Option<MonoMs>,
+    /// When this laptop last sent a claim on the control link.
+    pub(crate) claim_sent_at: Option<MonoMs>,
+    /// A remote report arrived just after a claim; it ends the claim unless
+    /// the pods grant it first.
+    pub(crate) yield_pending: bool,
     /// Rebuild again even though Pulse reports the sink running.
     pub(crate) force_rearm: bool,
     pub(crate) output_restart_serial: u64,
@@ -337,6 +346,10 @@ impl Daemon {
             handoff_muted: Vec::new(),
             handoff_muted_at: None,
             handoff_quiet_since: None,
+            setup_claim_at: None,
+            link_ready_at: None,
+            claim_sent_at: None,
+            yield_pending: false,
             force_rearm: false,
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
@@ -552,6 +565,14 @@ impl Daemon {
             {
                 self.deferred_playback_claim = None;
                 self.claim_playback(now);
+                // This play predates the link, so its opening reports do too.
+                if self.output.want
+                    && self.link_ready_at.is_some_and(|ready| {
+                        now.mono.saturating_since(ready) < crate::step::SETUP_CLAIM_SETTLE_MS
+                    })
+                {
+                    self.setup_claim_at = Some(now.mono);
+                }
             }
         }
         if let Some(pending) = &self.pending_admission {
@@ -3503,9 +3524,16 @@ impl Daemon {
         self.deferred_playback_claim = None;
         // Fleet admission only blocks opening a new link. A ready local link
         // can route a genuine play immediately, even before admission completes.
-        if self.config.accessory.is_none()
-            || (self.routing.phase().busy() && self.connection.stage() != Stage::Ready)
-        {
+        if self.config.accessory.is_none() {
+            return;
+        }
+        if self.routing.phase().busy() && self.connection.stage() != Stage::Ready {
+            // Admission opens the link and the claim goes out once it is
+            // ready. Hold speaker playback for it like any takeover, so the
+            // play does not start on the speakers in the meantime.
+            self.claim_seat(now);
+            self.seat.note_claim(self.accessory.ownership.at());
+            self.replan(now);
             return;
         }
         self.resume_output_on_grant = self.connection.stage() == Stage::Ready
@@ -7147,6 +7175,64 @@ mod tests {
     }
 
     #[test]
+    fn a_play_waiting_for_the_link_claims_over_the_owner_the_setup_reports_describe() {
+        use crate::audio::play::PlayerSeen;
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let claimed = |effects: &[Effect]| {
+            effects.iter().any(|e| {
+                matches!(e,
+                Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true))
+            })
+        };
+        let paused =
+            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::PausePlayers(_)));
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.select_accessory(Some(addr(3)));
+        daemon.audio.startup_players(&[PlayerSeen {
+            service: "org.mpris.MediaPlayer2.brave".into(),
+            playing: false,
+        }]);
+        daemon.step(Input::Command(Command::Connect), now);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::ControlSocket { up: true, generation }, now);
+        // The play arrives while the link is still being set up.
+        daemon.step(
+            Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
+            at(10),
+        );
+        assert!(daemon.output.want);
+        let feed = |daemon: &mut Daemon, packet: Vec<u8>, ms: u64| {
+            daemon.step(Input::Accessory { generation, packet }, at(ms))
+        };
+        feed(&mut daemon, vec![0x01, 0x00, 0x04, 0x00, 0x01], 20);
+        feed(&mut daemon, vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01], 30);
+        // The opening reports say another device owns the audio.
+        let report = feed(
+            &mut daemon,
+            vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00],
+            40,
+        );
+        assert!(!paused(&report.effects));
+        let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
+        battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
+        battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
+        battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
+        feed(&mut daemon, battery, 50);
+        let ready = feed(&mut daemon, vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02], 60);
+        assert!(claimed(&ready.effects), "the waiting play asks for the audio");
+        let remote = Observation::Source { local: false, kind: 2, remote: Some(addr(9)) };
+        let stale = daemon.step(Input::Observation(remote.clone()), at(100));
+        assert!(!paused(&stale.effects), "a report from before the claim is not a takeover");
+        assert!(daemon.output.want);
+        // Without an answer to the claim, a later report is a real takeover.
+        let later = daemon.step(Input::Observation(remote), at(1_700));
+        assert!(paused(&later.effects));
+    }
+
+    #[test]
     fn remote_takeover_mutes_streams_only_until_paused_players_drain() {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -7705,6 +7791,30 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_report_just_before_the_grant_does_not_end_the_claim() {
+        use crate::step::{Effect, Input};
+        // XPS, 2026-10-19 15:56:16: ownership false, then true 1 ms later.
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.set_local_address(Some(addr(2)));
+        ready_link(&mut daemon, now);
+        let generation = daemon.connection.generation();
+        let service = "org.mpris.MediaPlayer2.brave";
+        daemon.step(Input::Players(Vec::new()), now);
+        daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+        let mut effects = Vec::new();
+        for (ms, owned) in [(100, 0), (101, 1)] {
+            let packet = vec![4, 0, 4, 0, 9, 0, 6, owned, 0, 0, 0];
+            effects.extend(daemon.step(Input::Accessory { generation, packet }, at(ms)).effects);
+        }
+        effects.extend(daemon.step(Input::Tick, at(500)).effects);
+        assert!(!effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+        assert!(daemon.output.want);
+        assert!(!daemon.audio.yielded());
+    }
+
+    #[test]
     fn real_remote_reports_pause_local_media_once_and_a_fresh_play_can_reclaim() {
         use crate::step::{Effect, Input};
         let local = addr(2);
@@ -7725,8 +7835,13 @@ mod tests {
             daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
             assert!(daemon.output.want);
             let remote_at = Clock::new(now.mono.0 + 1, now.unix.0 + 1);
-            let yielded =
+            let reported =
                 daemon.step(Input::Accessory { generation, packet: packet.clone() }, remote_at);
+            // The pods may still grant the claim just sent; give them a moment.
+            assert!(!reported.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+            assert!(daemon.output.want);
+            let remote_at = Clock::new(now.mono.0 + 301, now.unix.0 + 301);
+            let yielded = daemon.step(Input::Tick, remote_at);
             assert!(
                 yielded.effects.iter().any(|effect| matches!(
                     effect, Effect::PausePlayers(names) if names == &[service.to_string()]
@@ -9295,6 +9410,70 @@ mod tests {
         assert!(retry.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
         assert!(!daemon.output.want);
         assert!(!retry.effects.iter().any(|effect| matches!(effect, Effect::WriteControl { .. })));
+    }
+
+    #[test]
+    fn a_play_during_fleet_admission_waits_muted_and_claims_once_the_link_is_ready() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::fleet::route::Start;
+        use crate::pods::link::{Claim, OpenStep};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let mut daemon = Daemon::new("gram");
+        daemon.select_accessory(Some(addr(9)));
+        daemon.audio.startup_players(&[PlayerSeen {
+            service: "org.mpris.MediaPlayer2.brave".into(),
+            playing: false,
+        }]);
+        daemon.step(
+            Input::Audio(Graph {
+                default_sink: "speakers".into(),
+                sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "speakers".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            }),
+            now,
+        );
+        let Start::Sent { .. } = daemon.start_route(addr(2)) else { panic!("route") };
+        let play = daemon.step(
+            Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
+            now,
+        );
+        assert!(daemon.output.want);
+        assert!(
+            play.effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))),
+            "the play waits for the pods instead of starting on the speakers"
+        );
+        // Admission opens the link; the claim goes out when it is ready.
+        let Claim::Started(generation) = daemon.connection.claim(now.mono) else { panic!("claim") };
+        daemon.note_socket(true, generation, now.mono);
+        assert!(daemon.connection.advance(OpenStep::Notifications, generation, now.mono));
+        let ready = daemon.step(Input::Observation(Observation::Ready), at(5_000));
+        assert!(ready.effects.iter().any(|e| matches!(e,
+            Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true))));
+        // The rest of the opening reports still name the previous owner.
+        let stale = daemon.step(
+            Input::Observation(Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(addr(4)),
+            }),
+            at(5_300),
+        );
+        assert!(!stale.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+        assert!(daemon.output.want);
     }
 
     #[test]
