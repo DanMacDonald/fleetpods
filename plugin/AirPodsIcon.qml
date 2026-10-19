@@ -38,7 +38,8 @@ Item {
   readonly property bool usesMeshBuds: pixelArt && dotted && !isCase
   readonly property real podsArtworkScale: 1.38
   function restingPodsTop(size) {
-    return Grid.podsArtworkTop(size, podsArtworkScale, Grid.pitch)
+    var ratio = Math.max(1, Window.window ? Window.window.devicePixelRatio : Screen.devicePixelRatio)
+    return Grid.podsArtworkTop(size, podsArtworkScale, Grid.screenPitch(Grid.pitch, ratio))
   }
   // Connector attachment follows the resting artwork, not the entrance
   // translation. Pods descend over the wires without pulling their ends up.

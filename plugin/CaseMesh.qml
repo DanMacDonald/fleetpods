@@ -22,7 +22,7 @@ Item {
     objectName: "caseMesh"
     // At this camera angle the mesh occupies 64% of its square viewport.
     // Match the image artwork's full width and fixed case-bottom baseline.
-    width: Math.floor(root.width / 0.64 / root.dotPitch) * root.dotPitch
+    width: Math.floor(root.width / 0.64 / effectiveDotPitch) * effectiveDotPitch
     height: width
     anchors.horizontalCenter: parent.horizontalCenter
     anchors.alignWhenCentered: false
@@ -40,7 +40,9 @@ Item {
     dotPitch: root.dotPitch
     // Fit complete edge glyphs inside the icon's clip, not just their centers.
     // Inset geometry only: the fixed grid and every dot's size stay unchanged.
-    zoom: 0.98
+    // Fractional scales need another physical pixel of clearance on each side
+    // because the whole-cell frame and dot edges round independently.
+    zoom: 0.98 - (pixelRatio % 1 === 0 ? 0 : 2 / pixelRatio / root.width)
     yaw: 0
     pitch: 0.24
     animating: false

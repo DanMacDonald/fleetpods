@@ -5,6 +5,20 @@
 var pitch = 3
 var scale = 1.4
 
+// Quantize in the window's physical pixels, not half logical pixels. A 3 px
+// grid at 160% otherwise repeats a 4.8 px spacing and produces beat patterns.
+function screenPitch(requested, pixelRatio) {
+  return Math.max(2, Math.round(Math.max(1.5, requested) * pixelRatio)) / pixelRatio
+}
+
+function screenSize(requested, dotPitch, pixelRatio) {
+  // Keep the existing half-pixel glyph weight at 200%, then choose the nearest
+  // physical size on other displays. Leave at least one pixel between dots.
+  var nominal = Math.max(0.5, Math.floor(requested * 2) / 2)
+  return Math.max(1, Math.min(Math.round(dotPitch * pixelRatio) - 1,
+    Math.round(nominal * pixelRatio))) / pixelRatio
+}
+
 function podsFrameSize(size, dotPitch) {
   return Math.floor(size / 0.90 / dotPitch) * dotPitch
 }

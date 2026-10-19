@@ -3,6 +3,7 @@ import QtQuick
 import QtTest
 import ".." as Pods
 import "../DotMesh.js" as Mesh
+import "../DotGrid.js" as Grid
 import "../rendering/Raster.js" as Raster
 import "../Model.js" as Model
 import qs.Commons as Commons
@@ -69,7 +70,8 @@ TestCase {
         compare(mesh.dotPitch, 3, "artwork size and state must not change physical dot spacing")
         compare(mesh.dotScale, 1.4, "every view must retain the approved pods glyph weight")
         verify(mesh.alignDotsToPixels)
-        compare(mesh.width % mesh.dotPitch, 0, "frame complete grid cells")
+        fuzzyCompare(mesh.width / mesh.effectiveDotPitch, Math.round(mesh.width / mesh.effectiveDotPitch), 0.00001,
+          "frame complete physical grid cells")
       }
     }
   }
@@ -83,11 +85,11 @@ TestCase {
   function test_popupPaintsCompleteEdgeDots(data) {
     var item = createTemporaryObject(popup, this, { caseState: data.state, iconSize: 137 })
     var mesh = findChild(item, "caseMesh")
-    var pitch = mesh.dotPitch, columns = Math.floor(mesh.width / pitch)
+    var pitch = mesh.effectiveDotPitch, columns = Math.floor(mesh.width / pitch)
     for (var light of [false, true]) {
       var style = Mesh.dotStyle(light, pitch, mesh.backgroundColor, mesh.foregroundColor, mesh.shadowColor)
       var size = Math.min(pitch * 0.85, style.size * mesh.dotScale)
-      if (mesh.alignDotsToPixels) size = Math.max(0.5, Math.floor(size * 2) / 2)
+      if (mesh.alignDotsToPixels) size = Grid.screenSize(size, pitch, mesh.pixelRatio)
       for (var lid of [0, 0.25, 0.5, 0.75, 1]) {
         var frame = Mesh.frame(mesh.geometry, data.state, lid, 0, mesh.yaw, mesh.pitch,
           columns, columns, light, 0, mesh.zoom)
@@ -95,12 +97,12 @@ TestCase {
           if (style.level(frame[i]) === 0) continue
           var x = (i % columns + 0.5) * pitch, y = (Math.floor(i / columns) + 0.5) * pitch
           if (mesh.alignDotsToPixels) {
-            x = Math.round((x - size / 2) * 2) / 2 + size / 2
-            y = Math.round((y - size / 2) * 2) / 2 + size / 2
+            x = Math.round((x - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
+            y = Math.round((y - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
           }
           var point = mesh.mapToItem(item, x, y)
           verify(point.x - size / 2 >= 0 && point.x + size / 2 <= item.width,
-            "outer columns must fit whole dots inside the icon clip")
+            "outer columns must fit whole dots inside the icon clip: x=" + point.x + ", size=" + size + ", lid=" + lid + ", light=" + light)
         }
       }
     }
@@ -221,11 +223,11 @@ TestCase {
     var item = createTemporaryObject(popup, this, { caseState: "" })
     findChild(item, "budsMeshArtwork").dotPitch = data.pitch
     var mesh = findChild(item, "budsMesh")
-    var pitch = mesh.dotPitch, columns = Math.floor(mesh.width / pitch)
+    var pitch = mesh.effectiveDotPitch, columns = Math.floor(mesh.width / pitch)
     for (var light of [false, true]) {
       var style = Mesh.dotStyle(light, pitch, mesh.backgroundColor, mesh.foregroundColor, mesh.shadowColor)
       var size = Math.min(pitch * 0.85, style.size * mesh.dotScale)
-      if (mesh.alignDotsToPixels) size = Math.max(0.5, Math.floor(size * 2) / 2)
+      if (mesh.alignDotsToPixels) size = Grid.screenSize(size, pitch, mesh.pixelRatio)
       for (var step = 0; step <= 20; step++) {
         var arrival = step / 20
         item.budsIn = arrival
@@ -235,8 +237,8 @@ TestCase {
           if (style.level(frame[i]) === 0) continue
           var x = (i % columns + 0.5) * pitch, y = (Math.floor(i / columns) + 0.5) * pitch
           if (mesh.alignDotsToPixels) {
-            x = Math.round((x - size / 2) * 2) / 2 + size / 2
-            y = Math.round((y - size / 2) * 2) / 2 + size / 2
+            x = Math.round((x - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
+            y = Math.round((y - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
           }
           var point = mesh.mapToItem(item, x, y)
           // Entry starts above the slot; only visible rows can crop at its sides.

@@ -20,6 +20,8 @@ Item {
   property real zoom: 1
   property bool smoothSampling: false
   property bool alignDotsToPixels: true
+  readonly property real pixelRatio: Math.max(1, Window.window ? Window.window.devicePixelRatio : Screen.devicePixelRatio)
+  readonly property real effectiveDotPitch: alignDotsToPixels ? Grid.screenPitch(dotPitch, pixelRatio) : Math.max(1.5, dotPitch)
   property real yaw: -0.32
   property real pitch: 0.24
   property real time: 0
@@ -75,6 +77,7 @@ Item {
   onZoomChanged: canvas.requestPaint()
   onSmoothSamplingChanged: canvas.requestPaint()
   onAlignDotsToPixelsChanged: canvas.requestPaint()
+  onPixelRatioChanged: canvas.requestPaint()
   onForegroundColorChanged: canvas.requestPaint()
   onShadowColorChanged: canvas.requestPaint()
   onBackgroundColorChanged: canvas.requestPaint()
@@ -89,18 +92,16 @@ Item {
 
   Canvas {
     id: canvas
-    // Preserve the gaps between subpixel dots at the popup's small size.
-    width: root.width * 2
-    height: root.height * 2
-    scale: 0.5
-    transformOrigin: Item.TopLeft
-    smooth: true
+    // Canvas already renders at the window's device pixel ratio. An extra 2x
+    // texture followed by downsampling creates uneven dots at fractional DPI.
+    width: Math.ceil(root.width)
+    height: Math.ceil(root.height)
+    smooth: !root.alignDotsToPixels
     onPaint: {
       if (!root.visible) return
       var ctx = getContext("2d")
       ctx.reset()
-      ctx.scale(2, 2)
-      var pitch = Math.max(1.5, root.dotPitch)
+      var pitch = root.effectiveDotPitch
       var columns = Math.max(1, Math.floor(root.width / pitch))
       var rows = Math.max(1, Math.floor(root.height / pitch))
       var frame = Mesh.renderFrame(root.geometry, root.caseState, root.lid, root.time,
@@ -110,8 +111,7 @@ Item {
       var style = Mesh.dotStyle(frame.tonal, pitch, root.backgroundColor,
         root.foregroundColor, root.shadowColor)
       var size = Math.min(pitch * 0.85, style.size * root.dotScale)
-      // One canvas pixel is half a logical pixel at the fixed 2x resolution.
-      if (root.alignDotsToPixels) size = Math.max(0.5, Math.floor(size * 2) / 2)
+      if (root.alignDotsToPixels) size = Grid.screenSize(size, pitch, root.pixelRatio)
       var bands = new Uint8Array(values.length)
       for (var i = 0; i < values.length; i++) bands[i] = style.level(values[i])
       for (var band = 1; band <= style.levels; band++) {
@@ -123,8 +123,8 @@ Item {
           var y = (Math.floor(i / columns) + 0.5) * pitch
           var left = x - size / 2, top = y - size / 2
           if (root.alignDotsToPixels) {
-            left = Math.round(left * 2) / 2
-            top = Math.round(top * 2) / 2
+            left = Math.round(left * root.pixelRatio) / root.pixelRatio
+            top = Math.round(top * root.pixelRatio) / root.pixelRatio
           }
           ctx.fillRect(left, top, size, size)
         }
