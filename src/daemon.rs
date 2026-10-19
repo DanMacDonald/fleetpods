@@ -7139,9 +7139,9 @@ mod tests {
             }
             // The player never reports a pause.
             daemon.audio.set_local_playing_for_test(true);
-            let early = daemon.step(Input::Tick, at(400));
+            let early = daemon.step(Input::Tick, at(900));
             assert!(!early.effects.iter().any(|e| matches!(e, Effect::Restore(_))));
-            let late = daemon.step(Input::Tick, at(600));
+            let late = daemon.step(Input::Tick, at(1_000));
             assert!(late.effects.iter().any(|e| matches!(e, Effect::Restore(s) if s.len() == 1)));
         }
     }
@@ -7216,7 +7216,9 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Effect::MuteStreams(_) | Effect::Restore(_))));
         // Uncontrolled streams are unmuted once paused players have drained.
-        let drained = daemon.step(Input::Tick, Clock::new(now.mono.0 + 150, now.unix.0 + 150));
+        let draining = daemon.step(Input::Tick, Clock::new(now.mono.0 + 400, now.unix.0 + 400));
+        assert!(!draining.effects.iter().any(|e| matches!(e, Effect::Restore(_))));
+        let drained = daemon.step(Input::Tick, Clock::new(now.mono.0 + 500, now.unix.0 + 500));
         assert!(drained.effects.iter().any(|e| matches!(e,
             Effect::Restore(streams) if streams.len() == 2 && streams.iter().all(|s| !s.mute))));
         assert!(daemon.output.held.is_empty());

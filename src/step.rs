@@ -23,11 +23,19 @@ const REBUILD_PAUSE_MS: u64 = 500;
 /// How long after losing the pods this laptop may still release its idle
 /// AirPods output early, so the pods start the new owner's audio sooner.
 const RELEASE_OUTPUT_MS: u64 = 3_000;
-/// Audio a player sent before it paused drains within this time.
-const HANDOFF_DRAIN_MS: u64 = 150;
-/// Streams muted at a handoff are unmuted by then even if a player keeps
-/// playing, so audio this laptop cannot pause is silent only briefly.
-const HANDOFF_MUTE_MS: u64 = 600;
+/// How long a handoff-muted stream stays muted after every player reports
+/// Paused. Brave keeps playing audio it had already queued for a while after
+/// it reports Paused, and the XPS speaker filter (EQ and a lookahead limiter)
+/// holds more. Unmuting 150 ms after Paused still let that tail reach the
+/// speakers as a short blip (2026-10-19); 500 ms did not, across rapid
+/// switching.
+const HANDOFF_DRAIN_MS: u64 = 500;
+/// Streams muted at a handoff are unmuted by then even if a player never
+/// reports Paused. A stream with no MPRIS player for the daemon to pause
+/// keeps playing, and is silenced for at most this long. It must exceed
+/// HANDOFF_DRAIN_MS plus the few tens of milliseconds a player takes to
+/// report Paused.
+const HANDOFF_MUTE_MS: u64 = 1_000;
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
