@@ -812,22 +812,7 @@ impl Daemon {
         }
         if self.connection.stage() == Stage::Ready && self.output.want {
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
-            self.mute_for_handoff(now);
             self.step_back(now);
-            // Streams a pending takeover had muted are still playing until
-            // the pause lands. Keep them muted until it has drained.
-            for saved in std::mem::take(&mut self.effects.restore_pending) {
-                if !self
-                    .handoff_muted
-                    .iter()
-                    .any(|s| (s.id, s.generation) == (saved.id, saved.generation))
-                {
-                    self.handoff_muted.push(saved);
-                }
-            }
-            if !self.handoff_muted.is_empty() {
-                self.handoff_muted_at.get_or_insert(now.mono);
-            }
             self.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
         }
     }
@@ -835,7 +820,7 @@ impl Daemon {
     /// Mute what plays to the pods before players are paused and their
     /// streams follow the default back to the speakers. A player keeps
     /// playing for a moment after Pause, and that audio would come out there.
-    fn mute_for_handoff(&mut self, now: Clock) {
+    pub(crate) fn mute_for_handoff(&mut self, now: Clock) {
         let (Some(accessory), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
         else {
             return;
@@ -857,6 +842,24 @@ impl Daemon {
         if !self.handoff_muted.is_empty() {
             self.handoff_muted_at.get_or_insert(now.mono);
             self.handoff_quiet_since = None;
+        }
+    }
+
+    /// Streams a pending takeover had muted are still playing until the
+    /// pause lands. Keep them muted until it has drained instead of
+    /// restoring them on the speakers now.
+    pub(crate) fn keep_restores_muted_for_handoff(&mut self, now: Clock) {
+        for saved in std::mem::take(&mut self.effects.restore_pending) {
+            if !self
+                .handoff_muted
+                .iter()
+                .any(|s| (s.id, s.generation) == (saved.id, saved.generation))
+            {
+                self.handoff_muted.push(saved);
+            }
+        }
+        if !self.handoff_muted.is_empty() {
+            self.handoff_muted_at.get_or_insert(now.mono);
         }
     }
 

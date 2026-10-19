@@ -3099,6 +3099,9 @@ impl Daemon {
     }
 
     pub(crate) fn step_back(&mut self, now: Clock) {
+        // Mute before the pause and before streams follow the default back
+        // to the speakers: a player keeps playing for a moment after Pause.
+        self.mute_for_handoff(now);
         self.background_requested = false;
         self.deferred_playback_claim = None;
         self.resume_output_on_grant = false;
@@ -3112,6 +3115,7 @@ impl Daemon {
             self.effects.pause_players = players;
         }
         self.replan(now);
+        self.keep_restores_muted_for_handoff(now);
     }
 
     pub(crate) fn seat_audio_failure(&mut self, reason: &'static str, now: Clock) {
@@ -3142,6 +3146,7 @@ impl Daemon {
                 self.reconnect_retry_at = None;
                 self.reconnect_retries = 0;
                 self.seat.begin_reconnect(now);
+                self.mute_for_handoff(now);
                 self.output.want = false;
                 self.transport_asked = false;
                 let players = self.audio.yield_playback();
@@ -5171,6 +5176,58 @@ mod tests {
             landed,
         );
         assert_eq!(daemon.connection.stage(), Stage::Ready);
+    }
+
+    #[test]
+    fn releasing_or_reconnecting_mutes_playing_streams_before_pausing() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+        // XPS, 2026-10-19 16:01:39: Reconnect paused Brave and its stream
+        // reached the speakers 10 ms later, still playing.
+        for command in [Command::ReconnectPeer, Command::HandoffRelease] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.note_bluez(true);
+            daemon.audio.startup_players(&[PlayerSeen {
+                service: "org.mpris.MediaPlayer2.brave".into(),
+                playing: true,
+            }]);
+            daemon.output.want = true;
+            daemon.step(
+                Input::Audio(Graph {
+                    default_sink: "pods".into(),
+                    sinks: vec![
+                        Sink {
+                            name: "pods".into(),
+                            address: Some(addr(3)),
+                            profile: Some("a2dp-sink".into()),
+                        },
+                        Sink { name: "speakers".into(), address: None, profile: None },
+                    ],
+                    cards: Vec::new(),
+                    streams: vec![LiveStream {
+                        id: 1,
+                        generation: 10,
+                        sink: "pods".into(),
+                        role: String::new(),
+                        node: "Brave".into(),
+                        mute: false,
+                        volume: 1.0,
+                        corked: false,
+                    }],
+                }),
+                now,
+            );
+            let outcome = daemon.step(Input::Command(command.clone()), now);
+            let mute = outcome.effects.iter().position(|e| matches!(e, Effect::MuteStreams(_)));
+            let pause = outcome.effects.iter().position(|e| matches!(e, Effect::PausePlayers(_)));
+            assert!(
+                matches!((mute, pause), (Some(m), Some(p)) if m < p),
+                "{command:?}: mute {mute:?} must come before pause {pause:?}"
+            );
+        }
     }
 
     #[test]
