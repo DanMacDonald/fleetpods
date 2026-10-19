@@ -6,7 +6,7 @@ qml_runner="${QML_BIN:-/usr/lib/qt6/bin/qml}"
 
 if [[ "${1:-}" == --help ]]; then
   cat <<'USAGE'
-Usage: tools/artwork/preview [--light] [--open | --closed] [--capture]
+Usage: tools/artwork/preview [--light] [--fresnel | --pods-out | --open | --closed | --right-out | --left-out | --empty] [--capture]
 
 Open the standalone FleetPods artwork study. No daemon or connected pods needed.
 Use QML_BIN to override the Qt 6 qml executable.
@@ -19,4 +19,11 @@ USAGE
   exit 0
 fi
 
-exec "$qml_runner" "$study_root/plugin/previews/DotPodsPreview.qml" -- "$@"
+study_file=DotPodsPreview.qml
+for study_arg in "$@"; do
+  if [[ "$study_arg" == --fresnel ]]; then
+    exec "$qml_runner" "$study_root/tools/artwork/fresnel/Study.qml" -- "$@"
+  fi
+  if [[ "$study_arg" == --pods-out ]]; then study_file=PodsOutPreview.qml; fi
+done
+exec "$qml_runner" "$study_root/plugin/previews/$study_file" -- "$@"

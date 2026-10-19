@@ -11,10 +11,11 @@ from pathlib import Path
 import sys
 
 import bpy
+import bmesh
 from mathutils import Matrix, Vector
 
 ROOT = Path(__file__).resolve().parents[2]
-SOURCE = Path(__file__).with_name('airpods-reference.blend')
+SOURCE = Path(__file__).with_name('airpods-artwork.blend')
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--full', action='store_true', help='Export unsimplified geometry for comparison')
 parser.add_argument('--output', type=Path, help='Override output path')
@@ -31,6 +32,8 @@ CENTER = Vector((0, 0.30, 0))
 
 
 def shade(material):
+    if 'artwork_shade' in material:
+        return float(material['artwork_shade'])
     if material.name == 'lifght green':
         return 1.5  # status light
     if material.name == 'metal':
@@ -53,6 +56,37 @@ def export_object(name, ratio, mode):
     obj.modifiers.clear()
     obj.data.calc_loop_triangles()
     original = len(obj.data.loop_triangles)
+    # Retain the reference lid's thin, nearly planar inner face. Collapsing
+    # these triangles can expose its dark backing between rim/recess walls.
+    # The 0.005-unit relief is below this artwork's grid resolution; its
+    # shared plane normal avoids bright/dark spots from averaged rim normals.
+    lid_face = []
+    if mode == 'lid' and not FULL:
+        face_transform = AXES * (obj.matrix_world.to_scale().x * SCALE)
+        for triangle in obj.data.loop_triangles:
+            if shade(obj.data.materials[triangle.material_index]) != 1:
+                continue
+            positions = [face_transform @ obj.data.vertices[i].co for i in triangle.vertices]
+            if all(abs(p.y) < 0.005 for p in positions):
+                lid_face.append([tuple(round(c, 5) for c in (*p, 0, -1, 0)) for p in positions])
+        # The source also has hairline separations between this face and its
+        # shallow inset trim. Close those sub-grid gaps in the retained face,
+        # while leaving the much wider pod recesses and outer contour intact.
+        patch = bmesh.new()
+        vertices = {}
+        for face in lid_face:
+            corners = []
+            for v in face:
+                point = (v[0], 0, v[2])
+                if point not in vertices:
+                    vertices[point] = patch.verts.new(point)
+                corners.append(vertices[point])
+            if len(set(corners)) == 3:
+                patch.faces.new(corners)
+        bmesh.ops.remove_doubles(patch, verts=list(patch.verts), dist=0.02)
+        bmesh.ops.triangulate(patch, faces=list(patch.faces))
+        lid_face = [[tuple(round(c, 5) for c in (*v.co, 0, -1, 0)) for v in f.verts] for f in patch.faces]
+        patch.free()
     if not FULL:
         modifier = obj.modifiers.new('Dot grid simplification', 'DECIMATE')
         modifier.ratio = ratio
@@ -78,18 +112,34 @@ def export_object(name, ratio, mode):
         material = mesh.materials[triangle.material_index]
         tone = shade(material)
         batch = batches.setdefault(tone, {'shade': tone, 'vertices': [], 'triangles': [], '_indices': {}})
+        if material.get('artwork_matte', False):
+            batch['matte'] = True
         face = []
+        planar_lid = mode == 'lid' and tone == 1 and all(
+            abs((transform @ mesh.vertices[i].co + origin).y) < 0.005 for i in triangle.vertices)
         for loop_index in triangle.loops:
             loop = mesh.loops[loop_index]
             vertex = mesh.vertices[loop.vertex_index]
             position = transform @ vertex.co + origin
             normal = (normals @ mesh.corner_normals[loop_index].vector).normalized()
+            if planar_lid or (mode == 'lid' and material.name == 'Artwork lid rim'):
+                normal = Vector((0, -1, 0))
             data = tuple(round(c, 5) for c in (*position, *normal))
             if data not in batch['_indices']:
                 batch['_indices'][data] = len(batch['vertices'])
                 batch['vertices'].append(data)
             face.append(batch['_indices'][data])
         batch['triangles'].append(face)
+    if lid_face:
+        batch = batches[1]
+        for vertices in lid_face:
+            face = []
+            for data in vertices:
+                if data not in batch['_indices']:
+                    batch['_indices'][data] = len(batch['vertices'])
+                    batch['vertices'].append(data)
+                face.append(batch['_indices'][data])
+            batch['triangles'].append(face)
     for batch in batches.values():
         del batch['_indices']
         if mode == 'bud' and batch['shade'] == 0.86:
@@ -103,7 +153,7 @@ def export_object(name, ratio, mode):
                 inward = -(ny * ry + nz * rz) / max(radial, 0.00001)
                 cavity.append(round(max(0, min(1, (inward - 0.05) / 0.65)), 5))
             batch['cavity'] = cavity
-    count = len(mesh.loop_triangles)
+    count = sum(len(batch['triangles']) for batch in batches.values())
     print(f'{name}: {original:,} -> {count:,} triangles')
     return list(batches.values()), original, count
 

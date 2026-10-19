@@ -45,7 +45,7 @@ var MAX_ERROR_CHARS = 140
 var ELIDED_ERROR_CHARS = 137
 
 function defaultPod() {
-  return { level: LEVEL_UNKNOWN, charging: false, inEar: false, inCase: false }
+  return { level: LEVEL_UNKNOWN, charging: false, inEar: false, inCase: false, outOfCase: false }
 }
 
 // Full shape on every path, so the panel never reads undefined off a parse failure.
@@ -255,6 +255,8 @@ function podFrom(raw) {
   pod.charging = raw.charging === true
   pod.inEar = raw.in_ear === true
   pod.inCase = raw.in_case === true
+  // Missing placement is unknown, not evidence that a pod has left its well.
+  pod.outOfCase = raw.in_case === false
   return pod
 }
 
@@ -502,8 +504,17 @@ function budsOut(lidState, left, right, lastAdvertisementMs, nowMs, connected, n
   return false
 }
 
+// Remember physical placement independently of the delayed artwork transition.
+// Not-in-ear alone does not tell us whether a pod has returned to its well.
+function rememberPodPlacement(pod, previous) {
+  if (pod && (pod.inEar || pod.outOfCase === true)) return false
+  if (pod && pod.inCase === true) return true
+  return previous === true || previous === false ? previous : null
+}
+
 function caseIconState(isHeadset, lidState, left, right, previousState, hadInEar,
-                       lastAdvertisementMs, nowMs, nearbyMs, connected, earReported, unpaired) {
+                       lastAdvertisementMs, nowMs, nearbyMs, connected, earReported, unpaired,
+                       rememberedPlacement) {
   left = left || defaultPod()
   right = right || defaultPod()
   if (isHeadset) return ""
@@ -513,29 +524,33 @@ function caseIconState(isHeadset, lidState, left, right, previousState, hadInEar
   // No advertisement and no connection means there is no worn state to preserve on startup.
   if (connected === false && Number(lastAdvertisementMs) === 0) return "closed"
   if (telemetryUnavailable(connected, lastAdvertisementMs, nowMs)) return "closed"
+  var leftOut = rememberPodPlacement(left, rememberedPlacement && rememberedPlacement.left) === false
+  var rightOut = rememberPodPlacement(right, rememberedPlacement && rememberedPlacement.right) === false
   // Disconnect clears the ear flags without reporting a physical change.
-  if (earReported === false) return previousState
+  // An explicit case-placement report can arrive before any ear report.
+  if (!rememberedPlacement && earReported === false
+      && !left.outOfCase && !right.outOfCase && !left.inCase && !right.inCase)
+    return previousState
   // A shut case stops advertising. Do not wait for the audio link to drop.
-  // Silence while a bud is still in-ear is the case in a pocket, not a shut lid.
+  // Silence while a bud is still reported out is not a new closed-lid report.
   var last = Number(lastAdvertisementMs || 0)
   var now = Number(nowMs || 0)
   var stale = now > 0 && last > 0 && now - last >= (nearbyMs || 20000)
-  if (stale && !left.inEar && !right.inEar)
+  if (stale && !leftOut && !rightOut)
     return "closed"
   if (!connected && stale && (left.charging || right.charging))
     return "closed"
-  if (left.inEar && right.inEar) {
+  if (leftOut && rightOut) {
     // Hold the empty case for a beat when the last pod leaves, then the buds glyph.
     if (previousState === "open" || previousState === "open-left"
       || previousState === "open-right" || previousState === "open-empty")
       return "open-empty"
     return ""
   }
-  // Named for the pod still sitting in the case. A docked bud often reports
-  // neither charging nor in_case, so one bud in the ear keeps the other drawn
-  // in the case. The empty case is only the beat after both are in-ear.
-  if (left.inEar && !right.inEar) return "open-right"
-  if (right.inEar && !left.inEar) return "open-left"
+  // Named for the pod still sitting in the case. Unknown placement retains
+  // each pod's last known side of the rim; no history defaults to seated.
+  if (leftOut && !rightOut) return "open-right"
+  if (rightOut && !leftOut) return "open-left"
   if (lidState === LID_CLOSED) return "closed"
   if (lidState === LID_OPEN) return "open"
   // Lid ads from while the buds were worn describe the empty case, so this tick

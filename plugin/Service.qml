@@ -135,7 +135,9 @@ Item {
   property int earDetectionBehavior: Model.EAR_PAUSE_ONE_OUT
   property string caseIconState: "closed"
   property bool lastAnyInEar: false
-  readonly property int emptyCaseHoldMs: 1000
+  property var rememberedPlacement: ({ left: null, right: null })
+  // Match the pod lift; the artwork itself waits for both pods to clear.
+  readonly property int emptyCaseHoldMs: 840
   readonly property int emptyCaseConfirmMs: 250
   property bool emptyCasePending: false
   property bool schemaUnsupported: false
@@ -186,6 +188,7 @@ Item {
     emptyCaseTimer.stop()
     caseIconState = "closed"
     lastAnyInEar = false
+    rememberedPlacement = { left: null, right: null }
     _queued = null
     _clearPending()
   }
@@ -198,6 +201,10 @@ Item {
 
   // Runs after the status log has taken the line, so view is this status.
   function applyStatus(status) {
+    rememberedPlacement = status.bluetoothPaired === false ? { left: null, right: null } : {
+      left: Model.rememberPodPlacement(status.left, rememberedPlacement.left),
+      right: Model.rememberPodPlacement(status.right, rememberedPlacement.right)
+    }
     if (Model.fleetRouteFailed(statusLogState.routeEnded)) {
       routeFailedMs = Date.now()
       if (activityHold && routeFailedSinceRequest()) releaseActivityHold()
@@ -301,7 +308,8 @@ Item {
     }
     applyCaseIcon(Model.caseIconState(view.isHeadset, view.iconLidState,
       view.left, view.right, caseIconState, lastAnyInEar,
-      view.lastAdvertisementMs, caseIconNowMs(view.lastAdvertisementMs), 20000, view.connected, view.earReported, (!view.bluetoothPaired || !view.pairingKeysReady)))
+      view.lastAdvertisementMs, caseIconNowMs(view.lastAdvertisementMs), 20000, view.connected, view.earReported,
+      (!view.bluetoothPaired || !view.pairingKeysReady), rememberedPlacement))
   }
 
   function applyCaseIcon(nextCase) {

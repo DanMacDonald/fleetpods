@@ -1,8 +1,8 @@
 // deno run --allow-read tools/artwork/compare_meshes.js /tmp/fleetpods-full.js
 if (Deno.args.length !== 1) throw new Error('Pass the path of a --full Blender export')
 const load = path => new Function(Deno.readTextFileSync(path).replace(/^\.pragma library\s*/, '') + '; return geometry')()
-const Mesh = new Function(Deno.readTextFileSync(new URL('../../plugin/DotMesh.js', import.meta.url))
-  + '; return { frame }')()
+import { loadQmlJs } from './load_qml_js.js'
+const Mesh = loadQmlJs(new URL('../../plugin/DotMesh.js', import.meta.url))
 const small = load(new URL('../../plugin/artwork/AirPodsMesh.js', import.meta.url))
 const full = load(Deno.args[0])
 function check(condition, message) { if (!condition) throw new Error(message) }

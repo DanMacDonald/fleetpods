@@ -15,6 +15,23 @@ TestCase {
   SignalSpy { id: release; signalName: "appleClicked" }
   SignalSpy { id: enroll; signalName: "enrollClicked" }
 
+  function test_caseExitRevealsRestingPodsConnectors() {
+    var item = createTemporaryObject(view, this, { podsVariant: "pro", caseState: "open-empty" })
+    var art = findChild(item, "seatPodsArtwork")
+    item.caseState = ""
+    verify(art.caseExiting)
+    var target = item.connectorEndY
+    verify(target > item.revealedConnectorEndY, "case initially covers the lower wire")
+    verify(item.revealedConnectorEndY > item.linkY + 8, "both wire ends point down")
+    wait(100)
+    compare(item.connectorEndY, target, "target stays in the final pods position")
+    compare(item.revealedConnectorEndY, target, "case descent uncovers the full wire")
+    tryCompare(art, "caseExiting", false, 600)
+    fuzzyCompare(item.connectorEndY, target, 0.001, "renderer swap must not move the connectors")
+    wait(100)
+    fuzzyCompare(item.revealedConnectorEndY, target, 0.001, "pods enter over the fixed wires")
+  }
+
   function test_connectedDiscoveryStaysInTrayWithInvitation() {
     var names = { "02:00:00:00:00:04": { label: "XPS", kind: "omarchy", discovered: true } }
     var peers = ["02:00:00:00:00:01", "02:00:00:00:00:04"]

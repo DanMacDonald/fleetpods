@@ -87,7 +87,13 @@ Item {
   readonly property int budsSize: buds.usesPixelArt ? 128 : 56
   readonly property int caseGap: 8
   readonly property real artworkY: root.linkY + root.captionGap + root.caseGap
-  readonly property int podLandingOffset: 12
+  // Lay the wires out for the incoming pods as soon as the case exits.
+  // Hide the part covered by the moving lid, including the gaps between dots.
+  readonly property real connectorEndY: buds.caseExiting
+    ? root.artworkY + buds.restingPodsTop(root.budsSize) : buds.y + buds.artworkTop
+  readonly property real revealedConnectorEndY: buds.caseExiting
+    ? Math.min(connectorEndY, buds.y + buds.artworkTop + buds.caseOut * buds.iconSize)
+    : connectorEndY
   readonly property int connectorDrawMs: 8000
   readonly property int wireGap: 10
   readonly property int moveMs: 450
@@ -221,14 +227,18 @@ Item {
 
   AirPodsIcon {
     id: buds
+    objectName: "seatPodsArtwork"
     z: 4
-    iconSize: root.budsSize
+    // 5% larger, rounded to a whole pixel; the dot grid stays physical.
+    iconSize: usesMeshCase ? 137 : root.budsSize
     pixelArt: true
     color: root.foreground
     variant: root.podsVariant
     caseState: root.caseState
     pairingMode: root.pairingMode
-    y: root.artworkY + (root.showBattery && usesPixelArt && !isCase ? root.podLandingOffset * budsIn : 0)
+    // The stems end at y=113 and the case at y=117.5. Keep their painted
+    // bottoms on the same baseline beside the case battery circle.
+    y: root.artworkY + (usesMeshCase ? -4.5 : 0)
     anchors.horizontalCenter: parent.horizontalCenter
   }
 
@@ -238,7 +248,7 @@ Item {
     visible: root.showBattery
     anchors.horizontalCenter: buds.horizontalCenter
     // Keep the gauges fixed while the pods drop into place.
-    y: root.artworkY + buds.height + 4
+    y: root.artworkY + root.budsSize + 4
     spacing: 16
     BatteryIndicator {
       objectName: "leftBatteryIndicator"
@@ -277,7 +287,8 @@ Item {
     id: caseBattery
     objectName: "caseBatteryIndicator"
     visible: root.showBattery && root.podsVariant !== "max"
-    x: buds.x + buds.width / 2 + Math.max(128, root.budsSize) / 2 + 24
+    // Follow the case's 3 px wider painted right edge, preserving the gutter.
+    x: buds.x + buds.width / 2 + Math.max(128, root.budsSize) / 2 + 27
     y: (root.artworkY + root.artworkBottom - height) / 2
     width: 64
     spacing: 8
@@ -330,7 +341,7 @@ Item {
       fillColor: "transparent"
       trim.end: root.connectionProgress
       startX: omarchyLink.wireX
-      startY: buds.y + buds.artworkTop
+      startY: root.revealedConnectorEndY
       PathLine { x: omarchyLink.wireX; y: root.linkY + omarchyLink.cornerRadius }
       PathQuad {
         x: omarchyLink.wireX + omarchyLink.cornerRadius
@@ -461,7 +472,7 @@ Item {
         controlX: branch.wireX
         controlY: root.linkY
       }
-      PathLine { x: branch.wireX; y: buds.y + buds.artworkTop }
+      PathLine { x: branch.wireX; y: root.revealedConnectorEndY }
     }
   }
 

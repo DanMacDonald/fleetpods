@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Shapes
 import Qt5Compat.GraphicalEffects
+import "DotGrid.js" as Grid
 import qs.Commons as Commons
 
 // Model-specific outlines, with optional pixel art for the popup.
@@ -19,19 +20,30 @@ Item {
   height: iconSize
   implicitWidth: iconSize
   implicitHeight: iconSize
+  // Pods enter stem-first through the same fixed boundary they leave through.
   clip: true
 
   readonly property bool isPro: variant === "pro"
   readonly property bool isUnknown: variant === "unknown"
   readonly property bool dotted: isPro || isUnknown
   readonly property bool isMax: variant === "max"
-  readonly property bool isCase: !isMax && (caseState === "open" || caseState === "closed"
+  readonly property bool isCase: !isMax && (caseExiting || caseState === "open" || caseState === "closed"
     || caseState === "open-left" || caseState === "open-right" || caseState === "open-empty")
   readonly property bool hiResCase: iconSize >= 32
   readonly property bool pixelCase: pixelArt && isCase && (dotted || caseState === "closed")
   readonly property bool usesPixelArt: pixelCase || (pixelArt && dotted && !isCase)
+  // Keep one renderer through either pod's departure, including the second
+  // pod leaving. open-left/open-right name the pod still seated in the case.
+  readonly property bool usesMeshCase: pixelCase
+  readonly property bool usesMeshBuds: pixelArt && dotted && !isCase
+  readonly property real podsArtworkScale: 1.38
+  function restingPodsTop(size) {
+    return Grid.podsArtworkTop(size, podsArtworkScale, Grid.pitch)
+  }
+  // Connector attachment follows the resting artwork, not the entrance
+  // translation. Pods descend over the wires without pulling their ends up.
   readonly property real artworkTop: usesPixelArt && pixelArtwork.item
-    ? pixelArtwork.y + pixelArtwork.item.artworkTop
+    ? pixelArtwork.item.artworkTop
     : isCase ? caseY + ink[1] * fit : (iconSize - ink[3] * fit) / 2
 
   // Apple's artboards sit the outline low, so the glyph is fitted to its ink box instead: x, y, width, height in artboard units.
@@ -55,8 +67,31 @@ Item {
   // return trip can animate instead of snapping shut.
   property real leftSeat: 1
   property real rightSeat: 1
+  property bool leftReturning: false
+  property bool rightReturning: false
+  readonly property int meshReturnMs: 500
+
+  function meshLift(seat, returning) {
+    // Begin with even the stem tip above the clip, without a long hidden lead-in.
+    return (1 - seat) * (returning ? 0.72 : 1)
+  }
+
+  function returnTurn(lift) {
+    // Hold the presentation angle until the head enters view. Finish the turn
+    // with the stem about halfway into its well, then lower it straight down.
+    return Math.max(0, Math.min(1, (lift - 0.12) / 0.24))
+  }
   property string seatedState: ""
   property bool droppingIntoClosed: false
+  property bool caseExiting: false
+  property real caseOut: 0
+
+  function startCaseExitWhenClear() {
+    if (caseExiting && leftSeat === 0 && rightSeat === 0 && !caseExit.running)
+      caseExit.start()
+  }
+  onLeftSeatChanged: startCaseExitWhenClear()
+  onRightSeatChanged: startCaseExitWhenClear()
   // 1 = buds glyph in place, 0 = waiting above the icon.
   property real budsIn: 1
   // Head from the case art, plus a stem that stays inside the well until the bud lifts.
@@ -73,57 +108,109 @@ Item {
   function moveSeat(anim, value) {
     // A running animation keeps its old endpoint until restarted.
     anim.stop()
+    var seat = anim === leftLift ? leftSeat : rightSeat
+    // Start the turn while the pod is still above the artwork. Keep it on
+    // reversal midway through a return; clear it for a new seated departure.
+    if (seat < 0.02 && value === 1) {
+      if (anim === leftLift) leftReturning = true
+      else rightReturning = true
+    } else if (seat > 0.98 && value === 0) {
+      if (anim === leftLift) leftReturning = false
+      else rightReturning = false
+    }
     if (Math.abs((anim === leftLift ? leftSeat : rightSeat) - value) < 0.02) {
       if (anim === leftLift) leftSeat = value
       else rightSeat = value
       return
     }
+    // caseStateChanged can run before usesMeshCase's binding refreshes. Set
+    // timing from the requested state before starting: a running animation
+    // otherwise retains the old standalone duration for this entire return.
+    var meshCase = pixelArt && variant !== "max"
+      && (variant === "pro" || variant === "unknown" || caseState === "closed")
+    anim.duration = meshCase ? (value === 0 ? 840 : meshReturnMs) : 420
+    // Returns descend at constant speed from the first frame through seating.
+    anim.easing.type = meshCase
+      ? (value === 1 ? Easing.Linear : Easing.InOutCubic) : Easing.InOutQuad
     anim.to = value
     anim.start()
   }
 
   function syncSeats(animate) {
+    if (caseExiting && caseState === "" && animate) return
+    caseExiting = false
+    caseExit.stop()
+    caseOut = 0
     if (caseState === "") {
+      // Keep the empty case renderer until it has cleared the bottom clip.
+      // If the state arrives early, let the departing pods finish first.
+      if (animate && seatedState === "open-empty" && pixelArt && dotted) {
+        caseExiting = true
+        if (!leftLift.running || leftLift.to !== 0) moveSeat(leftLift, 0)
+        if (!rightLift.running || rightLift.to !== 0) moveSeat(rightLift, 0)
+        startCaseExitWhenClear()
+        return
+      }
       var fromCase = seatedState === "open" || seatedState === "open-left"
         || seatedState === "open-right" || seatedState === "open-empty"
         || seatedState === "closed"
       seatedState = ""
       droppingIntoClosed = false
+      // The case loader is replaced by standalone artwork here. Preserve the
+      // physical pose in this item so a returning pod can descend when a new
+      // case renderer is loaded, including on startup with both pods out.
+      leftLift.stop()
+      rightLift.stop()
+      leftSeat = 0
+      rightSeat = 0
+      leftReturning = false
+      rightReturning = false
       if (animate && fromCase) budsDrop.start()
       else budsIn = 1
       return
     }
+    budsDrop.stop()
+    budsIn = 1
     if (caseState === "closed") {
       var lifted = leftSeat < 0.98 || rightSeat < 0.98
-      var wasOpen = seatedState === "open" || seatedState === "open-left"
+      var wasOpen = seatedState === "" || seatedState === "open" || seatedState === "open-left"
         || seatedState === "open-right" || seatedState === "open-empty"
       seatedState = "closed"
       if (animate && lifted && wasOpen) {
         droppingIntoClosed = true
         moveSeat(leftLift, 1)
         moveSeat(rightLift, 1)
+        closeAfterDrop.interval = Math.max(leftLift.duration, rightLift.duration) + 20
         closeAfterDrop.restart()
         return
       }
       droppingIntoClosed = false
+      leftLift.stop()
+      rightLift.stop()
+      leftSeat = 1
+      rightSeat = 1
+      leftReturning = false
+      rightReturning = false
       return
     }
     droppingIntoClosed = false
     var next = seatTargets(caseState)
-    var firstPaint = seatedState === "" && !animate
     seatedState = caseState
-    if (firstPaint) {
+    if (!animate) {
       leftLift.stop()
       rightLift.stop()
       leftSeat = next[0]
       rightSeat = next[1]
+      leftReturning = false
+      rightReturning = false
       return
     }
     moveSeat(leftLift, next[0])
     moveSeat(rightLift, next[1])
   }
 
-  onCaseStateChanged: syncSeats(true)
+  onCaseStateChanged: syncSeats(visible)
+  onVisibleChanged: if (!visible) { budsDrop.stop(); syncSeats(false) }
   Component.onCompleted: syncSeats(false)
 
   // The bar centers whatever bounds it can measure. The bud Shape's bounding
@@ -159,13 +246,30 @@ Item {
   }
 
   NumberAnimation {
+    id: caseExit
+    target: root
+    property: "caseOut"
+    from: 0
+    to: 1
+    duration: 350
+    easing.type: Easing.Linear
+    onFinished: {
+      root.caseExiting = false
+      root.caseOut = 0
+      root.seatedState = ""
+      root.syncSeats(false)
+      if (root.visible && root.caseState === "") budsDrop.restart()
+    }
+  }
+
+  NumberAnimation {
     id: budsDrop
     target: root
     property: "budsIn"
     from: 0
     to: 1
-    duration: 840
-    easing.type: Easing.OutCubic
+    duration: root.usesMeshBuds ? 494 : 414
+    easing.type: Easing.Linear
   }
 
   Image {
@@ -303,8 +407,43 @@ Item {
     active: root.usesPixelArt && artworkPalette.item !== null
     width: root.iconSize
     height: root.iconSize
-    y: root.isCase ? 0 : (1 - root.budsIn) * -root.iconSize
-    sourceComponent: PixelPods {
+    y: root.isCase ? root.caseOut * root.iconSize : (1 - root.budsIn) * -root.iconSize
+    sourceComponent: root.usesMeshCase ? meshCaseComponent
+      : root.usesMeshBuds ? meshBudsComponent : pixelComponent
+  }
+
+  Component {
+    id: meshCaseComponent
+    CaseMesh {
+      objectName: "caseMeshArtwork"
+      // Seat the returning pod before closing the lid over it.
+      caseState: root.caseExiting ? "open-empty" : root.droppingIntoClosed ? "open" : root.caseState
+      leftLift: root.meshLift(root.leftSeat, root.leftReturning)
+      rightLift: root.meshLift(root.rightSeat, root.rightReturning)
+      leftTurn: root.leftReturning ? root.returnTurn(leftLift) : 0
+      rightTurn: root.rightReturning ? root.returnTurn(rightLift) : 0
+      pairingMode: root.pairingMode
+      foregroundColor: artworkPalette.item.foreground
+      backgroundColor: artworkPalette.item.backgroundColor
+    }
+  }
+
+  Component {
+    id: meshBudsComponent
+    BudsMesh {
+      objectName: "budsMeshArtwork"
+      arrival: root.budsIn
+      // Fill more of the popup slot without enlarging the dots themselves.
+      artworkScale: root.podsArtworkScale
+      foregroundColor: artworkPalette.item.foreground
+      backgroundColor: artworkPalette.item.backgroundColor
+    }
+  }
+
+  Component {
+    id: pixelComponent
+    PixelPods {
+      objectName: "pixelArtwork"
       pairingMode: root.pairingMode
       caseState: root.pixelCase ? (root.droppingIntoClosed ? "open" : root.caseState) : ""
       foregroundColor: artworkPalette.item.foreground

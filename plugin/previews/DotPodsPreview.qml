@@ -4,6 +4,7 @@ import QtQuick.Controls
 import QtQuick.Layouts
 import QtQuick.Window
 import ".." as Pods
+import "../DotGrid.js" as Grid
 
 Window {
   id: window
@@ -15,11 +16,14 @@ Window {
   property color ink: "#c8cdda"
   property color muted: "#797f94"
   property string state: Qt.application.arguments.indexOf("--closed") >= 0 ? "closed"
+    : Qt.application.arguments.indexOf("--right-out") >= 0 ? "open-left"
+    : Qt.application.arguments.indexOf("--left-out") >= 0 ? "open-right"
+    : Qt.application.arguments.indexOf("--empty") >= 0 ? "open-empty"
     : Qt.application.arguments.indexOf("--open") >= 0 ? "open" : ""
   property bool moving: Qt.application.arguments.indexOf("--capture") < 0
   property bool lightTheme: Qt.application.arguments.indexOf("--light") >= 0
   property real angle: -0.32
-  property real spacing: 6
+  property real spacing: Grid.pitch
   readonly property color background: lightTheme ? "#efeee8" : "#1c1d26"
   readonly property color foreground: lightTheme ? "#343b4c" : ink
   readonly property color shade: lightTheme ? "#717b8e" : "#465675"
@@ -167,6 +171,12 @@ Window {
             Choice { label: window.moving ? "Pause" : "Animate"; onClicked: window.moving = !window.moving }
             Choice { label: window.lightTheme ? "Dark" : "Light"; onClicked: window.lightTheme = !window.lightTheme }
           }
+          RowLayout {
+            spacing: 8
+            Choice { label: "Left out"; selected: window.state === "open-right"; onClicked: window.state = "open-right" }
+            Choice { label: "Right out"; selected: window.state === "open-left"; onClicked: window.state = "open-left" }
+            Choice { label: "Both out"; selected: window.state === "open-empty"; onClicked: window.state = "open-empty" }
+          }
           Label { text: "ROTATION"; font.pixelSize: 10; font.letterSpacing: 1 }
           Dial {
             Layout.fillWidth: true
@@ -176,7 +186,7 @@ Window {
           Label { text: "DOT SPACING"; font.pixelSize: 10; font.letterSpacing: 1 }
           Dial {
             Layout.fillWidth: true
-            from: 3; to: 9; value: window.spacing
+            from: 2; to: 9; stepSize: 0.5; value: window.spacing
             onMoved: window.spacing = value
           }
         }
@@ -214,7 +224,6 @@ Window {
               shadowColor: window.shade
               caseState: sample.modelData.state
               animating: false
-              dotPitch: 2.2
             }
             Label {
               Layout.alignment: Qt.AlignHCenter

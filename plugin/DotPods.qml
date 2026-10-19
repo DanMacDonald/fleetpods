@@ -1,5 +1,6 @@
 import QtQuick
 import "DotMesh.js" as Mesh
+import "DotGrid.js" as Grid
 import "artwork/AirPodsMesh.js" as AirPods
 
 // Experimental popup artwork. Animation stops when hidden or explicitly paused.
@@ -11,24 +12,69 @@ Item {
   readonly property bool lightBackground: backgroundColor.hslLightness > 0.5
   property string caseState: ""
   property bool animating: true
-  property real dotPitch: 3
+  // The popup supplies an already animated pose that survives image switches.
+  // The standalone study animates its own state changes.
+  property bool animatePodLifts: true
+  property real dotPitch: Grid.pitch
+  property real dotScale: Grid.scale
+  property real zoom: 1
+  property bool smoothSampling: false
+  property bool alignDotsToPixels: true
   property real yaw: -0.32
   property real pitch: 0.24
   property real time: 0
+  // One progress value synchronizes the standalone descent and Y-axis turn.
+  property real budsArrival: 1
+  // Return pose: 1 faces the viewer, 0 is aligned with the charging well.
+  property real leftTurn: 0
+  property real rightTurn: 0
   property real lid: caseState === "closed" ? 0 : 1
+  // 0 = docked, 1 = clear of the artwork. Keep the departing mesh until its
+  // full travel finishes, instead of removing it when caseState changes.
+  property real rightLift: caseState === "open-left" || caseState === "open-empty" ? 1 : 0
+  property real leftLift: caseState === "open-right" || caseState === "open-empty" ? 1 : 0
   readonly property real artworkTop: height * 0.17
   readonly property var geometry: AirPods.geometry
   readonly property bool animationRunning: ticker.running
   implicitWidth: 128
   implicitHeight: 128
 
-  Behavior on lid { NumberAnimation { duration: 700; easing.type: Easing.InOutCubic } }
+  Behavior on lid {
+    enabled: root.visible
+    NumberAnimation { duration: 350; easing.type: Easing.InOutCubic }
+  }
+  Behavior on rightLift {
+    id: liftBehavior
+    enabled: root.visible && root.animatePodLifts
+    NumberAnimation {
+      duration: liftBehavior.targetValue === 1 ? 840 : 420
+      easing.type: Easing.InOutCubic
+    }
+  }
+  Behavior on leftLift {
+    id: leftLiftBehavior
+    enabled: root.visible && root.animatePodLifts
+    NumberAnimation {
+      duration: leftLiftBehavior.targetValue === 1 ? 840 : 420
+      easing.type: Easing.InOutCubic
+    }
+  }
+  onVisibleChanged: if (visible) canvas.requestPaint()
   onTimeChanged: canvas.requestPaint()
+  onBudsArrivalChanged: canvas.requestPaint()
+  onLeftTurnChanged: canvas.requestPaint()
+  onRightTurnChanged: canvas.requestPaint()
   onLidChanged: canvas.requestPaint()
+  onRightLiftChanged: canvas.requestPaint()
+  onLeftLiftChanged: canvas.requestPaint()
   onCaseStateChanged: canvas.requestPaint()
   onYawChanged: canvas.requestPaint()
   onPitchChanged: canvas.requestPaint()
   onDotPitchChanged: canvas.requestPaint()
+  onDotScaleChanged: canvas.requestPaint()
+  onZoomChanged: canvas.requestPaint()
+  onSmoothSamplingChanged: canvas.requestPaint()
+  onAlignDotsToPixelsChanged: canvas.requestPaint()
   onForegroundColorChanged: canvas.requestPaint()
   onShadowColorChanged: canvas.requestPaint()
   onBackgroundColorChanged: canvas.requestPaint()
@@ -43,39 +89,44 @@ Item {
 
   Canvas {
     id: canvas
-    anchors.fill: parent
+    // Preserve the gaps between subpixel dots at the popup's small size.
+    width: root.width * 2
+    height: root.height * 2
+    scale: 0.5
+    transformOrigin: Item.TopLeft
+    smooth: true
     onPaint: {
+      if (!root.visible) return
       var ctx = getContext("2d")
       ctx.reset()
+      ctx.scale(2, 2)
       var pitch = Math.max(1.5, root.dotPitch)
-      var columns = Math.max(1, Math.floor(width / pitch))
-      var rows = Math.max(1, Math.floor(height / pitch))
+      var columns = Math.max(1, Math.floor(root.width / pitch))
+      var rows = Math.max(1, Math.floor(root.height / pitch))
       var frame = Mesh.renderFrame(root.geometry, root.caseState, root.lid, root.time,
-        root.yaw + Math.sin(root.time * 0.45) * 0.22, root.pitch, columns, rows, root.lightBackground)
+        root.yaw + Math.sin(root.time * 0.45) * 0.22, root.pitch, columns, rows, root.lightBackground, root.rightLift, root.zoom, root.leftLift, root.budsArrival, root.smoothSampling,
+        { left: root.leftTurn, right: root.rightTurn })
       var values = frame.values
-      var c = root.foregroundColor, shadow = root.shadowColor
-      // A single palette covers the whole object in each theme. All light
-      // surfaces use the same full lattice and fade into the actual background.
-      var levels = frame.tonal ? 64 : 8
-      var background = root.backgroundColor
-      var size = frame.tonal ? Math.max(1.05, pitch * 0.48) : Math.max(0.85, pitch * 0.40)
-      for (var band = 1; band <= levels; band++) {
-        if (frame.tonal) {
-          var opacity = Math.pow(band / levels, 0.75)
-          ctx.fillStyle = Qt.rgba(background.r + (c.r - background.r) * opacity,
-            background.g + (c.g - background.g) * opacity,
-            background.b + (c.b - background.b) * opacity, 1)
-        } else {
-          var mix = Math.pow(band / levels, 1.3)
-          ctx.fillStyle = Qt.rgba(shadow.r + (c.r - shadow.r) * mix,
-            shadow.g + (c.g - shadow.g) * mix, shadow.b + (c.b - shadow.b) * mix, 1)
-        }
+      var style = Mesh.dotStyle(frame.tonal, pitch, root.backgroundColor,
+        root.foregroundColor, root.shadowColor)
+      var size = Math.min(pitch * 0.85, style.size * root.dotScale)
+      // One canvas pixel is half a logical pixel at the fixed 2x resolution.
+      if (root.alignDotsToPixels) size = Math.max(0.5, Math.floor(size * 2) / 2)
+      var bands = new Uint8Array(values.length)
+      for (var i = 0; i < values.length; i++) bands[i] = style.level(values[i])
+      for (var band = 1; band <= style.levels; band++) {
+        var color = style.colors[band]
+        ctx.fillStyle = Qt.rgba(color[0], color[1], color[2], 1)
         for (var i = 0; i < values.length; i++) {
-          var level = frame.tonal ? Math.round(values[i] * levels) : Math.ceil(values[i] * levels)
-          if (level !== band) continue
+          if (bands[i] !== band) continue
           var x = (i % columns + 0.5) * pitch
           var y = (Math.floor(i / columns) + 0.5) * pitch
-          ctx.fillRect(x - size / 2, y - size / 2, size, size)
+          var left = x - size / 2, top = y - size / 2
+          if (root.alignDotsToPixels) {
+            left = Math.round(left * 2) / 2
+            top = Math.round(top * 2) / 2
+          }
+          ctx.fillRect(left, top, size, size)
         }
       }
     }
