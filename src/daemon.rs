@@ -1842,7 +1842,10 @@ impl Daemon {
             }
             return;
         }
-        let seated = self.seated_members();
+        // A laptop asking for a seat is not on the pods, whatever older
+        // evidence (a remote source report, a held peer) still names it.
+        let mut seated = self.seated_members();
+        seated.retain(|peer| *peer != message.source);
         eprintln!(
             "fleetpodsd: fleet seat request from {} control={}",
             message.source,
@@ -8751,6 +8754,54 @@ mod tests {
         let granted = daemon
             .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
         assert!(!granted.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+    }
+
+    #[test]
+    fn a_playing_helper_admits_a_requester_that_older_evidence_still_seats() {
+        use crate::fleet::members::{Fleet, GroupKey, Member};
+        use crate::fleet::route_air::{Answer, Kind, Message};
+        let now = clock();
+        let local = addr(1);
+        let requester = addr(2);
+        let pods = addr(9);
+        let mut daemon = Daemon::new("gram");
+        daemon.set_local_address(Some(local));
+        daemon.select_accessory(Some(pods));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: local, label: "gram".into() },
+                Member { address: requester, label: "xps".into() },
+            ],
+        });
+        ready(&mut daemon, now.mono);
+        // The requester was the audio source moments ago and has since
+        // dropped off; the pods now list only this laptop, which is playing.
+        daemon.note_remote(requester, now.mono);
+        daemon.note_pod_peers(vec![local], now.unix);
+        daemon.note_ownership(true, now.mono);
+        daemon.note_source(true, 2, now.mono);
+        daemon.hear_request(
+            Message {
+                kind: Kind::Request,
+                result: Answer::Ok,
+                source: requester,
+                target: local,
+                source_session: [1; 16],
+                target_session: [2; 16],
+                sequence: 1,
+                transaction: 1u64.to_be_bytes(),
+                sent: now.unix,
+                accessory: pods,
+                retain: None,
+            },
+            now,
+        );
+        let reply = daemon.read_route(&daemon.route_reply.as_ref().unwrap().packet).unwrap();
+        assert_eq!(reply.result, Answer::Ok);
+        assert_eq!(reply.retain, Some(local), "the playing laptop keeps its seat");
+        assert!(!daemon.effects.drop_link);
     }
 
     #[test]
