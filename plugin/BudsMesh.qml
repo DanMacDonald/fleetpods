@@ -31,7 +31,8 @@ Item {
     // Keep a full physical pixel of clearance when rounding glyphs away from
     // the original 200% grid, including larger whole-pixel dots at 100%.
     zoom: (0.98 - (pixelRatio === 2 ? 0 : 2 / pixelRatio / root.width)) * root.artworkScale
-    smoothSampling: true
+    // Use one sample while turning; restore the four-sample finish at rest.
+    smoothSampling: root.arrival >= 1
     yaw: 0
     pitch: 0.24
     animating: false

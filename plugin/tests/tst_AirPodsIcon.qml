@@ -219,6 +219,25 @@ TestCase {
     return [{ tag: "2px", pitch: 2 }, { tag: "3px", pitch: 3 }]
   }
 
+  function test_standaloneSmoothingReturnsAtRest() {
+    var item = createTemporaryObject(popup, this, { caseState: "" })
+    var mesh = findChild(item, "budsMesh")
+    compare(mesh.smoothSampling, true, "initial resting artwork keeps its finish")
+    for (var arrival of [0, 0.25, 0.75, 0.99]) {
+      item.budsIn = arrival
+      compare(mesh.smoothSampling, false, "moving pods use a single sample")
+    }
+    item.budsIn = 1
+    compare(mesh.smoothSampling, true, "final frame restores smooth shading")
+    item.budsIn = 0.5
+    item.visible = false
+    item.visible = true
+    compare(item.budsIn, 1)
+    compare(mesh.smoothSampling, true, "reopened artwork is settled and smoothed")
+    item.caseState = "open"
+    compare(findChild(item, "caseMesh").smoothSampling, false, "case motion already uses one sample")
+  }
+
   function test_standaloneTurnKeepsCompleteEdgeDots(data) {
     var item = createTemporaryObject(popup, this, { caseState: "" })
     findChild(item, "budsMeshArtwork").dotPitch = data.pitch
