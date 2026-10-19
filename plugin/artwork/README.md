@@ -81,6 +81,11 @@ per side at its waist, tapering smoothly into the surrounding recess walls.
 This keeps two popup-grid samples on the plastic lip instead of exposing the
 dark backing. Both renderers use this geometry; dot size and spacing are unchanged.
 
+The outer sides of the lid recess mouths extend outward by up to 0.035 model
+units, blended through the surrounding lip and walls. At the popup grid this
+extends each short dark side section upward by two rows, joining the recess
+above a seated pod while retaining the bright outer rim.
+
 The generated asset is approximately 353 KB. The complete open scene instances 9,118 triangles. Blender is only needed to regenerate assets; the plugin renders the bundled JavaScript offline.
 
 Regenerate with Blender 4.5.3:

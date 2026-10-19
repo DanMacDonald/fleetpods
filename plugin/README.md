@@ -40,6 +40,8 @@ Bar glyphs are unchanged. The popup palette selects the light or dark renderer,
 and settled artwork does not run an animation timer. Preview and scrub the
 entrance with `./tools/artwork/preview --pods-out` (also supports `--light`).
 All 3D popup states share the 3 px dot pitch and glyph weight in `DotGrid.js`.
+The light standalone pods use softer white-shell contours and volume shading
+than the case, while retaining dark vents and the same dot size.
 Dots align to the half-pixel canvas grid; artwork framing changes the mesh size,
 not the dot size or spacing. Preview controls can override the pitch.
 Dark rendering uses the approved baseline-study settings: frontal fill 0.57

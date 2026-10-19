@@ -33,12 +33,23 @@ function render(scene, view) {
   var shading = separatePods ? composeSurfaceShading(layers, shadingGroups, surfaces, columns, rows, scale)
     : surfaceShading(light, depth, normals, materials, columns, rows, scale)
   var values = stipple(light, depth, facing, columns, rows, edges, shading)
+  if (state === "") softenPodShell(values, shading, materials)
   lidMaterialBoundaries(values, shading, samples, scene, columns, rows)
   dockedPodContrast(values, shading, depth, surfaces, materials, dockedPods, columns, rows, edges, normals, cavities)
   lidRimSeparation(values, samples, scene, view)
   for (var i = 0; i < values.length; i++) values[i] = Math.max(values[i], samples.openingCoverage[i])
   dockedOpeningSeparation(values, samples, dockedPods, columns, rows)
   return { values: values, tonal: true }
+}
+
+// Standalone white pods need soft volume shading, not the case's strong ink
+// contours. Reduce the shell's contour contrast and grazing-angle shadow
+// together; actual dark vent materials and their footprints retain full ink.
+function softenPodShell(values, shading, materials) {
+  for (var i = 0; i < values.length; i++) {
+    if (materials[i] < 0.85) continue
+    values[i] = 0.65 * shading[i] + 0.45 * Math.max(0, values[i] - shading[i])
+  }
 }
 
 // A dark matte lid socket already defines its edge against white plastic. Crease

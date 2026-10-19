@@ -137,6 +137,23 @@ def smooth_lid_divider(obj):
     print(f'{obj.name}: smoothed {np.count_nonzero(displacement)} inner divider vertices')
 
 
+def smooth_lid_recess_sides(obj):
+    # Carry the outer socket walls farther up their curved mouths. At popup
+    # density this joins the two low dark samples to the recess above, rather
+    # than leaving a short isolated notch beside a seated pod.
+    unit = abs(obj.matrix_world.to_scale().x) * 20
+    points = np.array([tuple(v.co) for v in obj.data.vertices]) * unit
+    weight = smooth_falloff(abs(abs(points[:, 0]) - 1.0), 0.04, 0.13)
+    weight *= smooth_falloff(abs(-points[:, 1] - 0.43), 0.055, 0.19)
+    weight *= smooth_falloff(abs(points[:, 2]), 0.01, 0.16)
+    displacement = np.sign(points[:, 0]) * 0.035 * weight
+    for i in np.flatnonzero(abs(displacement) > 1e-8):
+        obj.data.vertices[int(i)].co.x += displacement[i] / unit
+    obj.data.update()
+    obj['artwork_lid_recess_side_extension'] = 0.035
+    print(f'{obj.name}: smoothed {np.count_nonzero(displacement)} outer recess vertices')
+
+
 def smooth_lid_skirt(obj):
     # Blend the shallow groove and underside lip into the dome. Its outer wall
     # steps inward and back out before joining the dome; at dot-grid scale
@@ -290,6 +307,7 @@ for name in ('earbuds.001', 'earbuds.002'):
     edit_vent(bpy.data.objects[name])
 straighten_lid_rim(bpy.data.objects['top '])
 smooth_lid_divider(bpy.data.objects['top '])
+smooth_lid_recess_sides(bpy.data.objects['top '])
 smooth_lid_skirt(bpy.data.objects['top '])
 darken_recesses(bpy.data.objects['top '], True)
 darken_recesses(bpy.data.objects['buttom'], False)
