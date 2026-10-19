@@ -48,7 +48,13 @@ pub fn parse(packet: &[u8]) -> Option<Report> {
             "playingApp" => {
                 let value = string(&mut body)?;
                 if value != "Unknown" {
-                    app = Some(!value.is_empty() && value != "NA");
+                    // Dictation (`com.apple.inputmethod.ironwood`) names itself
+                    // the playing app while it only holds the microphone.
+                    app = Some(
+                        !value.is_empty()
+                            && value != "NA"
+                            && !value.starts_with("com.apple.inputmethod."),
+                    );
                 }
             }
             "hostStreamingState" => {
@@ -216,9 +222,12 @@ mod tests {
     #[test]
     fn playback_relays_bind_sender_and_prefer_the_app_over_streaming() {
         let sender = Address::parse("D0:C6:37:2F:D0:9F").unwrap();
-        for (app, stream, expected) in
-            [("NA", "NO", false), ("com.brave.Browser", "NO", true), ("Unknown", "YES", true)]
-        {
+        for (app, stream, expected) in [
+            ("NA", "NO", false),
+            ("com.brave.Browser", "NO", true),
+            ("Unknown", "YES", true),
+            ("com.apple.inputmethod.ironwood", "YES", false),
+        ] {
             let mut body = vec![1, 0xe2];
             put_string(&mut body, "playingApp");
             put_string(&mut body, app);
