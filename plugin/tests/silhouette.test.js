@@ -92,7 +92,7 @@ for (const state of ['open', 'open-left']) {
   for (let x = 23; x <= 56; x++) {
     let top = 0
     while (!frame[top * n + x] && top < n) top++
-    check(frame[top * n + x] > 0.9, 'lid outline stays crisp')
+    check(frame[top * n + x] > 0.89, 'thinner lid outline stays visible')
     check(frame[(top + 1) * n + x] <= 0.025, 'recess must have a pale row below the outline')
   }
 }

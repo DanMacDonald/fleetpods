@@ -993,6 +993,9 @@ Item {
     // A connected seat carries its connector up to the ellipse: as dim as the ellipse in the background, lit with the audio.
     Rectangle {
       objectName: "seatJoin" + seat.title
+      // Preserve the selected fractional width on both sides of the gutter.
+      // Without antialiasing, pixel rounding can make one join a pixel thinner.
+      antialiasing: true
       readonly property real joinTop: y
       readonly property real joinBottom: y + height
       visible: seat.connectorConnected
@@ -1009,6 +1012,7 @@ Item {
     // The other device in a pair is connected too, so its connector is as bright as the glowing device's.
     Rectangle {
       objectName: "seatJoinSecond" + seat.title
+      antialiasing: true
       visible: seat.drawnConnected && !!seat.occupantTwo
       z: 1
       width: seat.linkWidth

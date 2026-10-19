@@ -1,9 +1,42 @@
+// Light artwork preset selected in the interactive study (2026-10-19).
 .import "Raster.js" as Raster
+.import "CoveredDeck.js" as CoveredDeck
+
+function defaults() {
+  return {
+    "exteriorWidth": 0.3,
+    "exteriorOutline": 2,
+    "interiorWidth": 0,
+    "interiorOutline": 0.77,
+    "outline": 1.5,
+    "podOutline": 0.45,
+    "podShading": 0.63,
+    "surfaceShading": 2,
+    "frontalLight": 0.87,
+    "lightX": -0.13,
+    "lightY": 0.27,
+    "softness": 1.14,
+    "contactShadows": 0.98,
+    "recessRelief": 0.38,
+    "recessShade": 0.64,
+    "ventInk": 1,
+    "paletteCurve": 0.85,
+    "dotPitch": 3,
+    "dotSize": 2
+  }
+}
 
 // Light-background renderer: matte volumes, geometric contours, and pale
 // docked shells. All light-specific policy lives here; the rasterizer only
 // supplies projected surface samples. render(scene, view) is the entry point.
 function render(scene, view) {
+  var settings = defaults()
+  // Recolor matte recesses for light mode without changing shared geometry or
+  // the dark renderer's material values.
+  scene = scene.map(function(part) {
+    if (!part.mesh.matte || part.shade >= 0.95) return part
+    return Object.assign({}, part, {shade: settings.recessShade})
+  })
   var columns = view.columns, rows = view.rows, scale = view.scale
   var state = view.state, lid = view.lid
   var separatePods = state !== "" && lid > 0.03
@@ -30,25 +63,31 @@ function render(scene, view) {
   // Inside the finger bevel, the part join is a soft contact shadow. Its two
   // outer boundaries carry the outline instead of a third solid center line.
   for (var i = 0; i < edges.length; i++) edges[i] = Math.max(traced.interior[i] ? 0 : edges[i], traced.edges[i])
-  var shading = separatePods ? composeSurfaceShading(layers, shadingGroups, surfaces, columns, rows, scale)
-    : surfaceShading(light, depth, normals, materials, columns, rows, scale)
-  var values = stipple(light, depth, facing, columns, rows, edges, shading)
-  if (state === "") softenPodShell(values, shading, materials)
+  var shading = separatePods ? composeSurfaceShading(layers, shadingGroups, surfaces, columns, rows, scale, settings)
+    : surfaceShading(light, depth, normals, materials, columns, rows, scale, settings)
+  var values = stipple(light, depth, facing, columns, rows, edges, shading, settings)
+  if (state === "") softenPodShell(values, shading, materials, settings)
   lidMaterialBoundaries(values, shading, samples, scene, columns, rows)
   dockedPodContrast(values, shading, depth, surfaces, materials, dockedPods, columns, rows, edges, normals, cavities)
   lidRimSeparation(values, samples, scene, view)
   for (var i = 0; i < values.length; i++) values[i] = Math.max(values[i], samples.openingCoverage[i])
   dockedOpeningSeparation(values, samples, dockedPods, columns, rows)
+  for (var i = 0; i < values.length; i++) {
+    if (materials[i] <= 0.2 && samples.depth[i] !== -100) values[i] *= settings.ventInk
+    values[i] = Math.max(0, Math.min(1, values[i]))
+  }
+  CoveredDeck.blend(values, samples, view)
   return { values: values, tonal: true }
 }
 
 // Standalone white pods need soft volume shading, not the case's strong ink
 // contours. Reduce the shell's contour contrast and grazing-angle shadow
 // together; actual dark vent materials and their footprints retain full ink.
-function softenPodShell(values, shading, materials) {
+function softenPodShell(values, shading, materials, settings) {
+  settings = settings || defaults()
   for (var i = 0; i < values.length; i++) {
     if (materials[i] < 0.85) continue
-    values[i] = 0.65 * shading[i] + 0.45 * Math.max(0, values[i] - shading[i])
+    values[i] = settings.podShading * shading[i] + settings.podOutline * Math.max(0, values[i] - shading[i])
   }
 }
 
@@ -154,7 +193,7 @@ function vertexTone(n, shade) {
 // Continuous ink fades into the actual background, on a full dot lattice.
 function dotStyle(pitch, background, shadow) {
   return { levels: 64, size: Math.max(1.05, pitch * 0.48), base: background,
-    exponent: 0.75, level: function(value) { return Math.round(value * 64) } }
+    exponent: defaults().paletteCurve, level: function(value) { return Math.round(value * 64) } }
 }
 
 // The closed lid/body join is one shallow, mostly horizontal boundary. Trace
@@ -186,12 +225,13 @@ function closedCaseSeam(edges, depth, surfaces, columns, rows) {
 // Shade complete layers first, then select the visible surface's tone. Masking
 // before the neighborhood passes removes cavity samples near overlaps and
 // creates a light halo. Hidden samples can support shading, but never draw.
-function composeSurfaceShading(layers, groups, surfaces, columns, rows, scale) {
+function composeSurfaceShading(layers, groups, surfaces, columns, rows, scale, settings) {
+  settings = settings || defaults()
   var result = new Float32Array(surfaces.length)
   for (var group = 0; group < layers.length; group++) {
     var layer = layers[group]
     if (!layer) continue
-    var tone = surfaceShading(null, layer.depth, layer.normals, layer.materials, columns, rows, scale)
+    var tone = surfaceShading(null, layer.depth, layer.normals, layer.materials, columns, rows, scale, settings)
     for (var i = 0; i < result.length; i++) {
       if (groups[surfaces[i]] === group) result[i] = tone[i]
     }
@@ -361,10 +401,11 @@ function featureEdges(depth, normals, surfaces, columns, rows, sharpOnly) {
 // A fixed broad frontal light describes matte volumes. The white shoulder
 // keeps well-lit faces bare; there is no specular lobe or curvature gate that
 // can turn a smooth surface into disconnected bright bands.
-function matteTone(nx, ny, nz) {
-  var diffuse = Math.max(0, -0.18 * nx + 0.24 * ny + 0.9539392014 * nz)
+function matteTone(nx, ny, nz, settings) {
+  settings = settings || defaults()
+  var diffuse = Math.max(0, settings.lightX * nx + settings.lightY * ny + 0.9539392014 * settings.frontalLight * nz)
   var shadow = Math.max(0, Math.min(1, (0.84 - diffuse) / 0.74))
-  return Math.pow(shadow, 1.25) * 0.85
+  return Math.pow(shadow, settings.softness) * 0.85 * settings.surfaceShading
 }
 
 // Shallow bevels can carry relief in their normals even when their depth
@@ -424,7 +465,8 @@ function recessTone(depth, normals, columns, rows, scale) {
 // Local occlusion comes from visible geometry rising above the surface's
 // tangent plane. Convex shells and flat faces do not occlude themselves.
 // This is a small screen-space approximation, not a baked lighting texture.
-function surfaceShading(light, depth, normals, materials, columns, rows, scale) {
+function surfaceShading(light, depth, normals, materials, columns, rows, scale, settings) {
+  settings = settings || defaults()
   var density = new Float32Array(depth.length)
   var relief = recessTone(depth, normals, columns, rows, scale)
   var radius = Math.max(2, Math.round(scale * 0.18))
@@ -457,10 +499,10 @@ function surfaceShading(light, depth, normals, materials, columns, rows, scale) 
           * Math.max(0, 1 - distance / reach)
       }
       var ambient = Math.max(0, occlusion / directions.length * 3.0 - 0.035)
-      var tone = matteTone(nx, ny, nz)
+      var tone = matteTone(nx, ny, nz, settings)
       // Blend contact shadow smoothly instead of selecting between competing
       // shading fields, which can leave seams across an otherwise smooth face.
-      var volume = Math.min(0.9, tone + (ambient * 0.65 + relief[i]) * (1 - tone))
+      var volume = Math.min(0.9, tone + (ambient * 0.65 * settings.contactShadows + relief[i] * settings.recessRelief) * (1 - tone))
       // Material reflectance is shared with the dark renderer. Gray plastic
       // adds ink while retaining its diffuse/occlusion gradients; white
       // plastic keeps its existing volume shading.
@@ -497,8 +539,11 @@ function silhouetteDistance(depth, columns, rows) {
 
 // Every visible surface uses continuous tone, including the darkest vents.
 // White faces merge into the background; silhouettes remain one-dot contours.
-function stipple(light, depth, facing, columns, rows, features, shading) {
+function stipple(light, depth, facing, columns, rows, features, shading, settings) {
+  settings = settings || defaults()
   var dots = new Float32Array(light.length)
+  var exterior = new Float32Array(light.length)
+  var interior = new Float32Array(light.length)
   var boundary = silhouetteDistance(depth, columns, rows)
   for (var y = 0; y < rows; y++) {
     for (var x = 0; x < columns; x++) {
@@ -514,12 +559,64 @@ function stipple(light, depth, facing, columns, rows, features, shading) {
         var j = neighbors[k]
         if (depth[j] !== -100 && depth[i] - depth[j] > 0.16 && boundary[i] > 2) edge = Math.max(edge, 0.92)
       }
-      if (edge > 0) { dots[i] = edge; continue }
+      if (boundary[i] === 1) exterior[i] = edge
+      else interior[i] = edge
       // No random rejection or per-part palette: each grid sample carries
       // its tone all the way to the painter, including very faint values.
       dots[i] = shading ? shading[i]
         : Math.pow(Math.max(0, Math.min(1, (0.28 - light[i]) / 0.25)), 1.8)
     }
   }
+  // Classify before changing width, so an internal part boundary cannot turn
+  // into an exterior outline just because its stroke expands toward the rim.
+  var outside = outlineLayer(exterior, columns, rows, settings.exteriorWidth)
+  var inside = outlineLayer(interior, columns, rows, settings.interiorWidth)
+  var outerOpacity = Math.min(1, settings.exteriorWidth)
+  var innerOpacity = Math.min(1, settings.interiorWidth)
+  for (var i = 0; i < dots.length; i++) {
+    if (depth[i] === -100) continue
+    // Width controls the spatial footprint; strength controls ink within it.
+    // Fractional widths represent coverage, never a smaller glyph.
+    var hasOuter = outside.coverage[i] > 0 && settings.exteriorOutline > 0
+    var hasInner = inside.coverage[i] > 0 && settings.interiorOutline > 0
+    var outer = settings.exteriorOutline * (outside.ink[i] - dots[i] * outside.coverage[i]) * outerOpacity
+    var inner = settings.interiorOutline * (inside.ink[i] - dots[i] * inside.coverage[i]) * innerOpacity
+    // Keep the stronger stroke where the bands overlap, without double ink.
+    var contrast = hasOuter && hasInner ? Math.max(outer, inner)
+      : hasOuter ? outer : hasInner ? inner : 0
+    dots[i] += settings.outline * contrast
+  }
   return dots
+}
+
+function outlineLayer(outlines, columns, rows, width) {
+  var mask = new Float32Array(outlines.length)
+  for (var i = 0; i < mask.length; i++) mask[i] = outlines[i] > 0 ? 1 : 0
+  return {ink: resizeOutlines(outlines, columns, rows, width),
+    coverage: resizeOutlines(mask, columns, rows, width)}
+}
+
+// Expand the one-dot contour by a fractional radius. Interpolate adjacent
+// integer-radius footprints so the grid never jumps or changes dot size.
+// Below one dot, the unresolved stroke covers only part of each edge sample.
+// Material openings and volume shading are not part of this contour layer.
+function resizeOutlines(source, columns, rows, width) {
+  if (width <= 0) return new Float32Array(source.length)
+  if (width <= 1) return source
+  var radius = (width - 1) / 2
+  var inner = Math.floor(radius), outer = Math.ceil(radius), blend = radius - inner
+  var result = new Float32Array(source.length)
+  for (var y = 0; y < rows; y++) for (var x = 0; x < columns; x++) {
+    var near = 0, far = 0
+    for (var dy = -outer; dy <= outer; dy++) for (var dx = -outer; dx <= outer; dx++) {
+      if (Math.abs(dx) + Math.abs(dy) > outer) continue
+      var sx = x + dx, sy = y + dy
+      if (sx < 0 || sx >= columns || sy < 0 || sy >= rows) continue
+      var value = source[sy * columns + sx]
+      far = Math.max(far, value)
+      if (Math.abs(dx) + Math.abs(dy) <= inner) near = Math.max(near, value)
+    }
+    result[y * columns + x] = near + (far - near) * blend
+  }
+  return result
 }

@@ -262,14 +262,30 @@ Item {
     }
   }
 
-  NumberAnimation {
+  ParallelAnimation {
     id: budsDrop
-    target: root
-    property: "budsIn"
-    from: 0
-    to: 1
-    duration: root.usesMeshBuds ? 494 : 414
-    easing.type: Easing.Linear
+    readonly property int travelMs: root.pixelArt && root.dotted ? 494 : 414
+    // Animator writes its current position back when interrupted. A returning
+    // case (or a reopened popup) must start at its own resting baseline.
+    onStopped: artworkMotion.y = 0
+    NumberAnimation {
+      target: root
+      property: "budsIn"
+      from: 0
+      to: 1
+      duration: budsDrop.travelMs
+      easing.type: Easing.Linear
+    }
+    // The light renderer can spend several display frames shading a pose.
+    // Move its existing texture on the scene graph independently of those
+    // GUI-thread updates, while rotation follows the same linear timeline.
+    YAnimator {
+      target: artworkMotion
+      from: -root.iconSize
+      to: 0
+      duration: budsDrop.travelMs
+      easing.type: Easing.Linear
+    }
   }
 
   Image {
@@ -402,14 +418,20 @@ Item {
     sourceComponent: PopupPalette { foregroundColor: root.color }
   }
 
-  Loader {
-    id: pixelArtwork
-    active: root.usesPixelArt && artworkPalette.item !== null
+  Item {
+    id: artworkMotion
+    objectName: "artworkMotion"
     width: root.iconSize
     height: root.iconSize
-    y: root.isCase ? root.caseOut * root.iconSize : (1 - root.budsIn) * -root.iconSize
-    sourceComponent: root.usesMeshCase ? meshCaseComponent
-      : root.usesMeshBuds ? meshBudsComponent : pixelComponent
+    Loader {
+      id: pixelArtwork
+      active: root.usesPixelArt && artworkPalette.item !== null
+      width: root.iconSize
+      height: root.iconSize
+      y: root.isCase ? root.caseOut * root.iconSize : 0
+      sourceComponent: root.usesMeshCase ? meshCaseComponent
+        : root.usesMeshBuds ? meshBudsComponent : pixelComponent
+    }
   }
 
   Component {

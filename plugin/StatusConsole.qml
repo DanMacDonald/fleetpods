@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls
 import qs.Commons
+import qs.Commons as Commons
 import "Model.js" as Model
 
 Rectangle {
@@ -14,6 +15,12 @@ Rectangle {
   // Device names in a log line are drawn in this colour so they stand apart from the message.
   property var deviceNames: []
   property color nameColor: foreground
+  property color background: Commons.Color.popups.background
+  readonly property bool lightMode: background.hslLightness > foreground.hslLightness
+  // Monochrome themes still need the log's semantic colors.
+  readonly property color errorColor: lightMode && urgent.hslSaturation < 0.1 ? "#b42332" : urgent
+  readonly property color deviceColor: lightMode && nameColor.hslSaturation < 0.1 ? "#245fa8" : nameColor
+  readonly property color audioColor: lightMode ? "#245fa8" : "#6aa9ff"
   property string guidanceText: ""
   readonly property bool showingGuidance: guidanceText !== ""
   property bool expanded: false
@@ -22,7 +29,7 @@ Rectangle {
   readonly property int padding: Style.space(12)
   readonly property color muted: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.6)
   readonly property color ruleColor: Qt.rgba(foreground.r, foreground.g, foreground.b, 0.18)
-  readonly property color success: Qt.hsla(0.4, 0.35, foreground.hslLightness, 1)
+  readonly property color success: Qt.hsla(0.4, 0.35, Math.max(0.4, Math.min(0.8, foreground.hslLightness)), 1)
   readonly property real collapsedHeight: Math.max(Style.space(22), latestStatus.implicitHeight) + padding * 2
   implicitHeight: showingGuidance ? Math.max(collapsedHeight, statusGuidance.implicitHeight + padding)
     : expanded ? activityHeading.y + activityHeading.height + Style.space(14)
@@ -49,7 +56,7 @@ Rectangle {
   function styledText(row) {
     // StyledText collapses ordinary padding spaces. Preserve the three dot
     // positions so the retry count stays put throughout the animation.
-    var text = Model.deviceNameMarkup(messageText(row), root.deviceNames, root.nameColor)
+    var text = Model.deviceNameMarkup(messageText(row), root.deviceNames, root.deviceColor)
     if (row && row.live && row.detail && !row.retryPeer)
       text = text.replace(/ {2,}/g, function (spaces) { return "&nbsp;".repeat(spaces.length) })
     return text
@@ -175,7 +182,7 @@ Rectangle {
           width: parent.width
           text: root.styledText(root.latest)
           textFormat: Text.StyledText
-          color: root.latest && root.latest.kind === "error" ? root.urgent : root.foreground
+          color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.space(11)
           elide: Text.ElideRight
@@ -321,7 +328,7 @@ Rectangle {
         anchors.right: parent.right
         textFormat: Text.StyledText
         text: root.styledText(entry.row)
-        color: entry.row && entry.row.kind === "error" ? root.urgent : root.foreground
+        color: root.foreground
         font.family: root.fontFamily
         font.pixelSize: Style.space(11)
         wrapMode: Text.Wrap
@@ -352,8 +359,8 @@ Rectangle {
       running: statusSymbol.visible && statusSymbol.active && statusSymbol.stateName === "retry"
       onStopped: statusSymbol.rotation = 0
     }
-    readonly property color ink: stateName === "error" ? root.urgent : stateName === "success" ? root.success
-      : stateName === "audio" ? "#6aa9ff" : root.muted
+    readonly property color ink: stateName === "error" ? root.errorColor : stateName === "success" ? root.success
+      : stateName === "audio" ? root.audioColor : root.muted
     width: Style.space(14)
     height: width
     Rectangle {

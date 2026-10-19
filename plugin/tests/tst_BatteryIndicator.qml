@@ -7,6 +7,20 @@ TestCase {
   when: windowShown
   Component { id: indicator; Pods.BatteryIndicator { width: 64; height: implicitHeight } }
   Component { id: seats; Pods.SeatsView { width: 440; height: implicitHeight } }
+  function test_healthyChargeStaysGreenAcrossThemes() {
+    var item = createTemporaryObject(indicator, this, { level: 80 })
+    compare(item.fillColor, Qt.hsla(0.4, 0.6, item.foreground.hslLightness, 1))
+    for (var foreground of ["#000000", "#242424", "#ffffff"]) {
+      item.foreground = foreground
+      verify(item.fillColor.g > item.fillColor.r + 0.1)
+      verify(item.fillColor.g > item.fillColor.b + 0.1)
+      verify(item.fillColor.hslLightness >= 0.39)
+      verify(item.fillColor.hslLightness <= 0.81)
+      item.level = 9
+      compare(item.fillColor, item.lowColor)
+      item.level = 80
+    }
+  }
   function test_caseTransitionKeepsLayout_data() {
     return [{ tag: "left pod in case", state: "open-left" },
       { tag: "right pod in case", state: "open-right" }]

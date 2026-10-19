@@ -6,7 +6,7 @@ qml_runner="${QML_BIN:-/usr/lib/qt6/bin/qml}"
 
 if [[ "${1:-}" == --help ]]; then
   cat <<'USAGE'
-Usage: tools/artwork/preview [--light] [--fresnel | --pods-out | --open | --closed | --right-out | --left-out | --empty] [--capture]
+Usage: tools/artwork/preview [--light] [--light-study | --fresnel | --pods-out | --open | --closed | --right-out | --left-out | --empty] [--capture]
 
 Open the standalone FleetPods artwork study. No daemon or connected pods needed.
 Use QML_BIN to override the Qt 6 qml executable.
@@ -15,12 +15,17 @@ For a headless still:
   QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software tools/artwork/preview --light --open --capture
 
 Captures: /tmp/fleetpods-dotmesh-light.png or /tmp/fleetpods-dotmesh.png
+Light renderer controls: tools/artwork/preview --light-study
+Light study capture: /tmp/fleetpods-light-study.png
 USAGE
   exit 0
 fi
 
 study_file=DotPodsPreview.qml
 for study_arg in "$@"; do
+  if [[ "$study_arg" == --light-study ]]; then
+    exec env QT_QUICK_CONTROLS_STYLE=Basic "$qml_runner" "$study_root/tools/artwork/light/Study.qml" -- "$@"
+  fi
   if [[ "$study_arg" == --fresnel ]]; then
     exec "$qml_runner" "$study_root/tools/artwork/fresnel/Study.qml" -- "$@"
   fi

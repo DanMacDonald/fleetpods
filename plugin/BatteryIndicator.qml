@@ -7,7 +7,8 @@ Item {
   property string label: ""
   property color foreground: "#a9b1d6"
   property color lowColor: "#f7768e"
-  property color healthyColor: Qt.hsla(0.4, 0.6, foreground.hslLightness, 1)
+  // Keep the green visible even when a light theme uses a black foreground.
+  property color healthyColor: Qt.hsla(0.4, 0.6, Math.max(0.4, Math.min(0.8, foreground.hslLightness)), 1)
   property string fontFamily: ""
   property string unknownCaption: ""
   property real ringSize: 28

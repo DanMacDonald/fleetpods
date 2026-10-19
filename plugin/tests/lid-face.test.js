@@ -3,6 +3,8 @@ import { loadQmlJs } from '../../tools/artwork/load_qml_js.js'
 const Mesh = loadQmlJs(new URL('../DotMesh.js', import.meta.url))
 const Raster = loadQmlJs(new URL('../rendering/Raster.js', import.meta.url))
 const Dark = loadQmlJs(new URL('../rendering/Dark.js', import.meta.url))
+const Light = loadQmlJs(new URL('../rendering/Light.js', import.meta.url))
+const CoveredDeck = loadQmlJs(new URL('../rendering/CoveredDeck.js', import.meta.url))
 const source = Deno.readTextFileSync(new URL('../artwork/AirPodsMesh.js', import.meta.url))
 const geometry = new Function(source.replace(/^\.pragma library\s*/, '') + '; return geometry')()
 function check(condition, message) { if (!condition) throw new Error(message) }
@@ -16,6 +18,7 @@ for (const size of [64, 71, 80, 96, 128]) for (const yaw of [-0.1, 0, 0.1]) {
   const scene = Mesh.parts(geometry, 'closed', 0, 0)
   const raw = Raster.rasterize(scene, view, { vertexTone: Dark.vertexTone, surfaceData: true })
   const closed = Dark.render(scene, view).values
+  const closedInk = Light.render(scene, view).values
   const up = Raster.rotate(0, 1, 0, view.pitch, yaw, 0)
   for (let i = 0; i < closed.length; i++) {
     if (raw.surfaces[i] !== 1 || raw.light[i] < 0.6) continue
@@ -26,10 +29,26 @@ for (const size of [64, 71, 80, 96, 128]) for (const yaw of [-0.1, 0, 0.1]) {
     const below = closed[i + size]
     check(Math.abs(closed[i] - below) < 0.04,
       `covered deck must join the shell without a dark pinhole at ${size} cells, sample ${i}`)
+    check(Math.abs(closedInk[i] - closedInk[i + size]) < 0.04,
+      `covered deck must join the light shell without dark flecks at ${size} cells, sample ${i}`)
     shadowedDeck++
   }
 }
 check(shadowedDeck > 10, 'exercise visible deck slivers at multiple grid sizes and angles')
+
+// Lid coverage fades the correction; actual openings and other parts keep
+// their own tone. Exercise both light and dark starting values.
+for (const ink of [false, true]) for (const lid of [0, 0.075, 0.15, 1]) {
+  const deck = ink ? 0.9 : 0.8, shell = ink ? 0.25 : 0.4
+  const values = new Float32Array([deck, deck, deck, shell, shell, shell])
+  const samples = {surfaces: [1, 2, 3, 1, 2, 3],
+    normals: [0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1]}
+  CoveredDeck.blend(values, samples, {state: 'open', lid, columns: 3, rows: 2, pitch: 0, yaw: 0})
+  const expected = deck + Math.max(0, 1 - lid / 0.15) * (shell - deck)
+  check(Math.abs(values[0] - expected) < 1e-6, 'covered deck fades continuously during closing')
+  check(Math.abs(values[1] - deck) < 1e-6 && Math.abs(values[2] - deck) < 1e-6,
+    'lid and pod surfaces must not receive case-deck correction')
+}
 
 // At popup density, the socket wall used to run directly into the top outline.
 // Keep the white plastic lip readable without bleaching the socket below it.
@@ -39,7 +58,7 @@ for (const size of [80, 96, 128]) {
     const x = Math.floor(size * fraction)
     let y = 0
     while (y < size && frame[y * size + x] === 0) y++
-    check(frame[y * size + x] > 0.9, 'keep the lid silhouette crisp')
+    check(frame[y * size + x] > 0.89, 'keep the thinner lid silhouette visible')
     check(frame[(y + 1) * size + x] <= 0.04,
       `keep a pale row between outline and socket at ${size} cells, column ${x}`)
     const interior = [2, 3, 4, 5].map(dy => frame[(y + dy) * size + x])

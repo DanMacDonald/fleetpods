@@ -44,6 +44,40 @@ TestCase {
   }
 
   // 2026-10-12: device names stand apart from the rest of a log line.
+  function test_lightThemeKeepsSemanticColors_data() {
+    return [
+      { tag: "connected", kind: "connection", event: "connected", color: "success" },
+      { tag: "recovered", kind: "success", event: "", color: "success" },
+      { tag: "error", kind: "error", event: "", color: "errorColor" },
+      { tag: "audio", kind: "audio", event: "audioOn", color: "audioColor" },
+      { tag: "audio moved", kind: "audio", event: "audioTaken", color: "audioColor" }
+    ]
+  }
+  function test_lightThemeKeepsSemanticColors(data) {
+    rows.clear()
+    append({ time: "16:00:00", message: "Activity on laptop-a", kind: data.kind,
+      live: false, detail: "", eventKind: data.event })
+    var item = createTemporaryObject(consoleView, this, {
+      foreground: "black", background: "white", urgent: "#2a2a2a",
+      nameColor: "#6e6e6e", deviceNames: ["laptop-a"], expanded: true
+    })
+    wait(50)
+    var color = item[data.color]
+    var textColor = item.foreground
+    verify(color.hslSaturation > 0.3)
+    compare(String(findChild(item, "latestStatus").color), String(textColor))
+    compare(String(findChild(item, "headerSymbol").ink), String(color))
+    compare(String(findChild(item, "statusLine").color), String(textColor))
+    compare(String(findChild(item, "statusSymbol").ink), String(color))
+    verify(item.styledText({ message: "Activity on laptop-a" }).indexOf('<font color="#245fa8">laptop-a</font>') >= 0)
+    item.foreground = "#a9b1d6"
+    item.background = "#1a1b26"
+    compare(item.deviceColor, item.nameColor)
+    compare(item.errorColor, item.urgent)
+    compare(findChild(item, "latestStatus").color, item.foreground)
+    compare(findChild(item, "statusLine").color, item.foreground)
+  }
+
   function test_deviceNamesAreColoured() {
     rows.clear()
     append({ time: "16:53:43", message: "Omarchy Fleet connection switched to omarchy-xps.", kind: "status",
@@ -219,7 +253,7 @@ TestCase {
     compare(item.expanded, false)
     var latest = findChild(item, "latestStatus")
     compare(latest.text, "Latest message")
-    compare(latest.color, "#ff0000")
+    compare(latest.color, item.foreground)
     compare(findChild(item, "statusMessages").visible, false)
     var collapsedHeight = item.height
     mouseClick(findChild(item, "statusToggle"))

@@ -5,6 +5,7 @@ import ".." as Pods
 import "../DotMesh.js" as Mesh
 import "../rendering/Raster.js" as Raster
 import "../Model.js" as Model
+import qs.Commons as Commons
 
 TestCase {
   name: "AirPodsIconSeats"
@@ -17,6 +18,47 @@ TestCase {
 
   Component { id: icon; Pods.AirPodsIcon { iconSize: 24; variant: "pro" } }
   Component { id: popup; Pods.AirPodsIcon { iconSize: 128; variant: "pro"; pixelArt: true } }
+  Component { id: motionMarker; Rectangle { x: 2; y: 96; width: 3; height: 3; color: "#ff00ff" } }
+
+  function test_standaloneDescentUsesConstantScreenVelocity_data() {
+    return [{tag: "dark", background: "#1a1b26"}, {tag: "light", background: "#ffffff"}]
+  }
+
+  function test_standaloneDescentUsesConstantScreenVelocity(data) {
+    var previous = Commons.Color.popups.background
+    Commons.Color.popups.background = data.background
+    try {
+      var item = createTemporaryObject(popup, this, {caseState: "closed", iconSize: 64, clip: false})
+      var motion = findChild(item, "artworkMotion")
+      createTemporaryObject(motionMarker, motion)
+      item.caseState = ""
+      var points = []
+      for (var step = 0; step < 3; step++) {
+        wait(90)
+        var image = grabImage(this), found = -1
+        for (var y = 0; y < 110; y++) {
+          if (image.red(3, y) > 240 && image.green(3, y) < 20 && image.blue(3, y) > 240) {
+            found = y
+            break
+          }
+        }
+        verify(found >= 0, "the scene-graph marker stays visible during the drop")
+        points.push({y: found, time: Date.now()})
+      }
+      for (var i = 1; i < points.length; i++) {
+        var travel = points[i].y - points[i - 1].y
+        var expected = 64 * (points[i].time - points[i - 1].time) / 494
+        verify(Math.abs(travel - expected) < 6,
+          "screen-space descent stays linear: moved " + travel + ", expected " + expected)
+      }
+      tryCompare(item, "budsIn", 1, 1200)
+      compare(motion.y, 0, "translation finishes exactly at its resting baseline")
+      item.caseState = "open-left"
+      compare(motion.y, 0, "returning to the case cannot inherit the entrance offset")
+    } finally {
+      Commons.Color.popups.background = previous
+    }
+  }
 
   function test_popupGridStaysConsistentAcrossStates() {
     for (var size of [128, 160]) {
@@ -116,6 +158,7 @@ TestCase {
 
   function test_returnInterruptsStandaloneEntrance() {
     var item = createTemporaryObject(popup, this, { caseState: "open-empty" })
+    createTemporaryObject(motionMarker, findChild(item, "artworkMotion"))
     item.caseState = ""
     tryCompare(item, "caseExiting", false, 600)
     wait(160)
@@ -126,6 +169,10 @@ TestCase {
     tryCompare(mesh, "rightLift", 0, 1300)
     compare(mesh.leftLift, 1)
     compare(item.budsIn, 1)
+    waitForRendering(item)
+    var image = grabImage(item)
+    verify(image.red(3, 96) > 240 && image.green(3, 96) < 20 && image.blue(3, 96) > 240,
+      "interrupting the render-thread drop restores the case's screen-space baseline")
   }
 
   function test_caseExitWaitsForLastPodAndCanBeInterrupted() {
@@ -193,6 +240,9 @@ TestCase {
           }
           var point = mesh.mapToItem(item, x, y)
           // Entry starts above the slot; only visible rows can crop at its sides.
+          // mapToItem sees resting QML coordinates, not the YAnimator's
+          // scene-graph transform. Project this pose's translation explicitly.
+          point.y -= (1 - arrival) * item.iconSize
           if (arrival < 1 && (point.y + size / 2 < 0 || point.y - size / 2 > item.height)) continue
           verify(point.x - size / 2 >= 0 && point.x + size / 2 <= item.width,
             "turning tips must not crop the outer dot columns at arrival " + arrival + ", light=" + light + ", x=" + point.x + ", size=" + size)

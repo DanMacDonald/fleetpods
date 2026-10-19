@@ -1,0 +1,21 @@
+{
+  "exteriorWidth": 0.3,
+  "exteriorOutline": 2,
+  "interiorWidth": 0,
+  "interiorOutline": 0.77,
+  "outline": 1.5,
+  "podOutline": 0.45,
+  "podShading": 0.63,
+  "surfaceShading": 2,
+  "frontalLight": 0.87,
+  "lightX": -0.13,
+  "lightY": 0.27,
+  "softness": 1.14,
+  "contactShadows": 0.98,
+  "recessRelief": 0.38,
+  "recessShade": 0.64,
+  "ventInk": 1,
+  "paletteCurve": 0.85,
+  "dotPitch": 3,
+  "dotSize": 2
+}

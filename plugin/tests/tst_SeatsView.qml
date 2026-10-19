@@ -1332,6 +1332,41 @@ TestCase {
     compare(findChild(item, "omarchySeat").drawnConnected, true)
   }
 
+  function test_pairedConnectorsHaveEqualPaintedWidth_data() {
+    return [
+      { tag: "light", foreground: "#000000", background: "#ffffff" },
+      { tag: "dark", foreground: "#a9b1d6", background: "#1a1b26" }
+    ]
+  }
+  function test_pairedConnectorsHaveEqualPaintedWidth(data) {
+    // The software backend ignores Rectangle antialiasing. Measure the same
+    // GPU rasterization used by the live shell (QT_QUICK_BACKEND=rhi).
+    if (GraphicsInfo.api === GraphicsInfo.Software)
+      skip("Fractional stroke coverage requires the GPU renderer")
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var item = createTemporaryObject(view, this, { connectedToOmarchy: true, omarchyOwnsAudio: true,
+      foreground: data.foreground, screenFill: data.background,
+      omarchyDevices: [gram, xps], activeDeviceAddress: gram.address })
+    wait(700)
+    var seat = findChild(item, "omarchySeat")
+    var active = findChild(item, "seatJoinOmarchy"), other = findChild(item, "seatJoinSecondOmarchy")
+    compare(active.width, seat.linkWidth)
+    compare(other.width, seat.linkWidth)
+    var shot = grabImage(seat)
+    var scale = Math.round(shot.width / seat.width)
+    function paintedWidth(join) {
+      var y = Math.floor((join.y + join.height / 2) * scale), sum = 0
+      var background = shot.red(Math.floor(join.x * scale) - 3, y)
+      var contrast = Math.abs(background - item.foreground.r * 255)
+      for (var x = Math.floor(join.x * scale) - 2; x <= Math.ceil((join.x + join.width) * scale) + 2; ++x)
+        sum += Math.abs(shot.red(x, y) - background) / contrast
+      return sum / scale
+    }
+    fuzzyCompare(paintedWidth(active), seat.linkWidth, 0.1)
+    fuzzyCompare(paintedWidth(other), seat.linkWidth, 0.1)
+  }
+
   // 2026-10-04: a connected seat extends its connector to the ellipse and glows where they meet.
   function test_connectedSeatJoinsAndGlowsAtTheConnector() {
     var item = createTemporaryObject(view, this)
