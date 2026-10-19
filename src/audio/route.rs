@@ -216,6 +216,16 @@ impl RouteState {
         true
     }
 
+    /// Take over streams muted elsewhere as already quieted, with their
+    /// original state, so routing restores them instead of saving them muted.
+    pub fn adopt_quieted(&mut self, streams: Vec<StreamSnap>) {
+        for saved in streams {
+            if self.quieted.insert((saved.id, saved.generation)) {
+                self.held.push(saved);
+            }
+        }
+    }
+
     pub fn finish_recovery(&mut self, id: u64, ok: bool) -> bool {
         if !self.recovery.as_ref().is_some_and(|r| r.id == id && r.resetting) {
             return false;
@@ -834,6 +844,19 @@ pub fn managed(stream: &LiveStream) -> bool {
     }
     let role = stream.role.to_ascii_lowercase();
     role != "event" && role != "notification"
+}
+
+/// Audible playback streams on the accessory's output.
+pub fn audible_on_accessory(graph: &Graph, accessory: Address) -> Vec<StreamSnap> {
+    let Some(sink) = sink_for(graph, accessory) else {
+        return Vec::new();
+    };
+    graph
+        .streams
+        .iter()
+        .filter(|stream| stream.sink == sink.name && managed(stream))
+        .map(snap)
+        .collect()
 }
 
 fn snap(stream: &LiveStream) -> StreamSnap {

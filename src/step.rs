@@ -23,6 +23,11 @@ const REBUILD_PAUSE_MS: u64 = 500;
 /// How long after losing the pods this laptop may still release its idle
 /// AirPods output early, so the pods start the new owner's audio sooner.
 const RELEASE_OUTPUT_MS: u64 = 3_000;
+/// Audio a player sent before it paused drains within this time.
+const HANDOFF_DRAIN_MS: u64 = 150;
+/// Streams muted at a handoff are unmuted by then even if a player keeps
+/// playing, so audio this laptop cannot pause is silent only briefly.
+const HANDOFF_MUTE_MS: u64 = 600;
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
@@ -610,6 +615,7 @@ impl Daemon {
         if !self.mark_control_ready(generation) {
             return;
         }
+
         if let Some(peer) = self.peers_seated.first().copied() {
             self.note_alongside(peer, now.unix);
         }
@@ -758,9 +764,63 @@ impl Daemon {
         }
         if self.connection.stage() == Stage::Ready && self.output.want {
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
+            self.mute_for_handoff(now);
             self.step_back(now);
             self.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
         }
+    }
+
+    /// Mute what plays to the pods before players are paused and their
+    /// streams follow the default back to the speakers. A player keeps
+    /// playing for a moment after Pause, and that audio would come out there.
+    fn mute_for_handoff(&mut self, now: Clock) {
+        let (Some(accessory), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
+        else {
+            return;
+        };
+        for saved in crate::audio::route::audible_on_accessory(graph, accessory) {
+            if self
+                .handoff_muted
+                .iter()
+                .any(|s| (s.id, s.generation) == (saved.id, saved.generation))
+            {
+                continue;
+            }
+            self.effects.mute_streams.push(crate::audio::route::StreamTarget {
+                id: saved.id,
+                generation: saved.generation,
+            });
+            self.handoff_muted.push(saved);
+        }
+        if !self.handoff_muted.is_empty() {
+            self.handoff_muted_at.get_or_insert(now.mono);
+            self.handoff_quiet_since = None;
+        }
+    }
+
+    /// Unmute handoff streams once players have been paused long enough to
+    /// drain, or hand them to a new claim that will restore them itself.
+    fn pace_handoff_mute(&mut self, now: Clock) {
+        let Some(muted_at) = self.handoff_muted_at else {
+            return;
+        };
+        if self.output.want {
+            self.output.adopt_quieted(std::mem::take(&mut self.handoff_muted));
+        } else {
+            let quiet = if self.audio.local_playing() {
+                self.handoff_quiet_since = None;
+                false
+            } else {
+                let since = *self.handoff_quiet_since.get_or_insert(now.mono);
+                now.mono.saturating_since(since) >= HANDOFF_DRAIN_MS
+            };
+            if !quiet && now.mono.saturating_since(muted_at) < HANDOFF_MUTE_MS {
+                return;
+            }
+            self.effects.restore_pending.extend(std::mem::take(&mut self.handoff_muted));
+        }
+        self.handoff_muted_at = None;
+        self.handoff_quiet_since = None;
     }
 
     fn link_failed(&mut self, generation: Generation, busy: bool, now: Clock) {
@@ -1019,8 +1079,13 @@ impl Daemon {
                 )));
             }
         }
+        self.pace_handoff_mute(now);
         if !self.effects.restore_pending.is_empty() {
             effects.push(Effect::Restore(std::mem::take(&mut self.effects.restore_pending)));
+        }
+        if !self.effects.mute_streams.is_empty() {
+            // Ahead of the pause and the default switch in this step.
+            effects.insert(0, Effect::MuteStreams(std::mem::take(&mut self.effects.mute_streams)));
         }
         // The Router ordered this work; translate it in one place. A quiet
         // still leads the whole step, before any control write.

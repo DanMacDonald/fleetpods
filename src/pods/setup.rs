@@ -249,6 +249,7 @@ pub struct Setup {
     pending_ears: Option<(u8, u8)>,
     saw_battery: bool,
     saw_ears: bool,
+    saw_roster: bool,
     ready: bool,
     halves: [Option<Half>; 2],
 }
@@ -262,6 +263,7 @@ impl Setup {
             pending_ears: None,
             saw_battery: false,
             saw_ears: false,
+            saw_roster: false,
             ready: false,
             halves: [None, None],
         }
@@ -282,8 +284,11 @@ impl Setup {
         if let Some(report) = parse_report(packet) {
             self.note_report(report, &mut events);
         }
+        // Pods playing for another computer report battery and who is
+        // connected at once, but may hold ears until something changes. That
+        // would stall a takeover here until the setup times out.
         if self.saw_battery
-            && self.saw_ears
+            && (self.saw_ears || self.saw_roster)
             && !self.ready
             && matches!(self.phase, Phase::Notifications | Phase::Live)
         {
@@ -335,7 +340,12 @@ impl Setup {
             Report::Noise(mode) => events.push(Event::Noise(mode)),
             Report::Identity { name, model } => events.push(Event::Identity { name, model }),
             Report::Keys { irk, encryption } => events.push(Event::Keys { irk, encryption }),
-            Report::PodPeers { peers, owner } => events.push(Event::PodPeers { peers, owner }),
+            Report::PodPeers { peers, owner } => {
+                if matches!(self.phase, Phase::Notifications | Phase::Live) {
+                    self.saw_roster = true;
+                }
+                events.push(Event::PodPeers { peers, owner });
+            }
         }
     }
 
@@ -678,6 +688,25 @@ mod tests {
             let mut malformed = battery;
             malformed[8] = 0;
             assert!(parse_report(&malformed).is_none());
+        }
+    }
+
+    #[test]
+    fn battery_and_the_connected_list_complete_setup_when_ears_never_arrive() {
+        // XPS, 2026-10-19: a laptop not playing to the pods got the connected
+        // list and battery within a second of subscribing, but no ears report.
+        let roster = [0x04, 0x00, 0x04, 0x00, 0x2e, 0x00, 0x01, 0x02, 0x00];
+        for subscribed in [true, false] {
+            let mut setup = Setup::new();
+            setup.start();
+            setup.observe(&handshake_ack());
+            if subscribed {
+                setup.observe(&features_ack());
+            }
+            assert!(!setup.observe(&roster).1.contains(&Event::Ready));
+            let events = setup.observe(&sample_battery()).1;
+            assert_eq!(events.contains(&Event::Ready), subscribed, "only after subscribing");
+            assert!(!setup.observe(&sample_ears()).1.contains(&Event::Ready), "ready once");
         }
     }
 

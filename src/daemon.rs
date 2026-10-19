@@ -53,6 +53,7 @@ pub(crate) struct PendingEffects {
     pub follow_link: bool,
     pub announce_dirty: bool,
     pub restore_pending: Vec<StreamSnap>,
+    pub mute_streams: Vec<crate::audio::route::StreamTarget>,
 }
 
 pub struct Daemon {
@@ -125,6 +126,12 @@ pub struct Daemon {
     /// Until then, release the AirPods output once it goes idle after the
     /// pods moved to another computer.
     pub(crate) release_output_until: Option<MonoMs>,
+    /// Streams muted as the pods moved away, with their original state, so
+    /// audio already sent does not play out on the speakers.
+    pub(crate) handoff_muted: Vec<StreamSnap>,
+    pub(crate) handoff_muted_at: Option<MonoMs>,
+    /// When every local player was last seen paused since that mute.
+    pub(crate) handoff_quiet_since: Option<MonoMs>,
     /// Rebuild again even though Pulse reports the sink running.
     pub(crate) force_rearm: bool,
     pub(crate) output_restart_serial: u64,
@@ -327,6 +334,9 @@ impl Daemon {
             resume_players: Vec::new(),
             resumed_players: Vec::new(),
             release_output_until: None,
+            handoff_muted: Vec::new(),
+            handoff_muted_at: None,
+            handoff_quiet_since: None,
             force_rearm: false,
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
@@ -7079,7 +7089,65 @@ mod tests {
     }
 
     #[test]
-    fn remote_takeover_pauses_players_without_muting_uncontrolled_streams() {
+    fn a_handoff_mute_is_lifted_even_if_a_player_keeps_playing_or_is_handed_to_a_new_claim() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let graph = Graph {
+            default_sink: "pods".into(),
+            sinks: vec![
+                Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                },
+                Sink { name: "speakers".into(), address: None, profile: None },
+            ],
+            cards: Vec::new(),
+            streams: vec![LiveStream {
+                id: 1,
+                generation: 11,
+                sink: "pods".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 0.8,
+                corked: false,
+            }],
+        };
+        for reclaim in [false, true] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            ready_link(&mut daemon, now);
+            daemon.audio.startup_players(&[PlayerSeen {
+                service: "org.mpris.MediaPlayer2.brave".into(),
+                playing: true,
+            }]);
+            daemon.output.want = true;
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            assert_eq!(daemon.handoff_muted.len(), 1);
+            if reclaim {
+                // A new claim restores the stream itself, with its original state.
+                daemon.output.want = true;
+                daemon.step(Input::Tick, at(10));
+                assert!(daemon.handoff_muted.is_empty());
+                assert!(daemon.output.held.iter().any(|s| s.id == 1 && !s.mute && s.volume == 0.8));
+                continue;
+            }
+            // The player never reports a pause.
+            daemon.audio.set_local_playing_for_test(true);
+            let early = daemon.step(Input::Tick, at(400));
+            assert!(!early.effects.iter().any(|e| matches!(e, Effect::Restore(_))));
+            let late = daemon.step(Input::Tick, at(600));
+            assert!(late.effects.iter().any(|e| matches!(e, Effect::Restore(s) if s.len() == 1)));
+        }
+    }
+
+    #[test]
+    fn remote_takeover_mutes_streams_only_until_paused_players_drain() {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::step::{Effect, Input};
@@ -7119,9 +7187,10 @@ mod tests {
         daemon.step(Input::Audio(graph.clone()), now);
         let yielded = daemon
             .step(Input::Observation(crate::pods::observe::Observation::Ownership(false)), now);
+        // Muted ahead of the pause, so audio a player sends before it stops
+        // does not follow the default to the speakers.
         assert!(
-            !yielded.effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))),
-            "uncontrolled browser streams must remain audible rather than advance silently"
+            matches!(yielded.effects.first(), Some(Effect::MuteStreams(streams)) if streams.len() == 2)
         );
         assert!(yielded
             .effects
@@ -7146,6 +7215,10 @@ mod tests {
             .effects
             .iter()
             .any(|e| matches!(e, Effect::MuteStreams(_) | Effect::Restore(_))));
+        // Uncontrolled streams are unmuted once paused players have drained.
+        let drained = daemon.step(Input::Tick, Clock::new(now.mono.0 + 150, now.unix.0 + 150));
+        assert!(drained.effects.iter().any(|e| matches!(e,
+            Effect::Restore(streams) if streams.len() == 2 && streams.iter().all(|s| !s.mute))));
         assert!(daemon.output.held.is_empty());
         assert!(!daemon.output.want);
         let peer = addr(4);
