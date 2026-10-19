@@ -14,9 +14,15 @@ use crate::types::{Address, Battery, Clock, Generation, MonoMs};
 use crate::daemon::{host_id, Daemon};
 
 /// How long after an output rebuild audio must be streaming to the pods.
-const REARM_VERIFY_MS: u64 = 1_500;
+const REARM_VERIFY_MS: u64 = 2_500;
 /// Rebuilds after a failed start, per grant.
 const REARM_RETRY_LIMIT: u8 = 2;
+/// A player that pauses this soon after a rebuilt output came back paused
+/// because its stream was moved, not because the user asked.
+const REBUILD_PAUSE_MS: u64 = 500;
+/// How long after losing the pods this laptop may still release its idle
+/// AirPods output early, so the pods start the new owner's audio sooner.
+const RELEASE_OUTPUT_MS: u64 = 3_000;
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
@@ -215,6 +221,13 @@ pub enum Effect {
     },
     /// Pause these MPRIS players. The daemon already decided the seat was given away.
     PausePlayers(Vec<String>),
+    /// Play these MPRIS players again. They paused themselves while the
+    /// AirPods output was rebuilt under them.
+    ResumePlayers(Vec<String>),
+    /// Suspend this idle output so its Bluetooth audio stops now.
+    SuspendOutput {
+        name: String,
+    },
     /// The daemon is not holding the link. Attach the control socket if the accessory is already up.
     FollowLink,
     /// Publish the microphone source for this accessory. `description` is the name the panel shows.
@@ -312,6 +325,7 @@ impl Daemon {
                         // A rebuilt node can fail to start if the pods were not
                         // ready yet; check that audio actually flows.
                         self.rearm_verify_at = Some(now.mono.saturating_add(REARM_VERIFY_MS));
+                        self.rebuild_pause_until = Some(now.mono.saturating_add(REBUILD_PAUSE_MS));
                     }
                     self.replan(now);
                 }
@@ -533,8 +547,26 @@ impl Daemon {
                 None
             }
             Input::Player { service, playing } => {
+                if playing == Some(false)
+                    && self.output.want
+                    && self.audio.player_playing(&service)
+                    && (self.output.recovering()
+                        || self.rebuild_pause_until.is_some_and(|until| now.mono.0 < until.0))
+                    && !self.resume_players.contains(&service)
+                {
+                    eprintln!("fleetpodsd: player {service:?} paused during the AirPods rebuild; resuming it");
+                    self.resume_players.push(service.clone());
+                }
                 let after_yield = self.audio.yielded();
-                if self.audio.update_player(&service, playing) {
+                // Our own Play continues the claim already in progress.
+                let resumed = playing == Some(true)
+                    && self
+                        .resumed_players
+                        .iter()
+                        .position(|s| s == &service)
+                        .map(|at| self.resumed_players.remove(at))
+                        .is_some();
+                if self.audio.update_player(&service, playing) && !resumed {
                     eprintln!("fleetpodsd: player {service:?} reported new Playing state (after_yield={after_yield})");
                     self.claim_playback(now);
                 }
@@ -727,6 +759,7 @@ impl Daemon {
         if self.connection.stage() == Stage::Ready && self.output.want {
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
             self.step_back(now);
+            self.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
         }
     }
 
@@ -876,7 +909,30 @@ impl Daemon {
         }
         let players = std::mem::take(&mut self.effects.pause_players);
         if !players.is_empty() {
+            // Pausing is the daemon's own decision; do not undo it.
+            self.resume_players.clear();
             effects.push(Effect::PausePlayers(players));
+        }
+        if let Some(until) = self.release_output_until {
+            if self.output.want || !self.transport_active || now.mono.0 >= until.0 {
+                self.release_output_until = None;
+            } else if let Some(idle) = self.output_health.outputs.iter().find(|output| {
+                output.address.is_some() && output.address == accessory && output.state != 0
+            }) {
+                // Paused players have left the output. PipeWire would keep
+                // streaming silence to the pods for another second or so.
+                eprintln!("fleetpodsd: releasing the idle AirPods output for the new owner");
+                effects.push(Effect::SuspendOutput { name: idle.name.clone() });
+                self.release_output_until = None;
+            }
+        }
+        if !self.output.want {
+            self.resume_players.clear();
+            self.resumed_players.clear();
+        } else if !self.resume_players.is_empty() && !self.output.recovering() {
+            let players = std::mem::take(&mut self.resume_players);
+            self.resumed_players.clone_from(&players);
+            effects.push(Effect::ResumePlayers(players));
         }
         if self.effects.drop_link {
             self.effects.drop_link = false;

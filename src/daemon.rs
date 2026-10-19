@@ -116,6 +116,15 @@ pub struct Daemon {
     /// When to check that a rebuilt output actually started.
     pub(crate) rearm_verify_at: Option<MonoMs>,
     pub(crate) rearm_retries: u8,
+    /// Until then, a player pausing itself is a side effect of the rebuild.
+    pub(crate) rebuild_pause_until: Option<MonoMs>,
+    /// Players to play again once the output rebuild is done.
+    pub(crate) resume_players: Vec<String>,
+    /// Players this daemon just played again; their Playing is not a new claim.
+    pub(crate) resumed_players: Vec<String>,
+    /// Until then, release the AirPods output once it goes idle after the
+    /// pods moved to another computer.
+    pub(crate) release_output_until: Option<MonoMs>,
     /// Rebuild again even though Pulse reports the sink running.
     pub(crate) force_rearm: bool,
     pub(crate) output_restart_serial: u64,
@@ -314,6 +323,10 @@ impl Daemon {
             transport_active: false,
             rearm_verify_at: None,
             rearm_retries: 0,
+            rebuild_pause_until: None,
+            resume_players: Vec::new(),
+            resumed_players: Vec::new(),
+            release_output_until: None,
             force_rearm: false,
             output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
@@ -7027,6 +7040,45 @@ mod tests {
     }
 
     #[test]
+    fn losing_the_pods_releases_the_output_once_paused_players_leave_it() {
+        use crate::audio::health::Output;
+        use crate::audio::play::PlayerSeen;
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let output = |state| Output {
+            name: "pods".into(),
+            index: 7,
+            address: Some(addr(3)),
+            profile: Some("a2dp-sink".into()),
+            state,
+            muted: false,
+            audible_volume: true,
+        };
+        let released = |effects: &[Effect]| {
+            effects.iter().any(|e| matches!(e, Effect::SuspendOutput { name } if name == "pods"))
+        };
+        for streaming in [true, false] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            ready_link(&mut daemon, now);
+            daemon.audio.startup_players(&[PlayerSeen {
+                service: "org.mpris.MediaPlayer2.brave".into(),
+                playing: true,
+            }]);
+            daemon.output.want = true;
+            daemon.step(Input::Transport { active: streaming }, now);
+            daemon.step(Input::Outputs(vec![output(0)]), now);
+            let lost = daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            assert!(!released(&lost.effects), "players still on the output");
+            let idle = daemon.step(Input::Outputs(vec![output(1)]), at(30));
+            assert_eq!(released(&idle.effects), streaming);
+            let again = daemon.step(Input::Outputs(vec![output(1)]), at(60));
+            assert!(!released(&again.effects), "released once");
+        }
+    }
+
+    #[test]
     fn remote_takeover_pauses_players_without_muting_uncontrolled_streams() {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -7131,6 +7183,49 @@ mod tests {
     }
 
     #[test]
+    fn a_player_that_pauses_itself_as_the_output_is_rebuilt_is_played_again() {
+        use crate::audio::play::PlayerSeen;
+        use crate::step::{Effect, Input};
+        let brave = "org.mpris.MediaPlayer2.brave";
+        let resumed = |effects: &[Effect]| {
+            effects.iter().any(|e| matches!(e, Effect::ResumePlayers(names) if names == &[brave]))
+        };
+        // Within the window after a rebuild, outside it, and after the
+        // daemon itself gave the seat away.
+        for (after_ms, step_back, expect) in
+            [(100, false, true), (600, false, false), (100, true, false)]
+        {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.audio.startup_players(&[PlayerSeen { service: brave.into(), playing: true }]);
+            daemon.output.want = true;
+            daemon.step(Input::OutputRestarted { id: 0, ok: true }, now);
+            daemon.rebuild_pause_until = Some(now.mono.saturating_add(500));
+            if step_back {
+                daemon.step_back(now);
+            }
+            let later = Clock::new(now.mono.0 + after_ms, now.unix.0 + after_ms);
+            let paused =
+                daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, later);
+            assert_eq!(
+                resumed(&paused.effects),
+                expect,
+                "after {after_ms} ms, step_back={step_back}"
+            );
+            if expect {
+                // Our own Play continues the claim; it does not start another.
+                let serial = daemon.output_restart_serial;
+                let resume_output = daemon.resume_output_on_grant;
+                daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, later);
+                assert_eq!(daemon.output_restart_serial, serial);
+                assert_eq!(daemon.resume_output_on_grant, resume_output);
+                assert!(daemon.resumed_players.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn a_rebuilt_output_that_never_streams_is_rebuilt_again_a_bounded_number_of_times() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::pods::observe::Observation;
@@ -7174,7 +7269,7 @@ mod tests {
             let mut serial = daemon.output_restart_serial;
             let mut rebuilds = 0;
             for round in 0..4u64 {
-                let base = round * 2_000;
+                let base = round * 3_000;
                 if round == 0 {
                     daemon.step(Input::Observation(Observation::Ownership(true)), at(base));
                 } else {

@@ -42,6 +42,8 @@ pub enum Op {
         stream: StreamTarget,
     },
     Restore(StreamSnap),
+    /// Suspend this sink and let it resume, so an idle output stops now.
+    Suspend(String),
     /// Make this capture node the default source.
     DefaultSource(String),
     /// Select this codec profile on the card the audio server named.
@@ -413,6 +415,7 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
         eprintln!("fleetpodsd: PipeWire is not available");
         return;
     };
+    open_pw_cli();
     let dirty = Arc::new(AtomicBool::new(true));
     arm_subscribe(&mut pulse.context, &dirty);
     let mut subscribed = false;
@@ -530,9 +533,10 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
     }
     for ((id, generation), object_id) in soft_mutes {
         if generation_ok(&cached, &StreamTarget { id, generation }) {
-            set_soft_mute(object_id, false);
+            soft_mute_once(object_id, false);
         }
     }
+    close_pw_cli();
 }
 
 extern "C" fn poll_with_wake(
@@ -616,6 +620,12 @@ fn apply(
                     let _ = intro.move_sink_input_by_name(stream.id, sink, None);
                 }
             }
+            Op::Suspend(name) => {
+                // Applied in order: the second call only allows a later
+                // stream to start the output again.
+                let _ = intro.suspend_sink_by_name(name, true, None);
+                let _ = intro.suspend_sink_by_name(name, false, None);
+            }
             Op::DefaultSource(name) => {
                 let shown = name.clone();
                 let _ = context.set_default_source(name, move |ok| {
@@ -684,7 +694,18 @@ fn apply(
 /// A Pulse mute is saved as the application's future mute setting. PipeWire's
 /// softMute only silences this node. Pulse doesn't report it, so the worker
 /// overlays confirmed holds on its graph and clears them before shutting down.
+///
+/// A takeover mutes a stream that may already be playing on the speakers.
+/// The command first goes to a pw-cli kept open, which applies it within a
+/// few milliseconds; starting pw-cli takes 10-15 ms. That pw-cli reports
+/// nothing back, so a one-off pw-cli then applies it again and confirms it.
 fn set_soft_mute(object_id: u32, muted: bool) -> bool {
+    let line = format!("set-param {object_id} Props {{ softMute: {muted} }}\n");
+    send_pw_cli(&line);
+    soft_mute_once(object_id, muted)
+}
+
+fn soft_mute_once(object_id: u32, muted: bool) -> bool {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
     let value = if muted { "{ softMute: true }" } else { "{ softMute: false }" };
@@ -718,6 +739,67 @@ fn set_soft_mute(object_id: u32, muted: bool) -> bool {
             }
         }
     }
+}
+
+struct PwCli {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+}
+
+static PW_CLI: Mutex<Option<PwCli>> = Mutex::new(None);
+
+fn spawn_pw_cli() -> Option<PwCli> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("pw-cli")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdin = child.stdin.take()?;
+    Some(PwCli { child, stdin })
+}
+
+/// Write one command to the open pw-cli. One that has exited is replaced for
+/// the next command: a pw-cli just started drops commands until it has read
+/// the registry.
+fn send_pw_cli(line: &str) {
+    use std::io::Write;
+    let Ok(mut open) = PW_CLI.lock() else {
+        return;
+    };
+    if let Some(cli) = open.as_mut() {
+        if matches!(cli.child.try_wait(), Ok(None))
+            && cli.stdin.write_all(line.as_bytes()).and_then(|()| cli.stdin.flush()).is_ok()
+        {
+            return;
+        }
+    }
+    if let Some(mut stale) = open.take() {
+        let _ = stale.child.kill();
+        let _ = stale.child.wait();
+    }
+    *open = spawn_pw_cli();
+}
+
+/// Start pw-cli ahead of the first takeover so it is ready by then.
+fn open_pw_cli() {
+    if let Ok(mut open) = PW_CLI.lock() {
+        if open.is_none() {
+            *open = spawn_pw_cli();
+        }
+    }
+}
+
+/// End the open pw-cli. It does not exit at the end of its input.
+fn close_pw_cli() {
+    let Some(PwCli { mut child, stdin }) = PW_CLI.lock().ok().and_then(|mut open| open.take())
+    else {
+        return;
+    };
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Off the event loop. Always attempt resume, even if suspension fails.

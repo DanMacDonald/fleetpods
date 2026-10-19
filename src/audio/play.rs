@@ -215,6 +215,10 @@ impl Audio {
         self.local_playing = playing;
     }
 
+    pub fn player_playing(&self, service: &str) -> bool {
+        self.known_players.get(service).copied().unwrap_or(false)
+    }
+
     pub fn local_playing(&self) -> bool {
         self.local_playing
     }

@@ -52,9 +52,13 @@ pub fn random_bytes(buf: &mut [u8]) -> io::Result<()> {
     Ok(())
 }
 
-pub fn poll_in(fd: i32, timeout_ms: i32) -> io::Result<bool> {
-    let mut fd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-    let rc = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
+/// Wait for `fd` or `wake`. Reports whether `fd` is readable.
+pub fn poll_in_or_wake(fd: i32, wake: Option<i32>, timeout_ms: i32) -> io::Result<bool> {
+    let mut fds = [
+        libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: wake.unwrap_or(-1), events: libc::POLLIN, revents: 0 },
+    ];
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
     if rc < 0 {
         let err = io::Error::last_os_error();
         if err.kind() == io::ErrorKind::Interrupted {
@@ -62,5 +66,5 @@ pub fn poll_in(fd: i32, timeout_ms: i32) -> io::Result<bool> {
         }
         return Err(err);
     }
-    Ok(rc > 0)
+    Ok(fds[0].revents != 0)
 }

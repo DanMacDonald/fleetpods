@@ -61,6 +61,9 @@ pub struct Session {
     daemon: Daemon,
     radio: Option<Radio>,
     reports: Receiver<Input>,
+    /// Poked for every report, so the process loop handles it at once
+    /// instead of at its next timer.
+    reports_wake: Option<Wake>,
     audio: Option<pipewire::Handle>,
     players: Option<players::Handle>,
     secrets: Option<Sender<SecretJob>>,
@@ -90,7 +93,7 @@ impl Radio {
 
 impl Session {
     pub fn start(name: impl Into<String>) -> Self {
-        let (reports_tx, reports_rx) = mpsc::channel();
+        let (reports_tx, reports_rx, reports_wake) = waking_reports();
         let configured = configured_accessory();
         let radio = spawn_radio(reports_tx.clone(), configured);
         let audio = pipewire::spawn(reports_tx.clone());
@@ -104,6 +107,7 @@ impl Session {
             daemon,
             radio,
             reports: reports_rx,
+            reports_wake,
             audio,
             players,
             secrets,
@@ -252,7 +256,15 @@ impl Session {
         }
     }
 
+    /// Readable when a report waits for [`Session::poll`].
+    pub fn wake_fd(&self) -> Option<std::os::fd::RawFd> {
+        self.reports_wake.as_ref().map(Wake::raw)
+    }
+
     pub fn poll(&mut self, now: Clock) {
+        if let Some(wake) = &self.reports_wake {
+            wake.drain();
+        }
         while let Ok(input) = self.reports.try_recv() {
             let outcome = self.daemon.step(input, now);
             self.perform(&outcome.effects, now);
@@ -395,6 +407,16 @@ impl Session {
             Effect::PausePlayers(names) => {
                 if let Some(players) = &self.players {
                     players.pause(names.clone());
+                }
+            }
+            Effect::SuspendOutput { name } => {
+                if let Some(audio) = &self.audio {
+                    audio.send(vec![Op::Suspend(name.clone())]);
+                }
+            }
+            Effect::ResumePlayers(names) => {
+                if let Some(players) = &self.players {
+                    players.play(names.clone());
                 }
             }
             Effect::Disconnect { accessory } => self.radio(Job::Disconnect { address: *accessory }),
@@ -556,6 +578,31 @@ struct PendingCall {
     serial: u32,
     kind: CallKind,
     sent: Instant,
+}
+
+/// Worker threads report through the returned sender. A relay forwards each
+/// report and pokes the wake, so a blocked process loop sees it immediately.
+fn waking_reports() -> (Sender<Input>, Receiver<Input>, Option<Wake>) {
+    let (raw_tx, raw_rx) = mpsc::channel();
+    let Ok((wake, relay_wake)) = Wake::pair() else {
+        return (raw_tx, raw_rx, None);
+    };
+    let (tx, rx) = mpsc::channel();
+    let relay = thread::Builder::new().name("fleetpods-reports".into()).spawn(move || {
+        while let Ok(input) = raw_rx.recv() {
+            if tx.send(input).is_err() {
+                break;
+            }
+            relay_wake.poke();
+        }
+    });
+    match relay {
+        Ok(_) => (raw_tx, rx, Some(wake)),
+        Err(_) => {
+            let (raw_tx, raw_rx) = mpsc::channel();
+            (raw_tx, raw_rx, None)
+        }
+    }
 }
 
 fn spawn_radio(reports: Sender<Input>, configured: Option<Address>) -> Option<Radio> {
@@ -2055,6 +2102,7 @@ mod fleet_reset_tests {
             daemon,
             radio: None,
             reports,
+            reports_wake: None,
             audio: None,
             players: None,
             secrets: Some(jobs),

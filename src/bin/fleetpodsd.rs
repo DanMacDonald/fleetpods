@@ -60,7 +60,7 @@ fn main() {
         if let Err(err) = publish(&paths.status, &session.status(boot.clock()), &mut published) {
             eprintln!("fleetpodsd: {err}");
         }
-        match os::poll_in(listener.as_raw_fd(), 200) {
+        match os::poll_in_or_wake(listener.as_raw_fd(), session.wake_fd(), 200) {
             Ok(false) => continue,
             Ok(true) => {}
             Err(err) => {

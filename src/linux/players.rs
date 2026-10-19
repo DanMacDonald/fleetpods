@@ -20,6 +20,7 @@ use std::thread::JoinHandle;
 enum Job {
     Stop,
     Pause(Vec<String>),
+    Play(Vec<String>),
 }
 
 pub struct Handle {
@@ -34,6 +35,14 @@ impl Handle {
             return;
         }
         let _ = self.jobs.send(Job::Pause(names));
+        self.wake.poke();
+    }
+
+    pub fn play(&self, names: Vec<String>) {
+        if names.is_empty() {
+            return;
+        }
+        let _ = self.jobs.send(Job::Play(names));
         self.wake.poke();
     }
 
@@ -104,7 +113,12 @@ fn drain_jobs(jobs: &Receiver<Job>, bus: &Connection) -> bool {
             Ok(Job::Stop) | Err(mpsc::TryRecvError::Disconnected) => return false,
             Ok(Job::Pause(names)) => {
                 for name in names {
-                    pause_player(bus, &name);
+                    call_player(bus, &name, "Pause");
+                }
+            }
+            Ok(Job::Play(names)) => {
+                for name in names {
+                    call_player(bus, &name, "Play");
                 }
             }
             Err(mpsc::TryRecvError::Empty) => return true,
@@ -112,15 +126,17 @@ fn drain_jobs(jobs: &Receiver<Job>, bus: &Connection) -> bool {
     }
 }
 
-fn pause_player(bus: &Connection, service: &str) {
+fn call_player(bus: &Connection, service: &str, method: &str) {
     let proxy = bus.with_proxy(service, "/org/mpris/MediaPlayer2", Duration::from_millis(200));
-    eprintln!("fleetpodsd: media command source=fleetpods player={service:?} method=Pause sent");
+    eprintln!("fleetpodsd: media command source=fleetpods player={service:?} method={method} sent");
     let called: Result<(), dbus::Error> =
-        proxy.method_call("org.mpris.MediaPlayer2.Player", "Pause", ());
+        proxy.method_call("org.mpris.MediaPlayer2.Player", method, ());
     match called {
-        Ok(()) => eprintln!("fleetpodsd: media command player={service:?} method=Pause accepted"),
+        Ok(()) => {
+            eprintln!("fleetpodsd: media command player={service:?} method={method} accepted")
+        }
         Err(err) => {
-            eprintln!("fleetpodsd: media command player={service:?} method=Pause failed: {err}")
+            eprintln!("fleetpodsd: media command player={service:?} method={method} failed: {err}")
         }
     }
 }

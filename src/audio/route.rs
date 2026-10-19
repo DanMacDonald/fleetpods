@@ -107,6 +107,11 @@ impl RouteState {
         self.restore_sent.retain(|key| self.held.iter().any(|s| (s.id, s.generation) == *key));
     }
 
+    /// Streams are parked while the accessory output is rebuilt.
+    pub fn recovering(&self) -> bool {
+        self.recovery.is_some()
+    }
+
     pub fn holding_takeover(&self) -> bool {
         self.takeover_started.is_some()
     }
