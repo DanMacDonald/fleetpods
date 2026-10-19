@@ -3,9 +3,10 @@ use crate::support::World;
 #[test]
 fn a11_both_laptops_fill_seats_without_cancelling() {
     let mut world = World::pair();
+    world.open_case();
+    world.settle();
     world.command("gram", "activity");
     world.command("xps", "activity");
-    world.open_case();
     world.settle();
     assert_eq!(world.connect_attempts("gram"), 0);
     assert_eq!(world.connect_attempts("xps"), 0);
@@ -25,8 +26,9 @@ fn a11_both_laptops_fill_seats_without_cancelling() {
 #[test]
 fn a12_a_transient_connect_retries_in_the_open() {
     let mut world = World::single();
-    world.command("gram", "activity");
     world.open_case();
+    world.settle();
+    world.command("gram", "activity");
     world.settle();
     assert_eq!(world.connect_attempts("gram"), 0);
     world.advance(2_000);
@@ -45,6 +47,24 @@ fn a12_a_transient_connect_retries_in_the_open() {
     assert_eq!(world.connect_attempts("gram"), 2);
     assert_eq!(world.stage("gram"), "ready");
     assert_eq!(world.status("gram")["control_connection"]["reason"], "");
+}
+
+#[test]
+fn an_idle_laptop_observes_an_open_case_without_joining_the_active_peer() {
+    let mut world = World::joined_pair();
+    world.close_case();
+    world.settle();
+    world.open_case();
+    world.settle();
+    world.command("xps", "activity");
+    world.run_for(60_000);
+    assert!(world.seat_up("xps"));
+    assert!(!world.seat_up("gram"));
+    assert_eq!(world.connect_attempts("gram"), 0);
+    // Local input still joins through the connected fleet helper.
+    world.command("gram", "activity");
+    world.run_for(5_000);
+    assert!(world.seat_up("gram"));
 }
 
 #[test]

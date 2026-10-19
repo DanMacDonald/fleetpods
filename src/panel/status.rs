@@ -218,10 +218,9 @@ fn insert_batteries(status: &mut Map<String, Value>, accessory: &Accessory) {
 
 fn pod_value(pod: &Evidence<Pod>, placement: &Evidence<Placement>) -> Option<Value> {
     let battery = pod.known();
-    let placement = placement
-        .as_fresh()
-        .copied()
-        .or_else(|| battery.map(|pod| Placement { in_ear: pod.in_ear, in_case: pod.in_case }));
+    let placement = placement.as_fresh().copied().or_else(|| {
+        pod.as_fresh().map(|pod| Placement { in_ear: pod.in_ear, in_case: pod.in_case })
+    });
     if battery.is_none() && placement.is_none() {
         return None;
     }

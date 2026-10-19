@@ -138,6 +138,10 @@ pub struct Daemon {
     /// resets the saved roster instead of reviving remembered seat members.
     pod_list_seen: bool,
     pod_peers_at: Option<crate::types::UnixMs>,
+    /// A conflicting authenticated roster asks us to verify this socket, not
+    /// to trust the peer over a working local connection.
+    roster_probe: Option<(Generation, MonoMs)>,
+    roster_probe_after: Option<MonoMs>,
     /// An Apple device took the slot this laptop had been sitting in.
     /// A failed route, a closed case, and an idle link do not set this.
     displaced: bool,
@@ -229,6 +233,8 @@ const SLOT_HOLD_MS: u64 = 30_000;
 /// An established link disappearing may be another device taking its slot.
 /// Desktop activity must give that connection time to settle before reopening.
 const DISPLACEMENT_HOLD_MS: u64 = 5_000;
+const ROSTER_PROBE_MS: u64 = 5_000;
+const ROSTER_PROBE_INTERVAL_MS: u64 = 15_000;
 
 /// How long the non-owner of a dropped laptop pair holds its automatic
 /// reconnect so the owner can land first, before it may attach anyway.
@@ -319,6 +325,8 @@ impl Daemon {
             pod_peers_known: false,
             pod_list_seen: false,
             pod_peers_at: None,
+            roster_probe: None,
+            roster_probe_after: None,
             displaced: false,
             background_requested: false,
             deferred_playback_claim: None,
@@ -488,6 +496,7 @@ impl Daemon {
     }
 
     pub fn tick(&mut self, now: Clock) {
+        self.expire_roster_probe(now);
         if self.config.accessory.is_none() && self.nearby_pods.refresh(now.mono) {
             if let Some(report) = self.nearby_pods.selected_report(now.mono) {
                 self.accessory = report;
@@ -703,6 +712,8 @@ impl Daemon {
 
     /// The link report is stale. The playback claim stays until the user releases it.
     fn drop_reports(&mut self) {
+        self.roster_probe = None;
+        self.roster_probe_after = None;
         self.resume_output_on_grant = false;
         self.end_capture();
         self.microphone.set_control_ready(false);
@@ -1186,10 +1197,76 @@ impl Daemon {
             if !remembered.contains(&snapshot.reporter) {
                 self.peers_seated.retain(|peer| *peer != snapshot.reporter);
             }
+            self.probe_roster_conflict(snapshot.reporter, &remembered, snapshot.pending, now);
         }
         if outcome != Ingest::Replay {
             self.roster_dirty = true;
         }
+    }
+
+    fn probe_roster_conflict(
+        &mut self,
+        reporter: Address,
+        peers: &[Address],
+        pending: bool,
+        now: Clock,
+    ) {
+        let Some(local) = self.local_address else { return };
+        if pending
+            || self.connection.stage() != Stage::Ready
+            || self.connection.apple_reconnect()
+            || !self.pod_peers_known
+            || self.pod_peers.len() != 2
+            || !self.pod_peers.contains(&local)
+            || peers.len() != 2
+            || !peers.contains(&reporter)
+            || peers.contains(&local)
+            || self.roster_probe.is_some()
+            || self.roster_probe_after.is_some_and(|at| now.mono < at)
+        {
+            return;
+        }
+        let generation = self.connection.generation();
+        self.roster_probe = Some((generation, now.mono.saturating_add(ROSTER_PROBE_MS)));
+        self.roster_probe_after = Some(now.mono.saturating_add(ROSTER_PROBE_INTERVAL_MS));
+        // This existing read-only setup query elicits a control response without
+        // claiming audio, changing settings, or restarting the handshake.
+        self.effects.control_out.push((generation, crate::pods::setup::request_keys().to_vec()));
+        eprintln!(
+            "fleetpodsd: checking control liveness generation={} conflicting_reporter={reporter}",
+            generation.0
+        );
+    }
+
+    pub(crate) fn note_control_response(&mut self, generation: Generation) {
+        if self.roster_probe.is_some_and(|(expected, _)| generation == expected) {
+            self.roster_probe = None;
+            eprintln!("fleetpodsd: control liveness confirmed generation={}", generation.0);
+        }
+    }
+
+    fn expire_roster_probe(&mut self, now: Clock) {
+        let Some((generation, deadline)) = self.roster_probe else { return };
+        if generation != self.connection.generation() || self.connection.stage() != Stage::Ready {
+            self.roster_probe = None;
+            return;
+        }
+        if now.mono < deadline {
+            return;
+        }
+        eprintln!(
+            "fleetpodsd: silent control connection after roster conflict generation={}",
+            generation.0
+        );
+        // Follow the ordinary lost-socket path: retire its generation, clear
+        // local reports, and hold background reconnects while the peer settles.
+        let was_busy = self.routing.phase().busy();
+        self.note_socket(false, generation, now.mono);
+        self.accessory_setup = Setup::new();
+        if !was_busy {
+            self.step_back(now);
+        }
+        self.effects.drop_link = true;
     }
 
     pub(crate) fn import_roster_watermark(&mut self, bytes: &[u8]) {
@@ -2360,14 +2437,11 @@ impl Daemon {
                 self.displaced = false;
             }
         }
-        if open
-            && self.config.accessory.is_some()
-            && self.connection.stage() == Stage::Waiting
-            && !self.background_reopen_blocked(now)
-        {
-            self.background_requested = true;
-            self.open_connection(now);
-        }
+        // Opening the case is presence evidence, not a request for this host
+        // to connect. Every nearby fleet laptop hears it; starting a background
+        // attempt here lets an idle laptop evict the active laptop or phone.
+        // Activity, playback, Connect, and attachment to an existing ACL own
+        // their connection requests and still use the case-wake grace.
     }
 
     /// A proximity advertisement. The control link keeps bud reports once it is ready.
@@ -2430,6 +2504,10 @@ impl Daemon {
         }
         let link_up = self.connection.stage() == Stage::Ready;
         if !link_up && !model.is_headset() {
+            let previous = (
+                self.accessory.left_placement.known().copied(),
+                self.accessory.right_placement.known().copied(),
+            );
             let (left_ear, left_case) = placement(&sight, false);
             let (right_ear, right_case) = placement(&sight, true);
             self.accessory.note_placement(false, left_ear, left_case, now.mono);
@@ -2450,6 +2528,16 @@ impl Daemon {
                         self.note_case_battery(cell.level, cell.charging, now.mono);
                     }
                 }
+            }
+            let placement = (
+                self.accessory.left_placement.as_fresh().copied(),
+                self.accessory.right_placement.as_fresh().copied(),
+            );
+            if placement != previous {
+                eprintln!(
+                    "fleetpodsd: advertised placement without control stage={:?} left={:?} right={:?}",
+                    self.connection.stage(), placement.0, placement.1
+                );
             }
         } else if !link_up && decision.encrypted {
             if let Some(keys) = self.membership.accessory_keys() {
@@ -2498,8 +2586,14 @@ impl Daemon {
             right,
             Pod {
                 battery,
-                in_ear: in_ear.or(prior.and_then(|pod| pod.in_ear)),
-                in_case: in_case.or(prior.and_then(|pod| pod.in_case)),
+                in_ear,
+                // An advertisement replaces control-link placement. Reusing
+                // the old case flag here could keep a returned bud "out" (or
+                // a removed bud "docked") indefinitely. Fresh charging proves
+                // docking; a cached battery or not charging proves neither.
+                in_case: in_case.or_else(|| {
+                    cell.filter(|cell| cell.charging && in_ear != Some(true)).map(|_| true)
+                }),
             },
             now,
         );
@@ -3806,6 +3900,181 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_advertisements_replace_old_control_placement() {
+        use crate::step::{Effect, Input};
+
+        // Both laptops can lose their control slots; neither needs a seated
+        // fleet peer to keep receiving placement and lid telemetry.
+        for name in ["xps", "gram"] {
+            for previously_docked in [[false, false], [true, false], [false, true], [true, true]] {
+                let mut daemon = Daemon::new(name);
+                let now = clock();
+                ready_link(&mut daemon, now);
+                daemon.set_accessory_keys(AccessoryKeys {
+                    irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                    encryption: [0x22; 16],
+                });
+                for right in [false, true] {
+                    let docked = previously_docked[usize::from(right)];
+                    daemon.note_pod(
+                        right,
+                        Pod {
+                            battery: Battery::new(90, docked).unwrap(),
+                            in_ear: Some(!docked),
+                            in_case: Some(docked),
+                        },
+                        now.mono,
+                    );
+                }
+                let generation = daemon.connection.generation();
+                daemon.step(Input::ControlSocket { up: false, generation }, now);
+                assert_ne!(daemon.connection.stage(), Stage::Ready);
+
+                // Left is charging in the case, right is no longer in an ear.
+                // The right pod's case placement is unknown, not its old value.
+                let mut frame = encrypted_case();
+                frame[5] = 0x60;
+                frame[8] = 0;
+                let next = Clock::new(now.mono.0 + 1000, now.unix.0 + 1000);
+                let outcome =
+                    daemon.step(Input::Proximity { address: rpa(), payload: frame.clone() }, next);
+                let status = daemon.status_value(next);
+                assert_eq!(status["connected"], false);
+                assert_eq!(status["left"]["in_ear"], false);
+                assert_eq!(status["left"]["in_case"], true);
+                assert_eq!(status["left"]["level"], 83);
+                assert_eq!(status["right"]["in_ear"], false);
+                assert!(status["right"].get("in_case").is_none(), "{status}");
+                assert_eq!(status["lid_state"], 0);
+                assert!(!outcome.effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::OpenLink { .. } | Effect::WriteControl { .. }
+                )));
+
+                // Returning both buds and closing the case replaces placement
+                // again even though the control link has not returned.
+                frame[5] = 0x64;
+                frame[8] = 8;
+                daemon.step(Input::Proximity { address: rpa(), payload: frame }, next);
+                let status = daemon.status_value(next);
+                assert_eq!(status["left"]["in_case"], true);
+                assert_eq!(status["right"]["in_case"], true);
+                assert_eq!(status["case_confirmed_docked"], true);
+                assert_eq!(status["lid_state"], 1);
+            }
+        }
+    }
+
+    #[test]
+    fn removing_pods_after_eviction_updates_without_activity_or_reconnecting() {
+        use crate::step::{Effect, Input};
+        use aes::cipher::{BlockEncrypt, KeyInit};
+
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.set_accessory_keys(AccessoryKeys {
+            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+            encryption: [0x22; 16],
+        });
+        for right in [false, true] {
+            daemon.note_pod(
+                right,
+                Pod {
+                    battery: Battery::new(84, !right).unwrap(),
+                    in_ear: Some(right),
+                    in_case: Some(!right),
+                },
+                now.mono,
+            );
+        }
+        let generation = daemon.connection.generation();
+        daemon.step(Input::ControlSocket { up: false, generation }, now);
+        daemon.step(Input::Bluez(false), now);
+
+        // Observed Pro 3 headers: right worn first, then both worn. Use test
+        // keys and non-charging battery values, never captured secret material.
+        for (index, flags) in [0x03, 0x0b].into_iter().enumerate() {
+            let mut frame = vec![0x07, 0x19, 0x01, 0x27, 0x20, flags, 0x88, 0x8f, 0x11, 0, 8];
+            let mut plain = [0u8; 16];
+            plain[1] = 81;
+            plain[2] = 84;
+            plain[3] = 80;
+            let mut block = aes::cipher::generic_array::GenericArray::from(plain);
+            aes::Aes128::new((&[0x22; 16]).into()).encrypt_block(&mut block);
+            frame.extend_from_slice(&block);
+            let at = Clock::new(
+                now.mono.0 + 1000 + index as u64 * 1000,
+                now.unix.0 + 1000 + index as u64 * 1000,
+            );
+            let result = daemon.step(Input::Proximity { address: rpa(), payload: frame }, at);
+            let status = daemon.status_value(at);
+            assert_eq!(status["connected"], false);
+            assert_eq!(status["right"]["in_ear"], true);
+            assert_eq!(status["right"]["in_case"], false);
+            assert_eq!(status["left"]["in_ear"], index == 1);
+            if index == 0 {
+                assert!(
+                    status["left"].get("in_case").is_none(),
+                    "old docking must not survive: {status}"
+                );
+            } else {
+                assert_eq!(status["left"]["in_case"], false);
+            }
+            assert!(!result.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::OpenLink { .. } | Effect::WriteControl { .. }
+            )));
+        }
+        let later = Clock::new(now.mono.0 + 20_000, now.unix.0 + 20_000);
+        let idle = daemon.step(Input::Tick, later);
+        assert_eq!(daemon.status_value(later)["connected"], false);
+        assert!(!idle.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
+    }
+
+    #[test]
+    fn missing_advertised_battery_does_not_restore_old_docking() {
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        daemon.note_pod(
+            false,
+            Pod {
+                battery: Battery::new(90, true).unwrap(),
+                in_ear: Some(false),
+                in_case: Some(true),
+            },
+            now.mono,
+        );
+        daemon.accessory.note_placement(false, Some(false), None, now.mono);
+        daemon.paint_bud(false, None, Some(false), None, now.mono);
+        let status = daemon.status_value(now);
+        assert_eq!(status["left"]["level"], 90);
+        assert_eq!(status["left"]["in_ear"], false);
+        assert!(status["left"].get("in_case").is_none());
+    }
+
+    #[test]
+    fn expired_placement_does_not_return_through_cached_battery() {
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        daemon.note_pod(
+            false,
+            Pod {
+                battery: Battery::new(90, false).unwrap(),
+                in_ear: Some(true),
+                in_case: Some(false),
+            },
+            now.mono,
+        );
+        let later = Clock::new(now.mono.0 + 121_000, now.unix.0 + 121_000);
+        daemon.accessory.expire(later.mono, false);
+        let status = daemon.status_value(later);
+        assert_eq!(status["left"]["level"], 90);
+        assert!(status["left"].get("in_ear").is_none());
+        assert!(status["left"].get("in_case").is_none());
+    }
+
+    #[test]
     fn unpaired_advertisements_report_placement_without_inventing_batteries() {
         use crate::step::Input;
         let mut daemon = Daemon::new("xps");
@@ -3895,6 +4164,7 @@ mod tests {
                 Input::Proximity { address: rpa(), payload: captured_case(0x31) },
                 Clock::new(1000, 1000),
             );
+            daemon.step(Input::Command(Command::Activity), Clock::new(1000, 1000));
             if phase > 0 {
                 let opened = daemon.step(Input::Tick, Clock::new(3000, 3000));
                 assert!(opened.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
@@ -5335,6 +5605,136 @@ mod tests {
         assert_eq!(daemon.roster_peers(now), Vec::<Address>::new());
     }
 
+    fn conflicting_roster_setup() -> Daemon {
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        daemon.set_local_address(Some(addr(1)));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: addr(1), label: "xps".into() },
+                Member { address: addr(2), label: "gram".into() },
+            ],
+        });
+        ready_link(&mut daemon, now);
+        daemon.note_pod_peers(vec![addr(1), addr(4)], now.unix);
+        daemon.observe_nearby(
+            host_id(Some(addr(2))),
+            addr(2),
+            "gram",
+            now.unix,
+            true,
+            Some([1; 16]),
+        );
+        daemon
+    }
+
+    fn conflicting_roster(at: Clock, sequence: u64) -> crate::fleet::roster_air::Snapshot {
+        crate::fleet::roster_air::Snapshot {
+            reporter: addr(2),
+            session: [1; 16],
+            sequence,
+            sent: at.unix,
+            accessory: addr(3),
+            peers: vec![addr(2), addr(4)],
+            audio_source: Some(addr(4)),
+            last_use: at.unix,
+            pending: false,
+            audio_idle: false,
+        }
+    }
+
+    #[test]
+    fn conflicting_roster_probes_and_retires_a_silent_control_connection() {
+        use crate::step::{Effect, Input};
+        let mut daemon = conflicting_roster_setup();
+        let now = clock();
+        let generation = daemon.connection.generation();
+        daemon.hear_roster(conflicting_roster(now, 1), now);
+        let result = daemon.step(Input::Tick, now);
+        assert!(result.effects.iter().any(|e| matches!(e, Effect::WriteControl { bytes, .. }
+            if bytes == crate::pods::setup::request_keys())));
+        assert_eq!(daemon.connection.stage(), Stage::Ready, "a peer's claim alone cannot drop us");
+        let later = Clock::new(now.mono.0 + 4_000, now.unix.0 + 4_000);
+        // Repeat broadcasts must not keep moving the liveness deadline.
+        daemon.hear_roster(conflicting_roster(later, 2), later);
+        let result = daemon.step(Input::Tick, later);
+        assert!(!result.effects.iter().any(|e| matches!(e, Effect::WriteControl { .. })));
+        // Neither a malformed packet nor a stale socket's reply proves liveness.
+        daemon.step(Input::Accessory { generation, packet: vec![0xff] }, later);
+        daemon.step(
+            Input::Accessory { generation: Generation(generation.0 - 1), packet: key_packet(1, 2) },
+            later,
+        );
+        let deadline = Clock::new(now.mono.0 + 5_001, now.unix.0 + 5_001);
+        let result = daemon.step(Input::Tick, deadline);
+        assert!(result.effects.iter().any(|e| matches!(e, Effect::Disconnect { .. })));
+        assert!(!daemon.status_value(deadline)["connected"].as_bool().unwrap());
+        assert!(daemon.roster_peers(deadline).is_empty());
+        assert_ne!(daemon.connection.generation(), generation);
+        daemon.step(Input::Accessory { generation, packet: key_packet(1, 2) }, deadline);
+        assert_eq!(daemon.connection.stage(), Stage::Interrupted);
+        assert_eq!(
+            daemon.step(Input::Command(Command::Activity), deadline).reply.unwrap(),
+            "ignored\n"
+        );
+    }
+
+    #[test]
+    fn live_control_response_survives_a_conflicting_peer_roster() {
+        use crate::step::{Effect, Input};
+        let mut daemon = conflicting_roster_setup();
+        let now = clock();
+        daemon.hear_roster(conflicting_roster(now, 1), now);
+        daemon.step(Input::Tick, now);
+        let generation = daemon.connection.generation();
+        let reply = Clock::new(now.mono.0 + 100, now.unix.0 + 100);
+        daemon.step(Input::Accessory { generation, packet: key_packet(1, 2) }, reply);
+        let later = Clock::new(now.mono.0 + 6_000, now.unix.0 + 6_000);
+        daemon.hear_roster(conflicting_roster(later, 2), later);
+        let result = daemon.step(Input::Tick, later);
+        assert_eq!(daemon.connection.stage(), Stage::Ready);
+        assert!(!result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::Disconnect { .. } | Effect::WriteControl { .. })));
+        // A successful probe is not a permanent exemption if this link dies later.
+        let again = Clock::new(now.mono.0 + 16_000, now.unix.0 + 16_000);
+        daemon.hear_roster(conflicting_roster(again, 3), again);
+        let result = daemon.step(Input::Tick, again);
+        assert!(result.effects.iter().any(|e| matches!(e, Effect::WriteControl { bytes, .. }
+            if bytes == crate::pods::setup::request_keys())));
+    }
+
+    #[test]
+    fn only_accepted_conflicting_full_rosters_probe_the_connection() {
+        use crate::step::{Effect, Input};
+        for variant in 0..8 {
+            let mut daemon = conflicting_roster_setup();
+            let now = clock();
+            let mut report = conflicting_roster(now, 1);
+            match variant {
+                0 => report.pending = true,
+                1 => report.accessory = addr(9),
+                2 => report.reporter = addr(8),
+                3 => report.session = [9; 16],
+                4 => report.peers = vec![addr(1), addr(2)],
+                5 => report.peers = vec![addr(2)],
+                6 => report.peers.clear(),
+                _ => report.sent = UnixMs(now.unix.0.saturating_sub(16_000)),
+            }
+            daemon.hear_roster(report, now);
+            let result = daemon.step(Input::Tick, now);
+            assert!(
+                !result.effects.iter().any(|e| matches!(e, Effect::WriteControl { bytes, .. }
+                if bytes == crate::pods::setup::request_keys())),
+                "variant {variant}"
+            );
+            assert_eq!(daemon.connection.stage(), Stage::Ready);
+        }
+    }
+
     #[test]
     fn an_empty_fleet_roster_cannot_resurrect_a_tray_device_during_setup() {
         use crate::fleet::members::Fleet;
@@ -5985,6 +6385,7 @@ mod tests {
             let opening =
                 daemon.step(Input::Proximity { address: rpa(), payload: open.clone() }, now);
             assert!(!opening.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            daemon.step(Input::Command(Command::Activity), now);
             let now = Clock::new(now.mono.0 + 2_000, now.unix.0 + 2_000);
             let started = daemon.step(Input::Tick, now);
             assert!(started.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
@@ -6022,17 +6423,58 @@ mod tests {
             let reopened = daemon.step(Input::Proximity { address: rpa(), payload: open }, later);
             assert!(!reopened.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
             let settled = Clock::new(later.mono.0 + 2_000, later.unix.0 + 2_000);
-            let started = daemon.step(Input::Tick, settled);
+            let idle = daemon.step(Input::Tick, settled);
+            assert!(!idle.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            let started = daemon.step(Input::Command(Command::Activity), settled);
             assert!(started.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
             assert_eq!(daemon.connection.stage(), Stage::Connecting);
         }
     }
 
     #[test]
-    fn lid_wake_and_existing_acl_share_bounded_setup_retries() {
+    fn an_idle_laptop_does_not_connect_when_the_case_opens_and_a_peer_connects() {
         use crate::step::{Effect, Input};
-        // Both the lid-triggered attempt and attachment to an existing ACL used
-        // to bypass the intent/state needed by the retry loop.
+        let mut daemon = conflicting_roster_setup();
+        let now = clock();
+        let generation = daemon.connection.generation();
+        daemon.step(Input::ControlSocket { up: false, generation }, now);
+        daemon.step(Input::Bluez(false), now);
+        for right in [false, true] {
+            daemon.note_pod(
+                right,
+                Pod {
+                    battery: Battery::new(80, true).unwrap(),
+                    in_ear: Some(false),
+                    in_case: Some(true),
+                },
+                now.mono,
+            );
+        }
+        daemon.step(Input::Lid { open: false }, now);
+        assert_eq!(daemon.connection.stage(), Stage::Waiting);
+        // The other laptop and phone take the slots. Repeat open-lid reports
+        // through both the case-wake and former reconnect-order grace periods.
+        for elapsed in [1_000, 3_000, 10_000, 30_000, 60_000] {
+            let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
+            daemon.hear_roster(conflicting_roster(at, elapsed), at);
+            for input in [Input::Lid { open: true }, Input::Tick] {
+                let result = daemon.step(input, at);
+                assert!(!result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::OpenLink { .. } | Effect::WriteControl { .. })));
+            }
+            assert!(!daemon.background_requested);
+            assert_eq!(daemon.connection.stage(), Stage::Waiting);
+            assert_eq!(daemon.status_value(at)["lid_state"], 0);
+        }
+    }
+
+    #[test]
+    fn activity_after_lid_wake_and_existing_acl_share_bounded_setup_retries() {
+        use crate::step::{Effect, Input};
+        // Activity after opening the lid and attachment to an existing ACL
+        // both need tracked intent for the retry loop.
         for (existing_acl, released) in [(false, false), (false, true), (true, false), (true, true)]
         {
             let mut daemon = Daemon::new("xps");
@@ -6053,6 +6495,7 @@ mod tests {
                 daemon.connection.prepare();
                 let opening = daemon.step(Input::Lid { open: true }, now);
                 assert!(no_open(&opening.effects));
+                daemon.step(Input::Command(Command::Activity), now);
                 let start = now;
                 // Repeated advertisements neither bypass nor restart the grace.
                 for elapsed in [500, 1_999] {
@@ -6116,6 +6559,7 @@ mod tests {
             daemon.connection.prepare();
             let opening = daemon.step(Input::Lid { open: true }, now);
             assert!(!opening.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            daemon.step(Input::Command(Command::Activity), now);
             let cancel = if disconnect {
                 Input::Command(Command::Disconnect)
             } else {

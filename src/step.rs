@@ -574,6 +574,7 @@ impl Daemon {
 
     fn feed_accessory(&mut self, packet: &[u8], generation: Generation, now: Clock) {
         if self.hear_microphone(packet, now.mono) {
+            self.note_control_response(generation);
             return;
         }
         // One packet, interpreted once: `pods::observe` reads the peer
@@ -600,6 +601,7 @@ impl Daemon {
         now: Clock,
     ) {
         use crate::pods::observe::Observation;
+        self.note_control_response(generation);
         match observation {
             Observation::Bud { bud, level, charging, place } => {
                 let (in_ear, in_case) = place_of(place);

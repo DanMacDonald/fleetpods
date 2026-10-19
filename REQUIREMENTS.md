@@ -108,6 +108,8 @@ Publish each status document from one coherent logical snapshot. A reader must n
 
 **CON-2. Closed case is a normal state.** With the accessory unavailable or its case closed, keep fleet discovery and enrollment available. Publish remembered device identity, known fleet members, nearby hosts, and valid telemetry. Suppress connection attempts when the buds are stowed and unavailable. Closing the lid does not itself sever a live connection: keep occupied seats until disconnection is observed. Show open-lid guidance only once the accessory is disconnected and unavailable.
 
+Opening the case updates presence but does not itself request a connection on every fleet host. An idle, disconnected laptop must remain disconnected when another laptop connects. Local activity, playback, or an explicit Connect request can initiate a connection; attaching the control channel to an already established Bluetooth connection remains supported.
+
 **CON-3. Finish setup before claiming readiness.** Perform the AirPods handshake, feature and notification setup, and obtain the necessary initial reports. Accept valid reports that arrive earlier than their usual order. Bound every wait. Discard callbacks and timeouts belonging to a superseded connection.
 
 **CON-4. Recover without a new click.** A recoverable initial connection, control-setup, profile, or fleet-admission failure must schedule a bounded retry when the original intent is still valid. Requiring another keyboard event to escape a failed first attempt is a regression. Retry budgets and backoff must avoid continuous radio churn.

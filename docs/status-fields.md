@@ -24,7 +24,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `adaptive_noise_level` | Accessory-confirmed level. Omitted when unknown. The panel then reads `0` |
 | `conversational_awareness`, `one_bud_anc_mode` | Confirmed `true`, otherwise `false`. Off and unknown are the same on the wire |
 | `ear_detection_behavior` | Confirmed accessory value when one exists, otherwise the saved preference |
-| `left`, `right` | Known battery reports and independently observed placement (`in_ear`, `in_case`). Unpaired proximity observations can provide placement with `available: true` but no `level` or `charging`; missing battery fields remain unknown. Omitted when neither is known |
+| `left`, `right` | Known battery reports and fresh independently observed placement (`in_ear`, `in_case`). After a control disconnect, accepted proximity reports replace placement; fresh charging also confirms docking. Unknown placement does not reuse the old control report. Expired placement is omitted even if a cached battery remains. Unpaired proximity observations can provide placement with `available: true` but no `level` or `charging`; missing battery fields remain unknown. Omitted when neither is known |
 | `case`, `headset` | Known battery reports, including a real `0`. Omitted when unknown. Not emitted as `available: false` |
 | `lid_state` | Fresh lid report, otherwise `2`. A stale report does not stay "live" |
 | `last_known_lid_state` | Last lid value actually observed, otherwise `2` |
@@ -76,6 +76,16 @@ name keep their saved label, or the address fallback if none has been learned.
 When both fleet laptops are connected and idle, fresh desktop activity can request audio ownership over the existing control link. If the AirPods report loss of ownership without naming the new owner, a fresh authenticated self-report from the other seated laptop supplies that identity. Playing, pending, or expired reports cannot authorize this idle takeover. Sending the request does not mark ownership as transferred; the AirPods must confirm it.
 
 Suspend retires the current control generation before the local socket closes. A close callback from that generation cannot turn an intentional suspend into lost ownership. After the wake grace, a previously ready idle connection can restore its control session if Bluetooth has already rejoined, without requesting audio ownership. Bluetooth being connected alone does not confirm an Omarchy seat; the plugin shows that control setup is still pending until the daemon reports readiness.
+
+If an authenticated fleet member reports a confirmed full pair that excludes this
+laptop while its own AirPods list still includes it, the daemon checks the local
+control connection with the existing read-only key query. A valid control report
+or microphone packet confirms liveness. Five seconds of silence retires that
+connection, clears its stale local reports, and follows the ordinary lost-link
+path. Repeated roster broadcasts cannot extend the deadline; successful checks
+are limited to one per 15 seconds. Pending, expired, replayed, wrong-session, and
+other-accessory rosters cannot initiate the check. This does not alter pairing,
+fleet membership, or the roster wire format.
 
 `native_handoff` is omitted until the audio server has reported or this host has yielded or is reconnecting an Apple device. `yielded`, `phase`, `audio_output`, and `audio_active` come from that handoff. The panel treats a missing object as no local handoff block.
 
