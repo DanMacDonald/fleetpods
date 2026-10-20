@@ -21,6 +21,14 @@ TestCase {
       item.level = 80
     }
   }
+  function test_onlyLightThemesTintTheEmptyBand() {
+    var item = createTemporaryObject(indicator, this, { level: 60 })
+    for (var theme of [{ foreground: "#000000", tinted: true }, { foreground: "#242424", tinted: true },
+                       { foreground: "#a9b1d6", tinted: false }, { foreground: "#ffffff", tinted: false }]) {
+      item.foreground = theme.foreground
+      compare(item.tintedTrack, theme.tinted, theme.foreground)
+    }
+  }
   function test_caseTransitionKeepsLayout_data() {
     return [{ tag: "left pod in case", state: "open-left" },
       { tag: "right pod in case", state: "open-right" }]
