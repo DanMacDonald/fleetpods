@@ -2862,6 +2862,13 @@ impl Daemon {
                 "ignored"
             });
         }
+        // Connecting this laptop in the background takes one of the pods' two
+        // connections. Input alone must not cost a playing phone or Mac its
+        // connection (gram, 2026-10-19); a play here still takes over.
+        if self.outside_device_playing(now) {
+            eprintln!("fleetpodsd: activity ignored while a device outside the fleet plays on the AirPods");
+            return Response::line("ignored");
+        }
         // Input on an established link can claim idle audio immediately. Input
         // after a slot loss must not evict the device still taking that slot.
         if self.slot_hold_until.is_some_and(|until| now.mono.0 < until.0) {
@@ -2900,6 +2907,25 @@ impl Daemon {
                 Response::line("accepted")
             }
         }
+    }
+
+    /// A phone or Mac (not a fleet laptop) plays on the pods, by this laptop's
+    /// own observation or by the latest fleet report.
+    fn outside_device_playing(&self, now: Clock) -> bool {
+        let outside = |address: Address| {
+            Some(address) != self.local_address && !self.membership.contains(address)
+        };
+        if let Holder::Remote { address: Some(address), playing: true } = self.resolved(now).holder
+        {
+            if outside(address) {
+                return true;
+            }
+        }
+        self.config.accessory.and_then(|accessory| self.peers.fresh(now, accessory)).is_some_and(
+            |report| {
+                !report.pending && !report.audio_idle && report.audio_source.is_some_and(outside)
+            },
+        )
     }
 
     fn open_background_connection(&mut self, now: Clock) {
@@ -5784,6 +5810,56 @@ mod tests {
             Some([1; 16]),
         );
         daemon
+    }
+
+    #[test]
+    fn activity_does_not_connect_while_a_phone_plays_on_the_pods() {
+        use crate::step::Input;
+        // gram, 2026-10-19 16:11: input while disconnected asked the xps for a
+        // seat, and the pair reservation dropped the playing iPhone.
+        for phone_playing in [true, false] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            daemon.set_local_address(Some(addr(2)));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: addr(1), label: "xps".into() },
+                    Member { address: addr(2), label: "gram".into() },
+                ],
+            });
+            daemon.select_accessory(Some(addr(3)));
+            daemon.observe_nearby(
+                host_id(Some(addr(1))),
+                addr(1),
+                "xps",
+                now.unix,
+                true,
+                Some([1; 16]),
+            );
+            daemon.hear_roster(
+                crate::fleet::roster_air::Snapshot {
+                    reporter: addr(1),
+                    session: [1; 16],
+                    sequence: 1,
+                    sent: now.unix,
+                    accessory: addr(3),
+                    peers: vec![addr(1), addr(4)],
+                    audio_source: Some(addr(4)),
+                    last_use: now.unix,
+                    pending: false,
+                    audio_idle: !phone_playing,
+                },
+                now,
+            );
+            let reply = daemon.step(Input::Command(Command::Activity), now).reply;
+            assert_eq!(
+                reply.as_deref() == Some("ignored\n"),
+                phone_playing,
+                "phone playing={phone_playing}: {reply:?}"
+            );
+        }
     }
 
     fn conflicting_roster(at: Clock, sequence: u64) -> crate::fleet::roster_air::Snapshot {

@@ -48,7 +48,24 @@ Item {
   ActivityGate {
     id: activityGate
     idle: desk.isIdle
-    onActiveChanged: if (active) root.requestActivity("desktop-resumed")
+    onActiveChanged: if (active && !screensaverCheck.running) screensaverCheck.running = true
+  }
+
+  // The compositor can report input while Omarchy's screensaver is up without
+  // anyone at the desk (gram, 2026-10-19: a resume 0.3 s after the screensaver
+  // cycle started took the pods from a playing iPhone). Someone who really
+  // comes back closes the screensaver: it exits on a key press, or within about
+  // a second of losing focus. So a resume counts only if no screensaver is up,
+  // or if it closes within 3 s.
+  Process {
+    id: screensaverCheck
+    command: ["sh", "-c",
+      "up() { hyprctl clients -j | grep -q '\"class\": \"org.omarchy.screensaver\"'; }; "
+      + "up || exit 0; for i in $(seq 12); do sleep 0.25; up || exit 0; done; exit 1"]
+    onExited: function(exitCode) {
+      if (exitCode === 0) root.requestActivity("desktop-resumed")
+      else console.log("fleetpods-activity ignored: the screensaver is still up")
+    }
   }
 
   // The control reply returns before the link is up, and the socket has 8s to finish.
