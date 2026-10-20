@@ -375,6 +375,31 @@ impl Setup {
             return;
         };
         self.saw_ears = true;
+        // The report lists the pods by role, and the order comes from the last
+        // battery report. Taking a pod out or docking it can hand the primary
+        // role to the other pod before a battery report says so. Read with the
+        // old order, both pods would appear to move at once (XPS, 2026-10-19:
+        // left in ear / right out, then left in case / right in ear, 0.27 s
+        // apart). When the reversed order moves fewer pods, the roles swapped.
+        if let Some(secondary_bud) = self.secondary {
+            let moved = |bud, byte| {
+                let place = place_of(byte);
+                self.halves
+                    .iter()
+                    .flatten()
+                    .find(|half| half.bud == bud)
+                    .and_then(|half| half.place)
+                    .is_some_and(|old| place.is_some_and(|new| new != old)) as u8
+            };
+            let as_listed = moved(primary_bud, primary) + moved(secondary_bud, secondary);
+            let swapped = moved(secondary_bud, primary) + moved(primary_bud, secondary);
+            if swapped < as_listed {
+                eprintln!("fleetpodsd: ear report reads as a primary/secondary role swap");
+                self.primary = Some(secondary_bud);
+                self.secondary = Some(primary_bud);
+                return self.apply_ears(primary, secondary, events);
+            }
+        }
         self.place(primary_bud, primary, events);
         if let Some(bud) = self.secondary {
             self.place(bud, secondary, events);
@@ -382,12 +407,7 @@ impl Setup {
     }
 
     fn place(&mut self, bud: Bud, byte: u8, events: &mut Vec<Event>) {
-        let place = match byte {
-            0x00 => Some(Place::InEar),
-            0x01 => Some(Place::Out),
-            0x02 => Some(Place::InCase),
-            _ => None,
-        };
+        let place = place_of(byte);
         let slot = self.halves.iter_mut().find(|half| half.is_some_and(|half| half.bud == bud));
         let Some(slot) = slot else {
             return;
@@ -397,6 +417,15 @@ impl Setup {
         };
         half.place = place;
         events.push(Event::BudReport { bud, level: half.level, charging: half.charging, place });
+    }
+}
+
+fn place_of(byte: u8) -> Option<Place> {
+    match byte {
+        0x00 => Some(Place::InEar),
+        0x01 => Some(Place::Out),
+        0x02 => Some(Place::InCase),
+        _ => None,
     }
 }
 
@@ -708,6 +737,32 @@ mod tests {
             assert_eq!(events.contains(&Event::Ready), subscribed, "only after subscribing");
             assert!(!setup.observe(&sample_ears()).1.contains(&Event::Ready), "ready once");
         }
+    }
+
+    #[test]
+    fn an_ear_report_after_a_role_swap_does_not_move_both_pods() {
+        let mut setup = Setup::new();
+        setup.start();
+        setup.observe(&handshake_ack());
+        setup.observe(&features_ack());
+        setup.observe(&sample_battery());
+        // Primary in an ear, secondary docked.
+        setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02]);
+        let placed = |setup: &Setup| {
+            setup.halves.iter().flatten().map(|half| (half.bud, half.place)).collect::<Vec<_>>()
+        };
+        let before = placed(&setup);
+        // The docked pod became primary: the same two places, listed the other way.
+        let events = setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x02, 0x00]).1;
+        assert_eq!(placed(&setup), before, "neither pod moved");
+        assert!(events.iter().all(|event| match event {
+            Event::BudReport { bud, place, .. } => before.contains(&(*bud, *place)),
+            _ => true,
+        }));
+        // A real single move under the new roles still lands on the right pod.
+        let worn = before.iter().find(|(_, place)| *place == Some(Place::InEar)).unwrap().0;
+        setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x02, 0x01]);
+        assert!(placed(&setup).contains(&(worn, Some(Place::Out))), "the worn pod came out");
     }
 
     #[test]

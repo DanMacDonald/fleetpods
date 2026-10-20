@@ -29,14 +29,46 @@ use crate::types::{
     NoiseMode, UnixMs,
 };
 
-fn placement(sight: &crate::pods::air::Frame, right: bool) -> (Option<bool>, Option<bool>) {
+/// One pod's placement from an advertisement, given its current placement.
+///
+/// A frame comes from one pod: `primary_left` names it, and `this_in_case`
+/// says whether that pod is in the case (XPS, 2026-10-19: the left pod
+/// docked sent `primary_left` frames, the right pod docked did not). A docked
+/// pod also sends frames claiming both pods are docked with neither in an ear,
+/// while the other pod is worn; the next frame, 0.27 s later, shows it worn.
+/// So that claim never docks a pod known to be in an ear. Otherwise a pod out
+/// of an ear has an unknown case placement, never an older one.
+fn placement(
+    sight: &crate::pods::air::Frame,
+    right: bool,
+    prior: Option<crate::pods::reports::Placement>,
+) -> (Option<bool>, Option<bool>) {
+    let worn = prior.is_some_and(|prior| prior.in_ear == Some(true));
+    let sender = right != sight.primary_left;
+    if sender && sight.this_in_case {
+        return (Some(false), Some(true));
+    }
     if sight.both_in_case {
+        if worn {
+            return (Some(true), Some(false));
+        }
         return (Some(false), Some(true));
     }
     let in_ear = if right { sight.right_in_ear } else { sight.left_in_ear };
-    let in_case = if in_ear { Some(false) } else { None };
+    let in_case = if in_ear {
+        Some(false)
+    } else if sender {
+        // The sending pod is not in the case, or this_in_case would say so.
+        Some(false)
+    } else {
+        None
+    };
     (Some(in_ear), in_case)
 }
+
+/// How long a pod's advertisement about itself outranks the other pod's
+/// advertisements about it.
+const ADVERTISED_SELF_MS: u64 = 1_500;
 
 /// Effects queued by handlers and drained once per step by the harvest
 /// sweep in `step`. Handlers write here and nowhere else for anything
@@ -136,6 +168,8 @@ pub struct Daemon {
     pub(crate) setup_claim_at: Option<MonoMs>,
     /// When the control link last became ready.
     pub(crate) link_ready_at: Option<MonoMs>,
+    /// When each pod (left, right) last advertised while sending the frame.
+    pub(crate) advertised_self_at: [Option<MonoMs>; 2],
     /// When this laptop last sent a claim on the control link.
     pub(crate) claim_sent_at: Option<MonoMs>,
     /// A remote report arrived just after a claim; it ends the claim unless
@@ -348,6 +382,7 @@ impl Daemon {
             handoff_quiet_since: None,
             setup_claim_at: None,
             link_ready_at: None,
+            advertised_self_at: [None, None],
             claim_sent_at: None,
             yield_pending: false,
             force_rearm: false,
@@ -2578,8 +2613,27 @@ impl Daemon {
                 self.accessory.left_placement.known().copied(),
                 self.accessory.right_placement.known().copied(),
             );
-            let (left_ear, left_case) = placement(&sight, false);
-            let (right_ear, right_case) = placement(&sight, true);
+            // Each pod reports itself first. The other pod's view of it lags
+            // (XPS, 2026-10-19: the left pod said "out" while the docked right
+            // pod still said "worn", four flips in 0.4 s), so a pod that spoke
+            // for itself recently is not overruled by the other pod.
+            let sender_right = !sight.primary_left;
+            self.advertised_self_at[usize::from(sender_right)] = Some(now.mono);
+            let decode = |daemon: &Self, right: bool| {
+                let prior = if right {
+                    daemon.accessory.right_placement.as_fresh().copied()
+                } else {
+                    daemon.accessory.left_placement.as_fresh().copied()
+                };
+                let spoke = daemon.advertised_self_at[usize::from(right)]
+                    .is_some_and(|at| now.mono.saturating_since(at) < ADVERTISED_SELF_MS);
+                match prior {
+                    Some(prior) if right != sender_right && spoke => (prior.in_ear, prior.in_case),
+                    _ => placement(&sight, right, prior),
+                }
+            };
+            let (left_ear, left_case) = decode(self, false);
+            let (right_ear, right_case) = decode(self, true);
             self.accessory.note_placement(false, left_ear, left_case, now.mono);
             self.accessory.note_placement(true, right_ear, right_case, now.mono);
             self.note_ears(left_ear, right_ear, now.mono, now.mono);
@@ -2605,8 +2659,9 @@ impl Daemon {
             );
             if placement != previous {
                 eprintln!(
-                    "fleetpodsd: advertised placement without control stage={:?} left={:?} right={:?}",
-                    self.connection.stage(), placement.0, placement.1
+                    "fleetpodsd: advertised placement without control stage={:?} left={:?} right={:?} frame(primary_left={} this_in_case={} both_in_case={} left_in_ear={} right_in_ear={})",
+                    self.connection.stage(), placement.0, placement.1, sight.primary_left,
+                    sight.this_in_case, sight.both_in_case, sight.left_in_ear, sight.right_in_ear
                 );
             }
         } else if !link_up && decision.encrypted {
@@ -4093,6 +4148,83 @@ mod tests {
                 assert_eq!(status["lid_state"], 1);
             }
         }
+    }
+
+    #[test]
+    fn a_docked_pods_both_in_case_frame_does_not_dock_the_worn_pod() {
+        use crate::step::Input;
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        // XPS, 2026-10-19 20:53:15: with the left pod worn, the right pod docked
+        // and sent "both in case, neither in an ear", then 0.27 s later "left
+        // in ear". The panel briefly showed the left pod entering the case.
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.set_accessory_keys(AccessoryKeys {
+            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+            encryption: [0x22; 16],
+        });
+        let generation = daemon.connection.generation();
+        daemon.step(Input::ControlSocket { up: false, generation }, now);
+        daemon.step(Input::Bluez(false), now);
+        let mut plain = [0u8; 16];
+        plain[1] = 81;
+        plain[2] = 84;
+        plain[3] = 80;
+        let mut block = aes::cipher::generic_array::GenericArray::from(plain);
+        aes::Aes128::new((&[0x22; 16]).into()).encrypt_block(&mut block);
+        // Status bytes, all sent by the right pod: both worn; docked claiming
+        // both docked; docked with the left in an ear.
+        for (index, (flags, left_ear, right_case)) in
+            [(0x0b, true, false), (0x44, true, true), (0x42, true, true)].into_iter().enumerate()
+        {
+            let mut frame = vec![0x07, 0x19, 0x01, 0x27, 0x20, flags, 0x88, 0x8f, 0x11, 0, 8];
+            frame.extend_from_slice(&block);
+            let at = Clock::new(now.mono.0 + 1000 + index as u64 * 300, now.unix.0 + 1000);
+            daemon.step(Input::Proximity { address: rpa(), payload: frame }, at);
+            let status = daemon.status_value(at);
+            assert_eq!(status["left"]["in_ear"], left_ear, "frame {flags:#04x}: {status}");
+            assert_ne!(status["left"]["in_case"], true, "frame {flags:#04x}: {status}");
+            assert_eq!(status["right"]["in_case"], right_case, "frame {flags:#04x}: {status}");
+        }
+    }
+
+    #[test]
+    fn a_pods_own_advertisement_outranks_the_other_pods_view_of_it() {
+        use crate::step::Input;
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        // XPS, 2026-10-19 20:55:58: the left pod advertised itself out of the
+        // ear while the docked right pod, interleaved, still said "worn".
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.set_accessory_keys(AccessoryKeys {
+            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+            encryption: [0x22; 16],
+        });
+        let generation = daemon.connection.generation();
+        daemon.step(Input::ControlSocket { up: false, generation }, now);
+        daemon.step(Input::Bluez(false), now);
+        let mut block = aes::cipher::generic_array::GenericArray::from([0u8; 16]);
+        aes::Aes128::new((&[0x22; 16]).into()).encrypt_block(&mut block);
+        let send = |daemon: &mut Daemon, flags: u8, ms: u64| {
+            let mut frame = vec![0x07, 0x19, 0x01, 0x27, 0x20, flags, 0x88, 0x8f, 0x11, 0, 8];
+            frame.extend_from_slice(&block);
+            let at = Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.step(Input::Proximity { address: rpa(), payload: frame }, at);
+            daemon.status_value(at)
+        };
+        // Right pod docked, left worn; then the left pod says it is out; then
+        // the docked right pod repeats its older "left worn".
+        send(&mut daemon, 0x42, 1_000);
+        assert_eq!(send(&mut daemon, 0x20, 1_100)["left"]["in_ear"], false);
+        assert_eq!(
+            send(&mut daemon, 0x42, 1_150)["left"]["in_ear"],
+            false,
+            "the left pod spoke for itself"
+        );
+        // Once the left pod is quiet for a while, the other pod's view counts again.
+        assert_eq!(send(&mut daemon, 0x42, 2_700)["left"]["in_ear"], true);
     }
 
     #[test]
