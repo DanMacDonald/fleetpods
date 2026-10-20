@@ -97,6 +97,7 @@ function dotStyle(tonal, pitch, background, foreground, shadow) {
   style.colors = []
   for (var band = 1; band <= style.levels; band++) {
     var mix = Math.pow(band / style.levels, style.exponent), base = style.base
+    if (style.tone) mix = style.tone(mix)
     style.colors[band] = [base.r + (foreground.r - base.r) * mix,
       base.g + (foreground.g - base.g) * mix, base.b + (foreground.b - base.b) * mix]
   }

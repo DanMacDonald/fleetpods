@@ -43,11 +43,22 @@ function render(scene, view) {
   for (var i = 0; i < values.length; i++) values[i] = Math.max(values[i], samples.openingCoverage[i])
   dockedOpeningSeparation(values, samples, dockedPods, columns, rows)
   for (var i = 0; i < values.length; i++) {
-    if (materials[i] <= 0.2 && samples.depth[i] !== -100) values[i] *= settings.ventInk
+    // A lighter vent must not thin the silhouette: an outline dot that falls
+    // on a vent keeps its full ink.
+    if (materials[i] <= 0.2 && depth[i] !== -100 && !onSilhouette(depth, i, columns, rows))
+      values[i] *= settings.ventInk
     values[i] = Math.max(0, Math.min(1, values[i]))
   }
   CoveredDeck.blend(values, samples, view)
   return { values: values, tonal: true }
+}
+
+// A visible cell with background directly beside it (or at the grid edge).
+function onSilhouette(depth, i, columns, rows) {
+  var x = i % columns, y = (i - x) / columns
+  return x === 0 || y === 0 || x === columns - 1 || y === rows - 1
+    || depth[i - 1] === -100 || depth[i + 1] === -100
+    || depth[i - columns] === -100 || depth[i + columns] === -100
 }
 
 // Standalone white pods need soft volume shading, not the case's strong ink
@@ -550,6 +561,9 @@ function stipple(light, depth, facing, columns, rows, features, shading, setting
     var contrast = hasOuter && hasInner ? Math.max(outer, inner)
       : hasOuter ? outer : hasInner ? inner : 0
     dots[i] += settings.outline * contrast
+    // Darken the dots that already carry outline ink without widening the
+    // stroke: a gain keeps a faint neighbour faint, unlike a larger width.
+    if (contrast > 0) dots[i] = Math.min(1, dots[i] * settings.edgeGain)
   }
   return dots
 }

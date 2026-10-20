@@ -30,5 +30,8 @@ function frame(geometry, state, yaw, pitch, lid, pose, settings, baseline) {
   }
   return {values: values, columns: n, pitch: dotPitch,
     dotSize: baseline ? 2 : Math.min(options.dotSize, dotPitch),
-    paletteCurve: baseline ? Parameters.defaults().paletteCurve : options.paletteCurve}
+    paletteCurve: baseline ? Parameters.defaults().paletteCurve : options.paletteCurve,
+    paletteShift: baseline ? Parameters.defaults().paletteShift : options.paletteShift,
+    contrast: baseline ? Parameters.defaults().contrast : options.contrast,
+    contrastPivot: baseline ? Parameters.defaults().contrastPivot : options.contrastPivot}
 }

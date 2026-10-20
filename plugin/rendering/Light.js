@@ -4,23 +4,26 @@
 
 function defaults() {
   return {
-    "exteriorWidth": 0.3,
+    "exteriorWidth": 0.1,
     "exteriorOutline": 2,
     "interiorWidth": 0,
-    "interiorOutline": 0.77,
+    "interiorOutline": 2,
     "outline": 1.5,
-    "podOutline": 0.45,
+    "edgeGain": 4,
+    "podOutline": 1,
     "podShading": 0.63,
     "surfaceShading": 2,
-    "frontalLight": 0.87,
+    "frontalLight": 0.68,
     "lightX": -0.13,
-    "lightY": 0.27,
-    "softness": 1.14,
-    "contactShadows": 0.98,
-    "recessRelief": 0.38,
-    "recessShade": 0.64,
-    "ventInk": 1,
-    "paletteCurve": 0.85,
+    "lightY": 0.14,
+    "softness": 2.01,
+    "contactShadows": 0.8,
+    "recessRelief": 0.42,
+    "recessShade": 0.57,
+    "ventInk": 0.8,
+    "paletteCurve": 1.33,
+    "contrast": 3,
+    "contrastPivot": 0.2,
     "dotPitch": 3,
     "dotSize": 2
   }
@@ -73,11 +76,22 @@ function render(scene, view) {
   for (var i = 0; i < values.length; i++) values[i] = Math.max(values[i], samples.openingCoverage[i])
   dockedOpeningSeparation(values, samples, dockedPods, columns, rows)
   for (var i = 0; i < values.length; i++) {
-    if (materials[i] <= 0.2 && samples.depth[i] !== -100) values[i] *= settings.ventInk
+    // A lighter vent must not thin the silhouette: an outline dot that falls
+    // on a vent keeps its full ink.
+    if (materials[i] <= 0.2 && depth[i] !== -100 && !onSilhouette(depth, i, columns, rows))
+      values[i] *= settings.ventInk
     values[i] = Math.max(0, Math.min(1, values[i]))
   }
   CoveredDeck.blend(values, samples, view)
   return { values: values, tonal: true }
+}
+
+// A visible cell with background directly beside it (or at the grid edge).
+function onSilhouette(depth, i, columns, rows) {
+  var x = i % columns, y = (i - x) / columns
+  return x === 0 || y === 0 || x === columns - 1 || y === rows - 1
+    || depth[i - 1] === -100 || depth[i + 1] === -100
+    || depth[i - columns] === -100 || depth[i + columns] === -100
 }
 
 // Standalone white pods need soft volume shading, not the case's strong ink
@@ -192,8 +206,17 @@ function vertexTone(n, shade) {
 
 // Continuous ink fades into the actual background, on a full dot lattice.
 function dotStyle(pitch, background, shadow) {
+  var settings = defaults()
   return { levels: 64, size: Math.max(1.05, pitch * 0.48), base: background,
-    exponent: defaults().paletteCurve, level: function(value) { return Math.round(value * 64) } }
+    exponent: settings.paletteCurve, level: function(value) { return Math.round(value * 64) },
+    tone: function(mix) { return contrastTone(mix, settings.contrast, settings.contrastPivot) } }
+}
+
+// Push a palette position away from the pivot: darker dots darken, lighter
+// ones lighten, and the pivot tone itself stays put. 1 leaves tones as they are.
+function contrastTone(t, contrast, pivot) {
+  return t < pivot ? pivot * Math.pow(t / pivot, contrast)
+    : 1 - (1 - pivot) * Math.pow((1 - t) / (1 - pivot), contrast)
 }
 
 // The closed lid/body join is one shallow, mostly horizontal boundary. Trace
@@ -600,6 +623,9 @@ function stipple(light, depth, facing, columns, rows, features, shading, setting
     var contrast = hasOuter && hasInner ? Math.max(outer, inner)
       : hasOuter ? outer : hasInner ? inner : 0
     dots[i] += settings.outline * contrast
+    // Darken the dots that already carry outline ink without widening the
+    // stroke: a gain keeps a faint neighbour faint, unlike a larger width.
+    if (contrast > 0) dots[i] = Math.min(1, dots[i] * settings.edgeGain)
   }
   return dots
 }

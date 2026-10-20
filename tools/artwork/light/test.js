@@ -90,6 +90,8 @@ for (const control of Parameters.controls()) {
       changes ||= changed.values.length !== original.values.length
         || changed.values.some((v, i) => Math.abs(v - original.values[i]) > 1e-5)
         || changed.dotSize !== original.dotSize || changed.paletteCurve !== original.paletteCurve
+        || changed.paletteShift !== original.paletteShift || changed.contrast !== original.contrast
+        || changed.contrastPivot !== original.contrastPivot
       const baseline = render(state, options, true)
       const neutral = render(state, defaults, true)
       check(baseline.values.every((v, i) => v === neutral.values[i]), `Isolated ${control.key}`)

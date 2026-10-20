@@ -300,8 +300,10 @@ const occluded = Mesh.frame(occlusionScene, "closed", 0, 0, 0, 0, 64, 64, true)
 check(foreground.every((v, i) => v === occluded[i]), "occluded geometry must never create visible ink")
 console.log("Eight oblique crease orientations and hidden-surface occlusion passed")
 
-// Soft illumination must leave a planar white shell uniformly pale. A dark
-// material still reads as a hole; an actual nearby occluder still casts ink.
+// Soft illumination must leave a planar white shell uniformly pale. The light
+// preset (2026-10-19) gives front faces a faint even tint rather than bare
+// paper; it must stay uniform and light. A dark material still reads as a
+// hole; an actual nearby occluder still casts ink beyond that tint.
 {
   const size = 40, count = size * size, scale = size / 3.6
   const light = new Float32Array(count).fill(0.45)
@@ -310,7 +312,7 @@ console.log("Eight oblique crease orientations and hidden-surface occlusion pass
   const materials = new Float32Array(count).fill(1)
   for (let i = 0; i < count; i++) normals[i * 3 + 2] = 1
   const flat = Light.surfaceShading(light, depth, normals, materials, size, size, scale)
-  check(flat.every(v => v === flat[0] && v < 0.02), "softly lit white planes must remain uniformly pale")
+  check(flat.every(v => v === flat[0] && v < 0.2), "softly lit white planes must remain uniformly pale")
   const center = 20 * size + 20
   materials[center] = 0.1
   const hole = Light.surfaceShading(light, depth, normals, materials, size, size, scale)
@@ -319,7 +321,7 @@ console.log("Eight oblique crease orientations and hidden-surface occlusion pass
   // A raised strip beside the center is nearby contact geometry.
   for (let y = 0; y < size; y++) for (let x = 22; x < size; x++) depth[y * size + x] = 1.12
   const contact = Light.surfaceShading(light, depth, normals, materials, size, size, scale)
-  check(contact[center] > 0.04, "nearby geometry must supply localized ambient occlusion")
+  check(contact[center] > flat[center] + 0.04, "nearby geometry must supply localized ambient occlusion")
   check(contact[20 * size + 10] === flat[20 * size + 10], "contact shading must not spread across the flat face")
   // A convex shell falls below its local tangent plane; it should not look dirty.
   depth.fill(0.95); depth[center] = 1
@@ -378,7 +380,7 @@ console.log("Clean white faces, material openings, local occlusion, and single-d
   for (let y = 10; y < size - 10; y++) for (let x = 0; x < size; x++) {
     const i = y * size + x
     if (depth[i] === -100) continue
-    if (normals[i * 3 + 2] > 0.98) check(form[i] < 0.1, "the forward case face must remain pale")
+    if (normals[i * 3 + 2] > 0.98) check(form[i] < 0.2, "the forward case face must remain pale (the preset's faint front tint)")
     if (form[i] > 0.15 && normals[i * 3 + 2] < 0.70) roundedSamples++
   }
   check(roundedSamples > 100, "the rounded case sides must receive a visible tonal band")
@@ -435,7 +437,9 @@ console.log("Continuous gradients and uniform light-theme palette routing passed
     if (reference === undefined) reference = tone
     check(Math.abs(tone - reference) < 1e-9, "equal diffuse incidence must never produce a shiny hotspot")
   }
-  let previous = 0
+  // Start from the tone facing the light: the preset may give that a faint
+  // tint, which is a starting level, not a step in the falloff.
+  let previous = Light.matteTone(...light)
   for (let step = 0; step <= 140; step++) {
     const angle = step / 100
     const n = light.map((v, i) => Math.cos(angle) * v + Math.sin(angle) * tangent[i])
@@ -697,7 +701,9 @@ console.log("Closed seams stay connected and single-cell through slopes and dept
       "white pod shell must separate the vent from the dark lid recess")
     check(frame[22 * 80 + x] > 0.65,
       "vent separation must not bleach the lid behind the pod")
-    check(frame[24 * 80 + x] > 0.9 && frame[25 * 80 + x] > 0.6,
+    // Vent darkness lightens the vent body as a whole; its shape must survive.
+    const vent = Light.defaults().ventInk
+    check(frame[24 * 80 + x] > 0.9 * vent && frame[25 * 80 + x] > 0.6 * vent,
       "the vent must have a rounded two-row body, not a diagonal hairline")
     check(frame[26 * 80 + x] < 0.15, "small vents must not grow into broad dark patches")
   }
@@ -825,14 +831,16 @@ console.log("Recess materials darken lid sockets and the empty lower well while 
         check(Math.abs(samples.materials[y * 80 + x] - 0.6) < 1e-6,
           "complete medial socket walls must use matte recessed plastic")
       }
+      // Front-facing shell takes the preset's faint tint (about 0.11); a crease
+      // knot or lost shoulder would be far darker than this cap.
       for (const x of [39, 40]) for (let y = 19; y <= 24; y++) {
         check(samples.materials[y * 80 + x] === 1 && samples.light[y * 80 + x] > 0.6,
           "the central divider must remain bright shell plastic")
-        check(ink[y * 80 + x] < 0.1,
+        check(ink[y * 80 + x] < 0.2,
           "light rendering must keep the central divider pale instead of adding alternating crease knots")
       }
       for (const y of [17, 18]) for (const x of [38, 39, 40, 41]) {
-        check(ink[y * 80 + x] < 0.1,
+        check(ink[y * 80 + x] < 0.2,
           "rounded inner socket corners must leave the wider white shoulder visible")
       }
       for (const x of [37, 42]) for (let y = 19; y <= 24; y++) {

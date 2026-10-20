@@ -105,7 +105,14 @@ ApplicationWindow {
         for (var i = 0; i < f.values.length; i++) {
           var band = Math.round(f.values[i] * 64)
           if (!band) continue
+          // The shift raises the palette's floor toward the ink: every visible
+          // dot darkens, and empty cells stay empty, so the shape never grows.
           var t = Math.pow(band / 64, f.paletteCurve)
+          // Contrast pushes tones away from the pivot: darks darken, lights
+          // lighten, and the pivot tone itself stays put.
+          var p = f.contrastPivot
+          t = t < p ? p * Math.pow(t / p, f.contrast) : 1 - (1 - p) * Math.pow((1 - t) / (1 - p), f.contrast)
+          t = f.paletteShift + (1 - f.paletteShift) * t
           ctx.fillStyle = Qt.rgba(art.paper.r + (art.ink.r - art.paper.r) * t,
             art.paper.g + (art.ink.g - art.paper.g) * t,
             art.paper.b + (art.ink.b - art.paper.b) * t, 1)
@@ -194,10 +201,22 @@ ApplicationWindow {
             Label { text: "Rendering controls"; font.pixelSize: 18 }
             Label { text: "Settings save automatically"; font.pixelSize: 12; color: "#66615b" }
             ScrollView {
+              id: controlsScroll
               Layout.fillWidth: true; Layout.fillHeight: true
               clip: true; contentWidth: availableWidth
               ColumnLayout {
                 width: parent.width; spacing: 8
+                // The default wheel step is slow for a long list of controls.
+                // This sits inside the content so it sees the wheel before the Flickable.
+                WheelHandler {
+                  target: null
+                  onWheel: function(event) {
+                    var view = controlsScroll.contentItem
+                    var step = event.pixelDelta.y !== 0 ? event.pixelDelta.y * 2 : event.angleDelta.y * 1.25
+                    view.contentY = Math.max(0, Math.min(view.contentHeight - view.height, view.contentY - step))
+                    event.accepted = true
+                  }
+                }
                 Repeater {
                   model: Parameters.controls()
                   ColumnLayout {
