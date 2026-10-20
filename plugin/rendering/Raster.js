@@ -41,7 +41,13 @@ function projection(part, view, vertexTone) {
   var key = [a[0], a[1], a[2], at[0], at[1], at[2], part.mirror, part.scale, part.shade,
     view.pitch, view.yaw, view.columns, view.rows, view.scale].join(",")
   // Both pods share one mesh, mirrored, so keep a few placements per mesh.
-  var mesh = part.mesh, cache = mesh.projections || (mesh.projections = [])
+  // The cache is derived data, so it stays non-enumerable: copying or
+  // comparing the shared geometry never sees it.
+  var mesh = part.mesh, cache = mesh.projections
+  if (!cache) {
+    cache = []
+    Object.defineProperty(mesh, "projections", { value: cache, enumerable: false })
+  }
   for (var i = 0; i < cache.length; i++)
     if (cache[i].tone === vertexTone && cache[i].key === key) return cache[i]
   if (cache.length >= 6) cache.shift()

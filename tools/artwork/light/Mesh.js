@@ -13,10 +13,12 @@ function frame(geometry, state, yaw, pitch, lid, pose, settings, baseline) {
     values = Live.frame(geometry, state, lid, 0, yaw, pitch, n, n, true,
       undefined, zoom, undefined, pose, state === "")
   } else {
-    var scene = Live.parts(geometry, state, lid, 0, undefined, undefined, pose)
-    for (var i = 0; i < scene.length; i++) {
-      if (scene[i].mesh.matte) scene[i].shade = options.recessShade
-    }
+    // Recolor matte recesses on copies, as the live renderer does; the parts
+    // reference the shared geometry, which must not change.
+    var scene = Live.parts(geometry, state, lid, 0, undefined, undefined, pose).map(function(part) {
+      if (!part.mesh.matte || part.shade >= 0.95) return part
+      return Object.assign({}, part, {shade: options.recessShade})
+    })
     var view = {state: state, lid: lid, yaw: yaw, pitch: pitch, columns: n, rows: n,
       scale: n / (state === "" ? 2.95 : 3.6) * zoom, study: options}
     if (state === "") {

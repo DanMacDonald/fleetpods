@@ -7,6 +7,13 @@ const Raster = loadQmlJs(new URL("../rendering/Raster.js", import.meta.url))
 const asset = Deno.readTextFileSync(new URL("../artwork/AirPodsMesh.js", import.meta.url))
 const geometry = new Function(asset.replace(/^\.pragma library\s*/, "") + "; return geometry")()
 function check(condition, message) { if (!condition) throw new Error(message) }
+// The light palette is strongly non-linear (ink curve, then contrast), so
+// "pale" and "soft" are judged on the tone actually shown, not raw ink.
+const lightStyle = Light.dotStyle(3, null, null)
+function shown(value) {
+  const band = lightStyle.level(value)
+  return band ? lightStyle.tone(Math.pow(band / lightStyle.levels, lightStyle.exponent)) : 0
+}
 
 // Public-interface snapshots, initially captured before separating renderers
 // and updated for reviewed visual changes. Cover both themes, every pod/case
@@ -300,10 +307,10 @@ const occluded = Mesh.frame(occlusionScene, "closed", 0, 0, 0, 0, 64, 64, true)
 check(foreground.every((v, i) => v === occluded[i]), "occluded geometry must never create visible ink")
 console.log("Eight oblique crease orientations and hidden-surface occlusion passed")
 
-// Soft illumination must leave a planar white shell uniformly pale. The light
-// preset (2026-10-19) gives front faces a faint even tint rather than bare
-// paper; it must stay uniform and light. A dark material still reads as a
-// hole; an actual nearby occluder still casts ink beyond that tint.
+// Soft illumination must leave a planar white shell uniformly pale as shown.
+// The light preset gives front faces a faint even raw tint that the palette
+// keeps near paper. A dark material still reads as a hole; an actual nearby
+// occluder still casts ink beyond that tint.
 {
   const size = 40, count = size * size, scale = size / 3.6
   const light = new Float32Array(count).fill(0.45)
@@ -312,7 +319,7 @@ console.log("Eight oblique crease orientations and hidden-surface occlusion pass
   const materials = new Float32Array(count).fill(1)
   for (let i = 0; i < count; i++) normals[i * 3 + 2] = 1
   const flat = Light.surfaceShading(light, depth, normals, materials, size, size, scale)
-  check(flat.every(v => v === flat[0] && v < 0.2), "softly lit white planes must remain uniformly pale")
+  check(flat.every(v => v === flat[0] && shown(v) < 0.06), "softly lit white planes must remain uniformly pale")
   const center = 20 * size + 20
   materials[center] = 0.1
   const hole = Light.surfaceShading(light, depth, normals, materials, size, size, scale)
@@ -380,7 +387,7 @@ console.log("Clean white faces, material openings, local occlusion, and single-d
   for (let y = 10; y < size - 10; y++) for (let x = 0; x < size; x++) {
     const i = y * size + x
     if (depth[i] === -100) continue
-    if (normals[i * 3 + 2] > 0.98) check(form[i] < 0.2, "the forward case face must remain pale (the preset's faint front tint)")
+    if (normals[i * 3 + 2] > 0.98) check(shown(form[i]) < 0.15, "the forward case face must remain pale")
     if (form[i] > 0.15 && normals[i * 3 + 2] < 0.70) roundedSamples++
   }
   check(roundedSamples > 100, "the rounded case sides must receive a visible tonal band")
@@ -705,7 +712,7 @@ console.log("Closed seams stay connected and single-cell through slopes and dept
     const vent = Light.defaults().ventInk
     check(frame[24 * 80 + x] > 0.9 * vent && frame[25 * 80 + x] > 0.6 * vent,
       "the vent must have a rounded two-row body, not a diagonal hairline")
-    check(frame[26 * 80 + x] < 0.15, "small vents must not grow into broad dark patches")
+    check(shown(frame[26 * 80 + x]) < 0.15, "small vents must not grow into broad dark patches")
   }
   const samples = { depth: new Float32Array(144), surfaces: new Uint8Array(144).fill(3),
     materials: new Float32Array(144).fill(1) }
@@ -831,16 +838,15 @@ console.log("Recess materials darken lid sockets and the empty lower well while 
         check(Math.abs(samples.materials[y * 80 + x] - 0.6) < 1e-6,
           "complete medial socket walls must use matte recessed plastic")
       }
-      // Front-facing shell takes the preset's faint tint (about 0.11); a crease
-      // knot or lost shoulder would be far darker than this cap.
+      // A crease knot or lost shoulder would show well above this tone.
       for (const x of [39, 40]) for (let y = 19; y <= 24; y++) {
         check(samples.materials[y * 80 + x] === 1 && samples.light[y * 80 + x] > 0.6,
           "the central divider must remain bright shell plastic")
-        check(ink[y * 80 + x] < 0.2,
+        check(shown(ink[y * 80 + x]) < 0.1,
           "light rendering must keep the central divider pale instead of adding alternating crease knots")
       }
       for (const y of [17, 18]) for (const x of [38, 39, 40, 41]) {
-        check(ink[y * 80 + x] < 0.2,
+        check(shown(ink[y * 80 + x]) < 0.1,
           "rounded inner socket corners must leave the wider white shoulder visible")
       }
       for (const x of [37, 42]) for (let y = 19; y <= 24; y++) {
@@ -849,7 +855,7 @@ console.log("Recess materials darken lid sockets and the empty lower well while 
       }
       if (state === "open-left") {
         for (let x = 42; x <= 61; x++) {
-          check(ink[33 * 80 + x] > 0.01 && ink[33 * 80 + x] < 0.5,
+          check(shown(ink[33 * 80 + x]) > 0.01 && shown(ink[33 * 80 + x]) < 0.75,
             "with internal outlines disabled, the lip retains soft shading rather than a solid ink row")
           if (x > 42) check(Math.abs(ink[33 * 80 + x] - ink[33 * 80 + x - 1]) < 0.2,
             "the unoutlined lip must retain a continuous shading gradient")

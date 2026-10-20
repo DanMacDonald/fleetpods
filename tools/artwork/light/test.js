@@ -79,9 +79,10 @@ for (const control of Parameters.controls()) {
   let changes = false
   for (const state of ['', 'open-empty']) {
     // Contrast needs a nonzero band to exercise it; the chosen preset turns
-    // internal contours off, so enable that band for this control check.
-    const controlDefaults = control.key === 'interiorOutline'
-      ? {...defaults, interiorWidth: 1} : defaults
+    // internal contours off, so enable that band for this control check. Its
+    // outline gain also saturates outline dots, so test overall strength at 1.
+    const controlDefaults = control.key === 'interiorOutline' ? {...defaults, interiorWidth: 1}
+      : control.key === 'outline' ? {...defaults, edgeGain: 1} : defaults
     const original = render(state, controlDefaults)
     for (const value of [control.from, control.to]) {
       const options = {...controlDefaults, [control.key]: value}
