@@ -32,6 +32,32 @@ for (const fixture of fixtures) {
 }
 console.log(`${fixtures.length} light/dark reference frames passed`)
 
+// At the popup's 100% scale, a shallow stem edge crosses half of the four
+// samples for several rows. Empty samples must reduce coverage, not turn a
+// lit white surface into the dark palette's shadow band.
+{
+  const size = 47, zoom = (0.98 - 2 / 128) * 1.38
+  const frame = Mesh.renderFrame(geometry, "", 1, 0, 0, 0.24,
+    size, size, false, 0, zoom, 0, 1, true)
+  const style = Mesh.dotStyle(false, 3, { r: 0, g: 0, b: 0 },
+    { r: 1, g: 1, b: 1 }, { r: 0, g: 0, b: 0 })
+  for (let y = 30; y <= 33; y++) {
+    const edge = y * size + 11, interior = edge + 1
+    check(frame.coverage && frame.coverage[edge] === 0.5,
+      "the stem-edge fixture must retain half coverage")
+    check(frame.values[edge] > 0.59 && frame.values[edge] < 0.62,
+      "empty samples must not darken the stem's surface illumination")
+    const edgeColor = style.colors[style.level(frame.values[edge])][0] * frame.coverage[edge]
+    check(edgeColor > 0.45 && edgeColor <= 0.5,
+      "a half-covered bright stem dot must retain half its painted brightness")
+    check(frame.coverage[interior] === 1 && frame.values[interior] > 0.65,
+      "fully covered stem dots must retain their illumination and opacity")
+  }
+  check(frame.coverage[0] === 0 && frame.values[0] === 0,
+    "empty background must stay empty")
+}
+console.log("Smoothed stem edges separate surface illumination from coverage")
+
 // Standalone entry rotates rigid buds around Y, without changing their scale,
 // handedness, or seating transforms used by any of the case states.
 {

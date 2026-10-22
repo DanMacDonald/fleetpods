@@ -44,8 +44,15 @@ also retained in the repository. Blender is only needed to regenerate geometry.
 The experimental popup integration uses `CaseMesh.qml` to frame this same
 renderer for every case state, including either pod out and the empty case. Its camera is fixed
 while the hinge and both pods animate; the study retains its rotation controls and all
-mesh variants. The canvas renders at twice its displayed dimensions so small
-popup dots retain their gaps.
+mesh variants. The canvas renders at the window's native device pixel ratio.
+At 100% scaling, partial edge coverage preserves the laptop's dot weight rather
+than rounding 1.5-pixel dots up to 2 pixels. Higher scales retain whole-pixel dots.
+The grid stays pixel-aligned in both modes, and the rendering follows the window
+when it moves between monitors.
+Smoothed dark artwork keeps surface lighting separate from silhouette coverage,
+so partially covered dots fade against the background without acquiring false shadows.
+At 100% and 200%, the standalone pods also use identical geometry framing; extra
+edge clearance is reserved for fractional display scales.
 
 The study is saved in Git as a baseline before live-plugin integration. To run
 that version later without reverting ongoing work, use

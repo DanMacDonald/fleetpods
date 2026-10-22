@@ -21,6 +21,7 @@ Item {
   property bool smoothSampling: false
   property bool alignDotsToPixels: true
   readonly property real pixelRatio: Math.max(1, Window.window ? Window.window.devicePixelRatio : Screen.devicePixelRatio)
+  readonly property bool softDotEdges: alignDotsToPixels && pixelRatio === 1
   readonly property real effectiveDotPitch: alignDotsToPixels ? Grid.screenPitch(dotPitch, pixelRatio) : Math.max(1.5, dotPitch)
   property real yaw: -0.32
   property real pitch: 0.24
@@ -97,6 +98,9 @@ Item {
     width: Math.ceil(root.width)
     height: Math.ceil(root.height)
     smooth: !root.alignDotsToPixels
+    // Only the 100% display needs partial edge coverage. Keep the grid itself
+    // pixel-aligned so every dot has the same footprint, without beat patterns.
+    antialiasing: root.softDotEdges
     onPaint: {
       if (!root.visible) return
       var ctx = getContext("2d")
@@ -126,6 +130,7 @@ Item {
             left = Math.round(left * root.pixelRatio) / root.pixelRatio
             top = Math.round(top * root.pixelRatio) / root.pixelRatio
           }
+          ctx.globalAlpha = frame.coverage ? frame.coverage[i] : 1
           ctx.fillRect(left, top, size, size)
         }
       }

@@ -65,8 +65,8 @@ function frame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, right
   return renderFrame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, rightLift, zoom, leftLift, budsArrival, smoothSampling, podTurns).values
 }
 
-// Both renderers return { values: Float32Array, tonal: boolean }. The painter
-// uses tonal to select background-to-ink versus shadow-to-light dot colors.
+// The painter selects background-to-ink versus shadow-to-light dot colors.
+// Smoothed dark frames also carry coverage, applied after palette selection.
 function renderFrame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, rightLift, zoom, leftLift, budsArrival, smoothSampling, podTurns) {
   var renderer = ink ? Light : Dark
   var scene = parts(geometry, state, lid, time, rightLift, leftLift, budsArrival, podTurns)
@@ -76,17 +76,27 @@ function renderFrame(geometry, state, lid, time, yaw, pitch, columns, rows, ink,
   }
   if (!smoothSampling) return renderer.render(scene, view)
   // Integrate a small footprint per grid cell before palette quantization.
-  // Every sample uses the same renderer and depth rules; only dot color varies.
+  // Every sample uses the same renderer and depth rules.
   var values = new Float32Array(columns * rows)
+  var coverage = ink ? null : new Float32Array(values.length)
   for (var y = -1; y <= 1; y += 2) {
     for (var x = -1; x <= 1; x += 2) {
       view.sampleX = x * 0.25
       view.sampleY = y * 0.25
       var sample = renderer.render(scene, view)
-      for (var i = 0; i < values.length; i++) values[i] += sample.values[i] * 0.25
+      for (var i = 0; i < values.length; i++) {
+        values[i] += sample.values[i] * 0.25
+        if (coverage && sample.values[i] > 0) coverage[i] += 0.25
+      }
     }
   }
-  return { values: values, tonal: !!ink }
+  // Empty sub-samples are background, not poorly lit surface. Feeding their
+  // zeroes through the dark palette's nonlinear shadow cutoff makes a bright
+  // stem edge look like a dark patch. Shade only the covered surface, then
+  // composite its coverage against the actual background in the painter.
+  if (coverage) for (var i = 0; i < values.length; i++)
+    if (coverage[i] > 0) values[i] /= coverage[i]
+  return { values: values, tonal: !!ink, coverage: coverage }
 }
 
 // The canvas only paints squares. Palette, quantization, and dot weight are

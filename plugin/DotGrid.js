@@ -12,9 +12,11 @@ function screenPitch(requested, pixelRatio) {
 }
 
 function screenSize(requested, dotPitch, pixelRatio) {
-  // Keep the existing half-pixel glyph weight at 200%, then choose the nearest
-  // physical size on other displays. Leave at least one pixel between dots.
+  // At 100%, preserve the laptop's half-logical-pixel weight with coverage
+  // antialiasing. Rounding 1.5 to 2 otherwise makes dark dots much heavier.
+  // Higher-density displays keep their crisp whole-pixel glyphs.
   var nominal = Math.max(0.5, Math.floor(requested * 2) / 2)
+  if (pixelRatio === 1) return Math.max(1, Math.min(dotPitch - 1, nominal))
   return Math.max(1, Math.min(Math.round(dotPitch * pixelRatio) - 1,
     Math.round(nominal * pixelRatio))) / pixelRatio
 }

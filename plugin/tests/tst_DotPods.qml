@@ -7,8 +7,8 @@ TestCase {
   name: "DotPods"
   when: windowShown
   visible: true
-  width: 160
-  height: 160
+  width: 320
+  height: 320
   Component { id: artwork; Pods.DotPods { width: 128; height: 128 } }
   Component {
     id: gridCapture
@@ -34,8 +34,13 @@ TestCase {
     fuzzyCompare(pitch * data.ratio, Math.round(3 * data.ratio), 0.00001)
     for (var requested of [1.68, 2.016]) {
       var size = Grid.screenSize(requested, pitch, data.ratio)
-      fuzzyCompare(size * data.ratio, Math.round(size * data.ratio), 0.00001)
+      if (data.ratio !== 1)
+        fuzzyCompare(size * data.ratio, Math.round(size * data.ratio), 0.00001)
       verify((pitch - size) * data.ratio >= 0.99999)
+    }
+    if (data.ratio === 1) {
+      compare(Grid.screenSize(1.68, pitch, 1), 1.5)
+      compare(Grid.screenSize(2.016, pitch, 1), 2)
     }
     if (data.ratio === 2) {
       compare(pitch, 3)
@@ -57,12 +62,23 @@ TestCase {
     var pitch = item.mesh.effectiveDotPitch
     var expected = Math.round(Grid.screenSize(Math.max(0.85, pitch * 0.4) * 1.4, pitch, ratio) * ratio)
     var count = 0
+    var softDots = 0
     for (var y = 0; y < shot.height; ++y) {
       var start = -1, previous = -1
       for (var x = 0; x <= shot.width; ++x) {
-        var filled = x < shot.width && shot.red(x, y) > 127
-        if (x < shot.width) verify(shot.red(x, y) === 0 || shot.red(x, y) === 255,
+        var filled = x < shot.width && shot.red(x, y) > 0
+        if (x < shot.width && !item.mesh.softDotEdges) verify(shot.red(x, y) === 0 || shot.red(x, y) === 255,
           "dot coverage must not create alternating dim edges")
+        if (x < shot.width && item.mesh.softDotEdges && shot.red(x, y) === 255) {
+          // A 1.5 x 1.5 dot covers 2.25 pixels, matching the 3 x 3 dot at 2x.
+          // Every dot must have the same partial edges and a clear gap.
+          fuzzyCompare(shot.red(x + 1, y), 127, 2)
+          fuzzyCompare(shot.red(x, y + 1), 127, 2)
+          fuzzyCompare(shot.red(x + 1, y + 1), 63, 2)
+          compare(shot.red(x + 2, y), 0)
+          compare(shot.red(x, y + 2), 0)
+          softDots++
+        }
         if (filled && start < 0) {
           start = x
           if (previous >= 0) compare((start - previous) % Math.round(pitch * ratio), 0,
@@ -76,6 +92,7 @@ TestCase {
       }
     }
     verify(count > 100, "captured the rendered grid")
+    if (item.mesh.softDotEdges) verify(softDots > 50, "captured consistent partial coverage")
   }
 
   function test_hiddenArtworkStopsRendering() {
@@ -90,6 +107,30 @@ TestCase {
     tryVerify(function() { return item.time > stopped }, 500)
     item.animating = false
     verify(!item.animationRunning)
+  }
+
+  function test_smoothedStemEdgeRetainsHalfBrightness() {
+    var item = createTemporaryObject(gridCapture, this)
+    // QtTest's offscreen grab crops the physical backing image to the item's
+    // logical size. Leave enough background to include the stems at 200%.
+    item.width = 320
+    item.height = 320
+    item.mesh.x = 10
+    item.mesh.y = 10
+    item.mesh.width = 141
+    item.mesh.height = 141
+    item.mesh.caseState = ""
+    item.mesh.shadowColor = "black"
+    item.mesh.smoothSampling = true
+    item.mesh.zoom = (0.98 - 2 / 128) * 1.38
+    wait(400)
+    var shot = grabImage(item), ratio = item.mesh.pixelRatio
+    // First full pixel of the half-covered dot at column 11, row 30.
+    var edge = shot.red(Math.round(44 * ratio), Math.round(101 * ratio))
+    var interior = shot.red(Math.round(47 * ratio), Math.round(101 * ratio))
+    verify(edge >= 120 && edge <= 130,
+      "half-covered bright stem must composite near half white, got " + edge)
+    compare(interior, 255, "the adjacent fully covered stem remains bright")
   }
 
   function test_caseOpensAndClosesWhileMotionIsPaused() {

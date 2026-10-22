@@ -77,22 +77,22 @@ TestCase {
   }
 
   function test_popupPaintsCompleteEdgeDots_data() {
-    return ["closed", "open", "open-left", "open-right", "open-empty"].map(function(state) {
-      return { tag: state, state: state }
+    return ["", "closed", "open", "open-left", "open-right", "open-empty"].map(function(state) {
+      return { tag: state || "pods", state: state }
     })
   }
 
   function test_popupPaintsCompleteEdgeDots(data) {
-    var item = createTemporaryObject(popup, this, { caseState: data.state, iconSize: 137 })
-    var mesh = findChild(item, "caseMesh")
+    var item = createTemporaryObject(popup, this, { caseState: data.state, iconSize: data.state === "" ? 128 : 137 })
+    var mesh = findChild(item, data.state === "" ? "budsMesh" : "caseMesh")
     var pitch = mesh.effectiveDotPitch, columns = Math.floor(mesh.width / pitch)
     for (var light of [false, true]) {
       var style = Mesh.dotStyle(light, pitch, mesh.backgroundColor, mesh.foregroundColor, mesh.shadowColor)
       var size = Math.min(pitch * 0.85, style.size * mesh.dotScale)
       if (mesh.alignDotsToPixels) size = Grid.screenSize(size, pitch, mesh.pixelRatio)
-      for (var lid of [0, 0.25, 0.5, 0.75, 1]) {
+      for (var lid of data.state === "" ? [1] : [0, 0.25, 0.5, 0.75, 1]) {
         var frame = Mesh.frame(mesh.geometry, data.state, lid, 0, mesh.yaw, mesh.pitch,
-          columns, columns, light, 0, mesh.zoom)
+          columns, columns, light, 0, mesh.zoom, 0, 1, mesh.smoothSampling)
         for (var i = 0; i < frame.length; i++) {
           if (style.level(frame[i]) === 0) continue
           var x = (i % columns + 0.5) * pitch, y = (Math.floor(i / columns) + 0.5) * pitch
@@ -105,6 +105,24 @@ TestCase {
             "outer columns must fit whole dots inside the icon clip: x=" + point.x + ", size=" + size + ", lid=" + lid + ", light=" + light)
         }
       }
+    }
+  }
+
+  function test_standaloneStemHasNoDisplayScaleInset() {
+    var item = createTemporaryObject(popup, this, { caseState: "", iconSize: 128 })
+    var mesh = findChild(item, "budsMesh")
+    if (mesh.pixelRatio !== 1 && mesh.pixelRatio !== 2)
+      skip("The identical logical grids are on 100% and 200% displays")
+    var columns = Math.floor(mesh.width / mesh.effectiveDotPitch)
+    compare(columns, 47)
+    var frame = Mesh.renderFrame(mesh.geometry, "", 1, 0, mesh.yaw, mesh.pitch,
+      columns, columns, false, 0, mesh.zoom, 0, 1, mesh.smoothSampling)
+    // This strip was half-covered only at 100% because the legacy inset
+    // shrank the geometry even after dots had regained their 1.5 px weight.
+    for (var y = 30; y <= 33; y++) {
+      var stem = y * columns + 11
+      compare(frame.coverage[stem], 1, "the left stem must stay fully covered at row " + y)
+      verify(frame.values[stem] > 0.58, "the stem remains a lit surface")
     }
   }
 
