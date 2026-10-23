@@ -168,6 +168,7 @@ pub struct Schedule {
     aired_at: Option<MonoMs>,
     on_air: bool,
     presence: Option<Vec<u8>>,
+    activity: Option<Vec<u8>>,
     presence_urgent: bool,
     roster: Option<Vec<u8>>,
     roster_remaining: u8,
@@ -195,6 +196,7 @@ impl Schedule {
             aired_at: None,
             on_air: false,
             presence: None,
+            activity: None,
             presence_urgent: false,
             roster: None,
             roster_remaining: 0,
@@ -218,6 +220,15 @@ impl Schedule {
     pub fn offer_handoff_presence(&mut self, frame: Vec<u8>) {
         self.offer(frame);
         self.presence_urgent = true;
+    }
+
+    /// Activity has a single replaceable slot, refreshed by its owner module.
+    pub fn offer_activity(&mut self, frame: Vec<u8>) {
+        self.activity = Some(frame);
+    }
+
+    pub fn clear_activity(&mut self) {
+        self.activity = None;
     }
 
     pub fn clear_presence(&mut self) {
@@ -393,6 +404,12 @@ impl Schedule {
         if self.presence_urgent && self.route.is_none() {
             return self.take_presence(now);
         }
+        // One activity frame per refresh, after urgent control traffic. It
+        // cannot fill a repeat queue or replace legacy discovery/roster data.
+        if let Some(bytes) = self.activity.take() {
+            self.mark_aired(now);
+            return Some(Item::Activity(bytes));
+        }
         // Previous-daemon rotation: presence, roster, then the repeated
         // enrollment packet. Routing still takes the later slots.
         if self.repeat.is_some() && self.route.is_none() {
@@ -470,6 +487,7 @@ impl Default for Schedule {
 /// Which advertisement `due` chose. The caller does not read the bytes to find out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
+    Activity(Vec<u8>),
     Letter(Vec<u8>),
     Presence(Vec<u8>),
     Roster(Vec<u8>),

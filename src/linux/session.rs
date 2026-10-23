@@ -121,11 +121,15 @@ impl Session {
         }
     }
 
-    /// Load a roster watermark from the previous process and remember where to write the next one.
+    /// Load the durable roster watermark and sibling activity preference, and
+    /// remember their state directory for subsequent writes.
     pub fn use_roster_file(&mut self, path: &std::path::Path) {
         self.watermark = Some(path.to_path_buf());
         if let Ok(bytes) = std::fs::read(path) {
             self.daemon.import_roster_watermark(&bytes);
+        }
+        if let Ok(bytes) = std::fs::read(path.with_file_name("activity.preference")) {
+            self.daemon.activity_preference.restore(&bytes);
         }
     }
 
@@ -433,6 +437,11 @@ impl Session {
             Effect::Listen => self.radio(Job::Listen),
             Effect::StopListen => self.radio(Job::StopListen),
             Effect::StoreWatermark(bytes) => self.store_watermark(bytes),
+            Effect::StoreActivity(bytes) => {
+                if let Some(path) = &self.watermark {
+                    Self::store_state(&path.with_file_name("activity.preference"), bytes);
+                }
+            }
             Effect::StoreDevices(labels) => {
                 if let Err(err) = crate::devices::store(labels) {
                     eprintln!("fleetpodsd: could not save device names: {err}");
@@ -485,6 +494,10 @@ impl Session {
         let Some(path) = &self.watermark else {
             return;
         };
+        Self::store_state(path, bytes);
+    }
+
+    fn store_state(path: &std::path::Path, bytes: &[u8]) {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }

@@ -540,13 +540,9 @@ function caseIconState(isHeadset, lidState, left, right, previousState, hadInEar
     return "closed"
   if (!connected && stale && (left.charging || right.charging))
     return "closed"
-  if (leftOut && rightOut) {
-    // Hold the empty case for a beat when the last pod leaves, then the buds glyph.
-    if (previousState === "open" || previousState === "open-left"
-      || previousState === "open-right" || previousState === "open-empty")
-      return "open-empty"
-    return ""
-  }
+  // This is placement evidence. The artwork owns any empty-case hold and
+  // its exit; presentation history must not be fed back into physical state.
+  if (leftOut && rightOut) return ""
   // Named for the pod still sitting in the case. Unknown placement retains
   // each pod's last known side of the rim; no history defaults to seated.
   if (leftOut && !rightOut) return "open-right"

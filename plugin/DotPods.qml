@@ -97,6 +97,10 @@ Item {
     // texture followed by downsampling creates uneven dots at fractional DPI.
     width: Math.ceil(root.width)
     height: Math.ceil(root.height)
+    transform: Scale {
+      xScale: root.alignDotsToPixels ? Grid.canvasScale(canvas.width, root.pixelRatio) : 1
+      yScale: root.alignDotsToPixels ? Grid.canvasScale(canvas.height, root.pixelRatio) : 1
+    }
     smooth: !root.alignDotsToPixels
     // Only the 100% display needs partial edge coverage. Keep the grid itself
     // pixel-aligned so every dot has the same footprint, without beat patterns.

@@ -153,10 +153,6 @@ Item {
   property string caseIconState: "closed"
   property bool lastAnyInEar: false
   property var rememberedPlacement: ({ left: null, right: null })
-  // Match the pod lift; the artwork itself waits for both pods to clear.
-  readonly property int emptyCaseHoldMs: 840
-  readonly property int emptyCaseConfirmMs: 250
-  property bool emptyCasePending: false
   property bool schemaUnsupported: false
 
   readonly property string ctlPath: String(setting("ctlPath", "") || "fleetpods")
@@ -200,9 +196,6 @@ Item {
 
   // The daemon removes the file when it stops, so an absent file is a stopped daemon.
   function resetConnectionState() {
-    emptyCaseConfirmTimer.stop()
-    emptyCasePending = false
-    emptyCaseTimer.stop()
     caseIconState = "closed"
     lastAnyInEar = false
     rememberedPlacement = { left: null, right: null }
@@ -320,41 +313,13 @@ Item {
 
   function tickCaseIcon() {
     if (view.pairingMode && (!view.bluetoothPaired || !view.pairingKeysReady)) {
-      applyCaseIcon("open")
+      caseIconState = "open"
       return
     }
-    applyCaseIcon(Model.caseIconState(view.isHeadset, view.iconLidState,
+    caseIconState = Model.caseIconState(view.isHeadset, view.iconLidState,
       view.left, view.right, caseIconState, lastAnyInEar,
       view.lastAdvertisementMs, caseIconNowMs(view.lastAdvertisementMs), 20000, view.connected, view.earReported,
-      (!view.bluetoothPaired || !view.pairingKeysReady), rememberedPlacement))
-  }
-
-  function applyCaseIcon(nextCase) {
-    if (nextCase === "open-empty") {
-      // Conflicting ear reports must settle before showing the empty-case animation.
-      if (caseIconState !== "open-empty" && !emptyCasePending) {
-        emptyCasePending = true
-        emptyCaseConfirmTimer.restart()
-      }
-      return
-    }
-    emptyCaseConfirmTimer.stop()
-    emptyCasePending = false
-    emptyCaseTimer.stop()
-    caseIconState = nextCase
-  }
-
-  function confirmEmptyCase() {
-    emptyCaseConfirmTimer.stop()
-    if (!emptyCasePending) return
-    emptyCasePending = false
-    caseIconState = "open-empty"
-    emptyCaseTimer.restart()
-  }
-
-  function emptyCaseHoldDone() {
-    emptyCaseTimer.stop()
-    if (caseIconState === "open-empty") caseIconState = ""
+      (!view.bluetoothPaired || !view.pairingKeysReady), rememberedPlacement)
   }
 
   // The status log holds the optimistic claim and release from the send event.
@@ -377,20 +342,6 @@ Item {
     interval: root.settleHoldMs
     repeat: false
     onTriggered: { root._clearPending(); root.refresh() }
-  }
-
-  Timer {
-    id: emptyCaseConfirmTimer
-    interval: root.emptyCaseConfirmMs
-    repeat: false
-    onTriggered: root.confirmEmptyCase()
-  }
-
-  Timer {
-    id: emptyCaseTimer
-    interval: root.emptyCaseHoldMs
-    repeat: false
-    onTriggered: root.emptyCaseHoldDone()
   }
 
   FileView {

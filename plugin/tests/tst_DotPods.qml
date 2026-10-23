@@ -50,44 +50,54 @@ TestCase {
   }
 
   function test_physicalDotsHaveUniformFootprints_data() {
-    return ["closed", "open-empty", ""].map(function(state) {
-      return { tag: state || "pods", state: state }
-    })
+    var rows = []
+    for (var state of ["closed", "open-empty", ""])
+      for (var size of [128, 140.625])
+        for (var origin of [10.3, 10.375, 10.5])
+          rows.push({ tag: (state || "pods") + " " + size + " at " + origin,
+            state: state, size: size, origin: origin })
+    return rows
   }
   function test_physicalDotsHaveUniformFootprints(data) {
     var item = createTemporaryObject(gridCapture, this)
+    item.width = 360; item.height = 360
     item.mesh.caseState = data.state
+    item.mesh.width = data.size; item.mesh.height = data.size
+    item.mesh.x = data.origin; item.mesh.y = data.origin
     wait(400)
     var shot = grabImage(item), ratio = item.mesh.pixelRatio
     var pitch = item.mesh.effectiveDotPitch
     var expected = Math.round(Grid.screenSize(Math.max(0.85, pitch * 0.4) * 1.4, pitch, ratio) * ratio)
     var count = 0
     var softDots = 0
-    for (var y = 0; y < shot.height; ++y) {
-      var start = -1, previous = -1
-      for (var x = 0; x <= shot.width; ++x) {
-        var filled = x < shot.width && shot.red(x, y) > 0
-        if (x < shot.width && !item.mesh.softDotEdges) verify(shot.red(x, y) === 0 || shot.red(x, y) === 255,
-          "dot coverage must not create alternating dim edges")
-        if (x < shot.width && item.mesh.softDotEdges && shot.red(x, y) === 255) {
-          // A 1.5 x 1.5 dot covers 2.25 pixels, matching the 3 x 3 dot at 2x.
-          // Every dot must have the same partial edges and a clear gap.
-          fuzzyCompare(shot.red(x + 1, y), 127, 2)
-          fuzzyCompare(shot.red(x, y + 1), 127, 2)
-          fuzzyCompare(shot.red(x + 1, y + 1), 63, 2)
-          compare(shot.red(x + 2, y), 0)
-          compare(shot.red(x, y + 2), 0)
-          softDots++
-        }
-        if (filled && start < 0) {
-          start = x
-          if (previous >= 0) compare((start - previous) % Math.round(pitch * ratio), 0,
-            "dot starts stay on a uniform physical grid")
-          previous = start
-        }
-        if (!filled && start >= 0) {
-          compare(x - start, expected, "every dot row has the same physical width")
-          start = -1; count++
+    for (var vertical of [false, true]) {
+      var red = function(x, y) { return vertical ? shot.red(y, x) : shot.red(x, y) }
+      for (var y = 0; y < shot.height; ++y) {
+        var start = -1, previous = -1
+        for (var x = 0; x <= shot.width; ++x) {
+          var filled = x < shot.width && red(x, y) > 0
+          if (x < shot.width && !item.mesh.softDotEdges) verify(red(x, y) === 0 || red(x, y) === 255,
+            "dot coverage must not create alternating dim edges")
+          if (x < shot.width && item.mesh.softDotEdges && red(x, y) === 255) {
+            // A 1.5 x 1.5 dot covers 2.25 pixels, matching the 3 x 3 dot at 2x.
+            // Every dot must have the same partial edges and a clear gap.
+            fuzzyCompare(red(x + 1, y), 127, 2)
+            fuzzyCompare(red(x, y + 1), 127, 2)
+            fuzzyCompare(red(x + 1, y + 1), 63, 2)
+            compare(red(x + 2, y), 0)
+            compare(red(x, y + 2), 0)
+            softDots++
+          }
+          if (filled && start < 0) {
+            start = x
+            if (previous >= 0) compare((start - previous) % Math.round(pitch * ratio), 0,
+              "dot starts stay on a uniform physical grid")
+            previous = start
+          }
+          if (!filled && start >= 0) {
+            compare(x - start, expected, "every dot row has the same physical width")
+            start = -1; count++
+          }
         }
       }
     }
@@ -117,8 +127,9 @@ TestCase {
     item.height = 320
     item.mesh.x = 10
     item.mesh.y = 10
-    item.mesh.width = 141
-    item.mesh.height = 141
+    // Keep the sampled geometry at 47 cells across display scales.
+    item.mesh.width = 47 * item.mesh.effectiveDotPitch
+    item.mesh.height = item.mesh.width
     item.mesh.caseState = ""
     item.mesh.shadowColor = "black"
     item.mesh.smoothSampling = true
@@ -126,8 +137,12 @@ TestCase {
     wait(400)
     var shot = grabImage(item), ratio = item.mesh.pixelRatio
     // First full pixel of the half-covered dot at column 11, row 30.
-    var edge = shot.red(Math.round(44 * ratio), Math.round(101 * ratio))
-    var interior = shot.red(Math.round(47 * ratio), Math.round(101 * ratio))
+    var pitch = item.mesh.effectiveDotPitch
+    var size = Grid.screenSize(pitch * 0.4 * item.mesh.dotScale, pitch, ratio)
+    var x = Math.round(item.mesh.x * ratio) + Math.round(((11 + 0.5) * pitch - size / 2) * ratio)
+    var y = Math.round(item.mesh.y * ratio) + Math.round(((30 + 0.5) * pitch - size / 2) * ratio)
+    var edge = shot.red(x, y)
+    var interior = shot.red(x + Math.round(pitch * ratio), y)
     verify(edge >= 120 && edge <= 130,
       "half-covered bright stem must composite near half white, got " + edge)
     compare(interior, 255, "the adjacent fully covered stem remains bright")

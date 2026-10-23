@@ -19,10 +19,11 @@ The Quickshell panel lives in `plugin/` at the repository root, next to `src/`. 
 | `fleet::roster` | Authenticated roster reports, bound to reporter, accessory, session, and sequence | Direct accessory reports |
 | `fleet::members` | Fleet records and accessory keys | The invitation in progress |
 | `fleet::enroll` | One invitation: role, attempt, phase, expiry, tentative keys | A durable fleet |
+| `fleet::activity` | The durable preferred connector, authenticated activity gossip, and one wake request per availability cycle | Playback ownership, Bluetooth retries, or a fallback election |
 | `fleet::route` | Handoff intent and one admission transaction | The local Bluetooth retry |
 | `fleet::wire` | Service UUID and the enrollment context string | Enrollment outcome |
-| `audio::play` | Profile choice, stream holds, player observations, ear pause, volume ducking | A second audio-server connection |
-| `audio::route` | Which sink and which streams follow a claim | Opening PipeWire |
+| `audio::play` | Profile choice, player observations, ear pause, volume ducking | Stream mute/volume holds |
+| `audio::route` | Routing, original stream mute/volume state, handoff drain, recovery and ordered restoration work | Seat ownership and opening PipeWire |
 | `audio::mic` | Capture while the hidden source is streaming and not muted, the restart budget, and the verified format table | Playback profile policy |
 | `audio::seat` | Nothing. Who is playing, read from the pods and the fleet | The reports it reads |
 | `panel::status` | Nothing. The JSON document | Decisions |
@@ -42,6 +43,45 @@ The acceptance world answers an open link the same way the BlueZ thread does: Bl
 Enrollment letters are bytes from the moment they leave the daemon (`pf1` plus one JSON object, encoded in `fleet::postcard`). The platform never sees the in-memory `Letter` enum. That frame is not the C++ advertisement; A30 still needs captured fixtures. SPAKE2 itself lives in `fleet::crypto`, and the conversation that uses it lives in `handshake`.
 
 The acceptance world is a clock, a mailbox, and a log of those effects. Each scenario has its own world. The world answers `OpenLink` with `LinkOpened` or `LinkFailed` and forwards bytes. It does not finish a link on the daemon's behalf.
+
+## Remembered connector
+
+`fleet::activity::Preference` owns one record scoped to the fleet ID and paired accessory: owner address and activity time. Physical desktop activity, a new accepted Play, and explicit Connect/HandoffClaim update it, including while the pods are stowed. Startup player snapshots, case advertisements, heartbeats, and reconnects do not create activity. Equal timestamps use address bytes as a deterministic tie break; subsequent local input advances past a just-heard timestamp. Preference does not expire when its owner sleeps or leaves discovery.
+
+Version 9 advertisements gossip this record independently of roster/audio ownership. The 63-byte frame is `9 || seal_fleet("fleetpods-activity-v1", fleet_id, fleet_key, body)`, with a 34-byte body: relay address (6), accessory (6), owner (6), activity Unix milliseconds (8, big endian), envelope Unix milliseconds (8, big endian). Both relay and owner must be current fleet members (or the local device); wrong-accessory, unauthenticated, expired-envelope, and excessive-future-time frames are rejected. Envelopes expire after 15 seconds with the existing 5-second skew allowance; the remembered activity does not expire. Relaying a record refreshes only the envelope. Refreshes use a bounded radio slot every three seconds; new activity can be offered immediately. Existing presence and roster formats stay compatible.
+
+The Linux adapter atomically saves changes in `activity.preference` beside the status file under the user's state directory and restores them on startup. Resetting the fleet, changing the accessory, or removing the preferred member clears the record. Status exposes `fleet_preference` for diagnosis. An enrolled fleet with no valid record waits for fresh activity or explicit Connect.
+
+When the case opens or a pod becomes available, the preferred device waits two seconds, then asks the existing `pods::link::Connection` to connect in the background. The preference module never retries Bluetooth itself. Every automatic open and unsolicited attach is gated by the preference; a newer remote preference cancels an opening attempt and releases any held speaker audio. An established connection is not evicted merely by a preference change. Existing Apple playback protection, pairing holds, user disconnects, and explicit Apple reconnect transactions still apply. Availability alone never claims audio.
+
+All fleet daemons must be upgraded for this policy: older versions ignore version 9 and retain their old reconnect behavior. BLE gossip provides convergence when packets arrive, not distributed consensus during a radio partition. A device that has not received newer activity can temporarily have an outdated preference; there is no timeout-based fallback to a known nonpreferred host. Validate cross-device behavior on hardware as well as in the two-daemon tests.
+
+## Audio handoffs
+
+`audio::route::Router` owns saved stream state from acquisition through routing,
+handoff drain and recovery. The daemon supplies claim/release intent, graph
+observations and the clock. It drains ordered work once per step after all
+ownership and recovery decisions. Mutes execute ahead of player pauses and
+control writes. Recovery can cancel a queued restore before it reaches Linux;
+a new claim inherits a handoff's originals before reading a muted graph. An
+audio-server restart discards saved serials and every queued mute or restore.
+`Audio` keeps player observations, not a second copy of routing holds.
+
+## Artwork ownership
+
+`Model` interprets physical pod placement and `Service` retains that evidence.
+Neither schedules illustration changes. `AirPodsIcon` owns confirmation of the
+last departure, pod motion, empty-case hold and exit, standalone entrance,
+interruption, and renderer lifetime. Hidden artwork settles without replaying
+old transitions. The icon publishes connector positions so `SeatsView` does not
+interpret animation flags. Qt's scene-graph animator still moves the entrance
+texture independently of shading work.
+
+`MeshArtwork` owns the case and standalone frames, display-scale clearance,
+palette, camera and resting connector anchors. Popup and preview both use it.
+`DotPods` paints coverage separately from surface shading; the grid, mesh and
+light/dark rasterizers remain internal implementations. Framing tests capture
+the actual artwork at the same interface used by those callers.
 
 ## Rules that the types enforce
 
@@ -64,7 +104,7 @@ Do not add an event bus, an actor framework, or a trait per operating system to 
 
 ## Clocks
 
-`pods`, `fleet`, and `audio` store `MonoMs`. The status file uses Unix milliseconds. `Clock` is a paired reading taken by the runtime, and it is the only conversion.
+`pods`, `fleet`, and `audio` use `MonoMs` for local deadlines. Cross-device activity ordering and authenticated envelope timestamps use `UnixMs`; the preference survives reboot. The status file uses Unix milliseconds. `Clock` is a paired reading taken by the runtime, and it is the only conversion.
 
 ## What is deliberately absent
 

@@ -47,3 +47,11 @@ Later on 2026-10-13, the user reported Brave going silent during playback on XPS
 The daemon now observes raw sink states and can reopen an idle, suspended or failed output after three seconds of active, unmuted playback on a locally owned connection. Pauses, muted streams, sleep and handoffs are excluded. Recovery is rate-limited and bounded. `fleetpods audio reset` requests the same operation for failures that continue reporting a running output.
 
 The follow-up build passed 269 unit tests, 32 acceptance scenarios and Clippy. Simulated daemon tests cover the recovery delay, repeated failures, peer ownership, pause, suspend and unchanged Bluetooth pairing. The command completed on XPS with the control link ready, AirPods keys intact and fleet membership preserved. Attempts to inject a sustained hardware failure by suspending the sink returned it to running before the watchdog confirmed a persistent fault. They do not establish hardware validation of automatic recovery or reproduce the original silent-but-running failure. Long uninterrupted playback and capture at the next recurrence remain necessary to investigate its cause.
+
+## Remembered fleet connector
+
+Run with the new daemon on every fleet host. With the pods in a closed case, use host A and then host B, allowing a few seconds for radio exchange. Both status files should show B in `fleet_preference.device`, with the same `activity_ms`. Open the case: only B should open a control connection, and availability alone should not move speaker audio to the pods.
+
+Repeat with B asleep before opening the case. A must stay disconnected beyond discovery expiry and the old reconnect grace. Restart A and verify that B remains preferred. Fresh input or explicit Connect on A should make A preferred. A phone already playing on the pods must retain its existing activity protection. Check that a superseded pending connection restores the original mute and volume of any held speaker streams.
+
+This is a hardware checklist, not a claim of completed hardware validation. The automated two-daemon regression covers radio exchange, persisted preference, case reopen, absent owner, unsolicited attach, explicit Connect, and cancellation of a superseded opening attempt. Radio isolation can leave devices with different last-heard activity; do not infer consensus from a single host's status.

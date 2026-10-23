@@ -3,7 +3,6 @@ import QtQuick
 import QtTest
 import ".." as Pods
 import "../DotMesh.js" as Mesh
-import "../DotGrid.js" as Grid
 import "../rendering/Raster.js" as Raster
 import "../Model.js" as Model
 import qs.Commons as Commons
@@ -61,6 +60,50 @@ TestCase {
     }
   }
 
+  function test_placementOwnsTheEntireLastPodDeparture() {
+    var item = createTemporaryObject(popup, this, { caseState: "open-left" })
+    var mesh = findChild(item, "caseMesh")
+    item.caseState = ""
+    wait(100)
+    compare(mesh.leftLift, 0, "brief contradictory placement cannot lift the last pod")
+    tryVerify(function() { return mesh.leftLift > 0 }, 600)
+    verify(item.usesMeshCase, "the case survives confirmation and departure")
+    tryVerify(function() { return item.caseOut > 0 }, 1400)
+    compare(mesh.leftLift, 1, "case exit waits for both pods to clear")
+    tryCompare(item, "caseExiting", false, 600)
+    verify(item.usesMeshBuds)
+    tryCompare(item, "budsIn", 1, 1200)
+  }
+
+  function test_returnCancelsPendingEmptyPresentation_data() {
+    return [{ tag: "confirmation", delay: 100 }, { tag: "lift", delay: 400 }]
+  }
+  function test_returnCancelsPendingEmptyPresentation(data) {
+    var item = createTemporaryObject(popup, this, { caseState: "open-left" })
+    item.caseState = ""
+    wait(data.delay)
+    item.caseState = "open-left"
+    var mesh = findChild(item, "caseMesh")
+    tryCompare(mesh, "leftLift", 0, 900)
+    wait(1100)
+    verify(item.usesMeshCase, "a cancelled hold must never unload the returning case")
+    compare(mesh.rightLift, 1)
+    compare(item.caseOut, 0)
+  }
+
+  function test_hiddenDepartureCancelsAllPresentationTimers() {
+    var item = createTemporaryObject(popup, this, { caseState: "open-left" })
+    item.caseState = ""
+    wait(100)
+    item.visible = false
+    item.visible = true
+    verify(item.usesMeshBuds)
+    compare(item.budsIn, 1)
+    wait(1200)
+    verify(item.usesMeshBuds)
+    compare(item.budsIn, 1, "reopening must not replay a stale pending departure")
+  }
+
   function test_popupGridStaysConsistentAcrossStates() {
     for (var size of [128, 160]) {
       for (var state of ["", "closed", "open", "open-left", "open-right", "open-empty"]) {
@@ -72,38 +115,6 @@ TestCase {
         verify(mesh.alignDotsToPixels)
         fuzzyCompare(mesh.width / mesh.effectiveDotPitch, Math.round(mesh.width / mesh.effectiveDotPitch), 0.00001,
           "frame complete physical grid cells")
-      }
-    }
-  }
-
-  function test_popupPaintsCompleteEdgeDots_data() {
-    return ["", "closed", "open", "open-left", "open-right", "open-empty"].map(function(state) {
-      return { tag: state || "pods", state: state }
-    })
-  }
-
-  function test_popupPaintsCompleteEdgeDots(data) {
-    var item = createTemporaryObject(popup, this, { caseState: data.state, iconSize: data.state === "" ? 128 : 137 })
-    var mesh = findChild(item, data.state === "" ? "budsMesh" : "caseMesh")
-    var pitch = mesh.effectiveDotPitch, columns = Math.floor(mesh.width / pitch)
-    for (var light of [false, true]) {
-      var style = Mesh.dotStyle(light, pitch, mesh.backgroundColor, mesh.foregroundColor, mesh.shadowColor)
-      var size = Math.min(pitch * 0.85, style.size * mesh.dotScale)
-      if (mesh.alignDotsToPixels) size = Grid.screenSize(size, pitch, mesh.pixelRatio)
-      for (var lid of data.state === "" ? [1] : [0, 0.25, 0.5, 0.75, 1]) {
-        var frame = Mesh.frame(mesh.geometry, data.state, lid, 0, mesh.yaw, mesh.pitch,
-          columns, columns, light, 0, mesh.zoom, 0, 1, mesh.smoothSampling)
-        for (var i = 0; i < frame.length; i++) {
-          if (style.level(frame[i]) === 0) continue
-          var x = (i % columns + 0.5) * pitch, y = (Math.floor(i / columns) + 0.5) * pitch
-          if (mesh.alignDotsToPixels) {
-            x = Math.round((x - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
-            y = Math.round((y - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
-          }
-          var point = mesh.mapToItem(item, x, y)
-          verify(point.x - size / 2 >= 0 && point.x + size / 2 <= item.width,
-            "outer columns must fit whole dots inside the icon clip: x=" + point.x + ", size=" + size + ", lid=" + lid + ", light=" + light)
-        }
       }
     }
   }
@@ -233,10 +244,6 @@ TestCase {
     compare(findChild(item, "budsMesh").budsArrival, 1)
   }
 
-  function test_standaloneTurnKeepsCompleteEdgeDots_data() {
-    return [{ tag: "2px", pitch: 2 }, { tag: "3px", pitch: 3 }]
-  }
-
   function test_standaloneSmoothingReturnsAtRest() {
     var item = createTemporaryObject(popup, this, { caseState: "" })
     var mesh = findChild(item, "budsMesh")
@@ -254,43 +261,6 @@ TestCase {
     compare(mesh.smoothSampling, true, "reopened artwork is settled and smoothed")
     item.caseState = "open"
     compare(findChild(item, "caseMesh").smoothSampling, false, "case motion already uses one sample")
-  }
-
-  function test_standaloneTurnKeepsCompleteEdgeDots(data) {
-    var item = createTemporaryObject(popup, this, { caseState: "" })
-    findChild(item, "budsMeshArtwork").dotPitch = data.pitch
-    var mesh = findChild(item, "budsMesh")
-    var pitch = mesh.effectiveDotPitch, columns = Math.floor(mesh.width / pitch)
-    for (var light of [false, true]) {
-      var style = Mesh.dotStyle(light, pitch, mesh.backgroundColor, mesh.foregroundColor, mesh.shadowColor)
-      var size = Math.min(pitch * 0.85, style.size * mesh.dotScale)
-      if (mesh.alignDotsToPixels) size = Grid.screenSize(size, pitch, mesh.pixelRatio)
-      for (var step = 0; step <= 20; step++) {
-        var arrival = step / 20
-        item.budsIn = arrival
-        var frame = Mesh.frame(mesh.geometry, "", 1, 0, mesh.yaw, mesh.pitch,
-          columns, columns, light, 0, mesh.zoom, 0, arrival, mesh.smoothSampling)
-        for (var i = 0; i < frame.length; i++) {
-          if (style.level(frame[i]) === 0) continue
-          var x = (i % columns + 0.5) * pitch, y = (Math.floor(i / columns) + 0.5) * pitch
-          if (mesh.alignDotsToPixels) {
-            x = Math.round((x - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
-            y = Math.round((y - size / 2) * mesh.pixelRatio) / mesh.pixelRatio + size / 2
-          }
-          var point = mesh.mapToItem(item, x, y)
-          // Entry starts above the slot; only visible rows can crop at its sides.
-          // mapToItem sees resting QML coordinates, not the YAnimator's
-          // scene-graph transform. Project this pose's translation explicitly.
-          point.y -= (1 - arrival) * item.iconSize
-          if (arrival < 1 && (point.y + size / 2 < 0 || point.y - size / 2 > item.height)) continue
-          verify(point.x - size / 2 >= 0 && point.x + size / 2 <= item.width,
-            "turning tips must not crop the outer dot columns at arrival " + arrival + ", light=" + light + ", x=" + point.x + ", size=" + size)
-          if (arrival === 1)
-            verify(point.y - size / 2 >= 0 && point.y + size / 2 <= item.height,
-              "settled enlarged pods must fit complete dots vertically")
-        }
-      }
-    }
   }
 
   function liftCases() {

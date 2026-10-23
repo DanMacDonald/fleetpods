@@ -624,12 +624,15 @@ impl World {
             | Effect::MuteStreams(_)
             | Effect::MoveStreams(_)
             | Effect::PausePlayers(_)
+            | Effect::ResumePlayers(_)
+            | Effect::SuspendOutput { .. }
             | Effect::ReleaseAir
             | Effect::Listen
             | Effect::StopListen
             | Effect::FollowLink
             | Effect::StoreDevices(_)
-            | Effect::StoreWatermark(_) => {}
+            | Effect::StoreWatermark(_)
+            | Effect::StoreActivity(_) => {}
         }
     }
 

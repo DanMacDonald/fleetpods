@@ -319,9 +319,9 @@ impl Connection {
         Claim::Started(self.generation)
     }
 
-    /// Park an unavailable accessory and retire callbacks and retry deadlines.
+    /// Park until an eligible request, retiring callbacks and retry deadlines.
     /// An established link may finish its normal shutdown on its own.
-    pub fn wait_for_case(&mut self) -> bool {
+    pub fn wait_for_request(&mut self) -> bool {
         if matches!(self.live, Live::Waiting { .. } | Live::Ready { .. }) {
             return false;
         }

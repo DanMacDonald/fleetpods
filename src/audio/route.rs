@@ -58,11 +58,11 @@ pub struct StreamTarget {
 
 /// Remembered across graphs. Retries use the daemon clock.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RouteState {
-    pub want: bool,
-    pub from: Option<String>,
+struct RouteState {
+    want: bool,
+    from: Option<String>,
     /// Original mute and volume of streams this claim muted.
-    pub held: Vec<StreamSnap>,
+    held: Vec<StreamSnap>,
     quieted: BTreeSet<(u32, u64)>,
     quiet_at: Option<MonoMs>,
     asked_default: Option<MonoMs>,
@@ -255,7 +255,7 @@ pub struct Move {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct RouteAction {
+struct RouteAction {
     pub routed: bool,
     pub quiet: Vec<StreamTarget>,
     pub set_default: Option<String>,
@@ -268,8 +268,8 @@ pub struct RouteAction {
 }
 
 /// One ordered piece of work from planning a graph. The Router emits
-/// these in execution order: quiet before restart/start before the
-/// default sink before moves.
+/// these in execution order: quiet, eligible restores, restart/start,
+/// default sink, then moves. The daemon places quiet ahead of player pauses.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Work {
     Quiet(Vec<StreamTarget>),
@@ -277,6 +277,7 @@ pub enum Work {
     Start(Restart),
     SetDefault(String),
     Move(Move),
+    Restore(Vec<StreamSnap>),
 }
 
 /// What planning a graph decided, apart from the retained work.
@@ -284,7 +285,6 @@ pub enum Work {
 pub struct Outcome {
     pub routed: bool,
     pub failure: Option<&'static str>,
-    pub restore: Vec<StreamSnap>,
 }
 
 /// The routing transaction. It owns the route state and the work that
@@ -294,11 +294,176 @@ pub struct Outcome {
 pub struct Router {
     state: RouteState,
     pending: Vec<Work>,
+    restores: Vec<StreamSnap>,
+    handoff: Option<Handoff>,
+    handoff_quiet: Vec<StreamTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Handoff {
+    streams: Vec<StreamSnap>,
+    muted_at: MonoMs,
+    quiet_since: Option<MonoMs>,
 }
 
 impl Router {
     pub fn new() -> Self {
-        Self { state: RouteState::new(), pending: Vec::new() }
+        Self {
+            state: RouteState::new(),
+            pending: Vec::new(),
+            restores: Vec::new(),
+            handoff: None,
+            handoff_quiet: Vec::new(),
+        }
+    }
+
+    pub fn claim(&mut self) {
+        self.state.want = true;
+        // Transfer originals before the next graph can snapshot a muted stream.
+        if let Some(handoff) = self.handoff.take() {
+            self.state.adopt_quieted(handoff.streams);
+        }
+    }
+    pub fn release(&mut self) {
+        self.state.want = false;
+    }
+    pub fn wants_output(&self) -> bool {
+        self.state.want
+    }
+    pub fn source_sink(&self) -> Option<&str> {
+        self.state.from.as_deref()
+    }
+    pub fn held_streams(&self) -> &[StreamSnap] {
+        &self.state.held
+    }
+    pub fn recovering(&self) -> bool {
+        self.state.recovering()
+    }
+    pub fn holding_takeover(&self) -> bool {
+        self.state.holding_takeover()
+    }
+    pub fn needs_graph(&self) -> bool {
+        self.state.want || self.state.from.is_some() || !self.state.held.is_empty()
+    }
+
+    /// Saved states from an acquisition that muted streams before routing.
+    pub fn hold_streams(&mut self, streams: &[StreamSnap]) {
+        self.state.adopt_quieted(streams.to_vec());
+    }
+
+    pub fn fail_acquisition(&mut self) {
+        self.restores.extend(std::mem::take(&mut self.state.held));
+        self.state.quieted.clear();
+    }
+
+    /// Forget every stream serial and queued effect from the dead server.
+    /// The playback claim survives; old restores must not touch its replacement.
+    pub fn forget_server(&mut self) {
+        self.state.forget_server();
+        self.pending.clear();
+        self.restores.clear();
+        self.handoff = None;
+        self.handoff_quiet.clear();
+    }
+
+    pub fn begin_recovery(
+        &mut self,
+        id: u64,
+        accessory: Address,
+        graph: &Graph,
+        now: MonoMs,
+    ) -> bool {
+        if !self.state.begin_recovery(id, accessory, graph, now) {
+            return false;
+        }
+        // A graph earlier in this step may already have queued an unmute.
+        // Recovery owns those originals until the streams are safely relinked.
+        self.restores.retain(|saved| {
+            !self
+                .state
+                .held
+                .iter()
+                .any(|held| held.id == saved.id && held.generation == saved.generation)
+        });
+        true
+    }
+
+    pub fn finish_recovery(&mut self, id: u64, ok: bool) -> bool {
+        self.state.finish_recovery(id, ok)
+    }
+
+    /// Yield audio without leaking a player's queued tail onto the speakers.
+    /// Capture originals before pause/default-switch effects can execute.
+    pub fn handoff(&mut self, accessory: Option<Address>, graph: Option<&Graph>, now: MonoMs) {
+        // Already-held originals take precedence over a graph that observes
+        // our mute. Saving that graph first would restore the stream muted.
+        self.restores.extend(std::mem::take(&mut self.state.held));
+        self.defer_restores(now);
+        self.state.quieted.clear();
+        self.state.restore_sent.clear();
+        if let (Some(accessory), Some(graph)) = (accessory, graph) {
+            for saved in audible_on_accessory(graph, accessory) {
+                let handoff = self.handoff.get_or_insert_with(|| Handoff {
+                    streams: Vec::new(),
+                    muted_at: now,
+                    quiet_since: None,
+                });
+                if !handoff
+                    .streams
+                    .iter()
+                    .any(|s| s.id == saved.id && s.generation == saved.generation)
+                {
+                    handoff.streams.push(saved);
+                }
+                let target = StreamTarget { id: saved.id, generation: saved.generation };
+                if !self.handoff_quiet.contains(&target) {
+                    self.handoff_quiet.push(target);
+                }
+            }
+        }
+        if let Some(handoff) = &mut self.handoff {
+            handoff.quiet_since = None;
+        }
+        self.pending.clear();
+        self.release();
+    }
+
+    fn defer_restores(&mut self, now: MonoMs) {
+        for saved in std::mem::take(&mut self.restores) {
+            let handoff = self.handoff.get_or_insert_with(|| Handoff {
+                streams: Vec::new(),
+                muted_at: now,
+                quiet_since: None,
+            });
+            if !handoff.streams.iter().any(|s| s.id == saved.id && s.generation == saved.generation)
+            {
+                handoff.streams.push(saved);
+            }
+        }
+    }
+
+    fn pace_handoff(&mut self, now: MonoMs, playing: bool) {
+        let Some(handoff) = &mut self.handoff else {
+            return;
+        };
+        if !self.state.want {
+            let quiet = if playing {
+                handoff.quiet_since = None;
+                false
+            } else {
+                let since = *handoff.quiet_since.get_or_insert(now);
+                now.saturating_since(since) >= HANDOFF_DRAIN_MS
+            };
+            if !quiet && now.saturating_since(handoff.muted_at) < HANDOFF_MUTE_MS {
+                return;
+            }
+        }
+        let handoff = self.handoff.take().unwrap();
+        if self.state.want {
+            self.state.adopt_quieted(handoff.streams);
+        } else {
+            self.restores.extend(handoff.streams);
+        }
     }
 
     pub fn on_graph(
@@ -332,16 +497,27 @@ impl Router {
         }
         self.state = action.state;
         self.pending = work;
-        Outcome { routed: action.routed, failure: action.failure, restore: action.restore }
+        self.restores.extend(action.restore);
+        if self.handoff.is_some() {
+            self.defer_restores(now);
+        }
+        Outcome { routed: action.routed, failure: action.failure }
     }
 
-    /// The ordered work from the latest graph, drained exactly once.
-    pub fn take_work(&mut self) -> Vec<Work> {
-        std::mem::take(&mut self.pending)
-    }
-
-    pub fn clear_work(&mut self) {
-        self.pending.clear();
+    /// Drain one ordered batch after all decisions for this input. Quiet work
+    /// precedes the daemon's pause/control effects; restores precede route moves.
+    pub fn take_work(&mut self, now: MonoMs, playing: bool) -> Vec<Work> {
+        self.pace_handoff(now, playing);
+        let mut work = Vec::new();
+        if !self.handoff_quiet.is_empty() {
+            work.push(Work::Quiet(std::mem::take(&mut self.handoff_quiet)));
+        }
+        if !self.restores.is_empty() {
+            work.push(Work::Restore(std::mem::take(&mut self.restores)));
+        }
+        work.append(&mut self.pending);
+        work.sort_by_key(|item| if matches!(item, Work::Quiet(_)) { 0 } else { 1 });
+        work
     }
 }
 
@@ -351,19 +527,19 @@ impl Default for Router {
     }
 }
 
-impl std::ops::Deref for Router {
-    type Target = RouteState;
-
-    fn deref(&self) -> &RouteState {
-        &self.state
-    }
-}
-
-impl std::ops::DerefMut for Router {
-    fn deref_mut(&mut self) -> &mut RouteState {
-        &mut self.state
-    }
-}
+/// How long a handoff-muted stream stays muted after every player reports
+/// Paused. Brave keeps playing audio it had already queued for a while after
+/// it reports Paused, and the XPS speaker filter (EQ and a lookahead limiter)
+/// holds more. Unmuting 150 ms after Paused still let that tail reach the
+/// speakers as a short blip (2026-10-19); 500 ms did not, across rapid
+/// switching.
+const HANDOFF_DRAIN_MS: u64 = 500;
+/// Streams muted at a handoff are unmuted by then even if a player never
+/// reports Paused. A stream with no MPRIS player for the daemon to pause
+/// keeps playing, and is silenced for at most this long. It must exceed
+/// HANDOFF_DRAIN_MS plus the few tens of milliseconds a player takes to
+/// report Paused.
+const HANDOFF_MUTE_MS: u64 = 1_000;
 
 const RETRY_MS: u64 = 1_000;
 /// How long speaker playback stays muted waiting for the pods. A play that
@@ -371,7 +547,7 @@ const RETRY_MS: u64 = 1_000;
 const TAKEOVER_HOLD_MS: u64 = 12_000;
 
 /// Hold speaker playback while ownership or the AirPods output is still pending.
-pub fn hold_for_takeover(
+fn hold_for_takeover(
     mut state: RouteState,
     accessory: Option<Address>,
     graph: &Graph,
@@ -422,7 +598,7 @@ pub fn hold_for_takeover(
 /// Mute managed streams on the current default, then switch, then move them.
 /// A stream already on some other sink is left there. The same graph planned
 /// again does not repeat a request inside the retry interval.
-pub fn plan(
+fn plan(
     mut state: RouteState,
     accessory: Option<Address>,
     graph: &Graph,
@@ -1386,25 +1562,103 @@ mod tests {
     fn router_retains_state_and_orders_quiet_before_default() {
         let pods = address();
         let mut router = Router::new();
-        router.want = true;
+        router.claim();
         let mut picture = graph(
             "speakers",
             vec![sink("speakers", None, None)],
             vec![stream(1, 8, "speakers", "", false)],
         );
-        let first = router.on_graph(Some(pods), &picture, false, MonoMs(0));
-        assert!(first.restore.is_empty());
+        router.on_graph(Some(pods), &picture, false, MonoMs(0));
         assert_eq!(
-            router.take_work(),
+            router.take_work(MonoMs(400), false),
             vec![Work::Quiet(vec![StreamTarget { id: 1, generation: 8 }])]
         );
-        assert!(router.take_work().is_empty(), "work drains exactly once");
+        assert!(router.take_work(MonoMs(400), false).is_empty(), "work drains exactly once");
         // State survived inside the Router: the muted stream is held, and a
         // later graph with the pods sink moves to SetDefault, not Quiet again.
-        assert_eq!(router.held.len(), 1);
+        assert_eq!(router.held_streams().len(), 1);
         picture.streams[0].mute = true;
         picture.sinks.push(sink("pods", Some(pods), Some("a2dp-sink")));
         router.on_graph(Some(pods), &picture, false, MonoMs(400));
-        assert_eq!(router.take_work(), vec![Work::SetDefault("pods".into())]);
+        assert_eq!(router.take_work(MonoMs(400), false), vec![Work::SetDefault("pods".into())]);
+    }
+
+    #[test]
+    fn router_drains_a_handoff_and_bounds_an_unresponsive_player() {
+        for keeps_playing in [false, true] {
+            let mut router = Router::new();
+            let picture = graph(
+                "pods",
+                vec![sink("pods", Some(address()), None)],
+                vec![stream(1, 8, "pods", "", false)],
+            );
+            router.claim();
+            router.handoff(Some(address()), Some(&picture), MonoMs(0));
+            router.on_graph(Some(address()), &picture, false, MonoMs(0));
+            assert_eq!(
+                router.take_work(MonoMs(0), keeps_playing),
+                vec![Work::Quiet(vec![StreamTarget { id: 1, generation: 8 }])]
+            );
+            let deadline = if keeps_playing { HANDOFF_MUTE_MS } else { HANDOFF_DRAIN_MS };
+            assert!(router.take_work(MonoMs(deadline - 1), keeps_playing).is_empty());
+            assert_eq!(
+                router.take_work(MonoMs(deadline), keeps_playing),
+                vec![Work::Restore(vec![snap(&picture.streams[0])])]
+            );
+            assert!(router.take_work(MonoMs(deadline + 1), keeps_playing).is_empty());
+        }
+    }
+
+    #[test]
+    fn router_reclaim_preserves_originals_before_reading_the_muted_graph() {
+        let mut router = Router::new();
+        let mut picture = graph(
+            "speakers",
+            vec![sink("speakers", None, None), sink("pods", Some(address()), None)],
+            vec![stream(1, 8, "speakers", "", false)],
+        );
+        picture.streams[0].volume = 1.4;
+        let original = snap(&picture.streams[0]);
+        router.claim();
+        router.on_graph(Some(address()), &picture, false, MonoMs(0));
+        router.take_work(MonoMs(0), true);
+        picture.streams[0].mute = true;
+        picture.streams[0].sink = "pods".into();
+        picture.default_sink = "pods".into();
+        // The last graph already reflects our mute; handoff must keep the original.
+        router.handoff(Some(address()), Some(&picture), MonoMs(10));
+        router.on_graph(Some(address()), &picture, false, MonoMs(10));
+        router.take_work(MonoMs(10), false);
+        router.claim();
+        router.on_graph(Some(address()), &picture, false, MonoMs(20));
+        let work = router.take_work(MonoMs(20), true);
+        assert!(work.contains(&Work::Restore(vec![original])));
+        assert!(!work.iter().any(|w| matches!(w, Work::Restore(s) if s.iter().any(|s| s.mute))));
+    }
+
+    #[test]
+    fn router_forgets_queued_handoff_work_when_the_server_dies() {
+        let mut router = Router::new();
+        let picture = graph(
+            "pods",
+            vec![sink("pods", Some(address()), None)],
+            vec![stream(1, 8, "pods", "", false)],
+        );
+        router.handoff(Some(address()), Some(&picture), MonoMs(0));
+        router.forget_server();
+        assert!(router.take_work(MonoMs(2_000), false).is_empty());
+        router.claim();
+        let replacement = graph(
+            "speakers",
+            vec![sink("speakers", None, None)],
+            vec![stream(1, 9, "speakers", "", false)],
+        );
+        router.on_graph(Some(address()), &replacement, false, MonoMs(2_001));
+        router.take_work(MonoMs(2_001), false);
+        router.fail_acquisition();
+        assert_eq!(
+            router.take_work(MonoMs(2_002), false),
+            vec![Work::Restore(vec![snap(&replacement.streams[0])])]
+        );
     }
 }

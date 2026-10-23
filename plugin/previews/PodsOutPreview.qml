@@ -60,7 +60,7 @@ Window {
             Layout.alignment: Qt.AlignHCenter
             Layout.preferredWidth: 280; Layout.preferredHeight: 280
             clip: true
-            Pods.BudsMesh {
+            Pods.MeshArtwork {
               width: parent.width; height: parent.height
               y: -(1 - window.arrival) * height
               arrival: window.arrival

@@ -23,19 +23,6 @@ const REBUILD_PAUSE_MS: u64 = 500;
 /// How long after losing the pods this laptop may still release its idle
 /// AirPods output early, so the pods start the new owner's audio sooner.
 const RELEASE_OUTPUT_MS: u64 = 3_000;
-/// How long a handoff-muted stream stays muted after every player reports
-/// Paused. Brave keeps playing audio it had already queued for a while after
-/// it reports Paused, and the XPS speaker filter (EQ and a lookahead limiter)
-/// holds more. Unmuting 150 ms after Paused still let that tail reach the
-/// speakers as a short blip (2026-10-19); 500 ms did not, across rapid
-/// switching.
-const HANDOFF_DRAIN_MS: u64 = 500;
-/// Streams muted at a handoff are unmuted by then even if a player never
-/// reports Paused. A stream with no MPRIS player for the daemon to pause
-/// keeps playing, and is silenced for at most this long. It must exceed
-/// HANDOFF_DRAIN_MS plus the few tens of milliseconds a player takes to
-/// report Paused.
-const HANDOFF_MUTE_MS: u64 = 1_000;
 /// After a claim sent as a new link becomes ready (or just after, by a play
 /// that waited for it), the rest of the pods' opening reports still
 /// describe who played before it. A remote owner in
@@ -202,6 +189,8 @@ pub enum Effect {
     StopListen,
     /// Persist the roster replay watermark. The bytes are not a secret.
     StoreWatermark(Vec<u8>),
+    /// Persist the last-active fleet device independently of roster expiry.
+    StoreActivity(Vec<u8>),
     /// Remember learned Apple peer names across daemon restarts.
     StoreDevices(std::collections::HashMap<Address, String>),
     Announce(Vec<u8>),
@@ -301,7 +290,7 @@ impl Daemon {
     /// claim within [`CLAIM_ANSWER_MS`].
     pub(crate) fn wants_local_confirm(&self, now: MonoMs) -> bool {
         self.seat.wants_local_confirm(
-            self.output.want,
+            self.output.wants_output(),
             self.audio.local_playing(),
             self.audio.yielded(),
             &self.accessory.ownership,
@@ -508,6 +497,8 @@ impl Daemon {
                     self.radio_inbox.accept(&bytes, self.local_address, now.mono)
                 {
                     self.hear_radio(&frame, Some(source), now);
+                } else if bytes.first() == Some(&crate::fleet::activity::VERSION) {
+                    self.hear_activity(&bytes, now);
                 } else if let Some(sight) = self.read_presence(&bytes, now.unix) {
                     self.hear_presence(sight);
                 } else if let Some(snapshot) = self.read_roster(&bytes) {
@@ -553,6 +544,7 @@ impl Daemon {
                 None
             }
             Input::AudioLost => {
+                self.last_graph = None;
                 self.output.forget_server();
                 self.output_health.forget_server();
                 self.audio.set_routed(false);
@@ -563,7 +555,7 @@ impl Daemon {
                 None
             }
             Input::Streams(streams) => {
-                self.hold_streams(&streams);
+                self.output.hold_streams(&streams);
                 None
             }
             Input::Players(players) => {
@@ -573,7 +565,7 @@ impl Daemon {
             }
             Input::Player { service, playing } => {
                 if playing == Some(false)
-                    && self.output.want
+                    && self.output.wants_output()
                     && self.audio.player_playing(&service)
                     && (self.output.recovering()
                         || self.rebuild_pause_until.is_some_and(|until| now.mono.0 < until.0))
@@ -593,6 +585,7 @@ impl Daemon {
                         .is_some();
                 if self.audio.update_player(&service, playing) && !resumed {
                     eprintln!("fleetpodsd: player {service:?} reported new Playing state (after_yield={after_yield})");
+                    self.remember_activity(now);
                     self.claim_playback(now);
                 }
                 self.effects.announce_dirty = true;
@@ -642,7 +635,7 @@ impl Daemon {
         self.link_ready_at = Some(now.mono);
         // A play waiting for this link asked before anything the pods
         // reported during setup, so those reports cannot override it.
-        if self.output.want {
+        if self.output.wants_output() {
             self.seat.note_claim(self.accessory.ownership.at());
         }
         if self.request_playback_ownership(now) {
@@ -801,7 +794,7 @@ impl Daemon {
             eprintln!("fleetpodsd: ignoring a remote report that predates this laptop's claim");
             return;
         }
-        if self.output.want
+        if self.output.wants_output()
             && self.claim_sent_at.is_some_and(|at| now.mono.saturating_since(at) < CLAIM_ANSWER_MS)
         {
             if !self.yield_pending {
@@ -810,82 +803,11 @@ impl Daemon {
             self.yield_pending = true;
             return;
         }
-        if self.connection.stage() == Stage::Ready && self.output.want {
+        if self.connection.stage() == Stage::Ready && self.output.wants_output() {
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
             self.step_back(now);
             self.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
         }
-    }
-
-    /// Mute what plays to the pods before players are paused and their
-    /// streams follow the default back to the speakers. A player keeps
-    /// playing for a moment after Pause, and that audio would come out there.
-    pub(crate) fn mute_for_handoff(&mut self, now: Clock) {
-        let (Some(accessory), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
-        else {
-            return;
-        };
-        for saved in crate::audio::route::audible_on_accessory(graph, accessory) {
-            if self
-                .handoff_muted
-                .iter()
-                .any(|s| (s.id, s.generation) == (saved.id, saved.generation))
-            {
-                continue;
-            }
-            self.effects.mute_streams.push(crate::audio::route::StreamTarget {
-                id: saved.id,
-                generation: saved.generation,
-            });
-            self.handoff_muted.push(saved);
-        }
-        if !self.handoff_muted.is_empty() {
-            self.handoff_muted_at.get_or_insert(now.mono);
-            self.handoff_quiet_since = None;
-        }
-    }
-
-    /// Streams a pending takeover had muted are still playing until the
-    /// pause lands. Keep them muted until it has drained instead of
-    /// restoring them on the speakers now.
-    pub(crate) fn keep_restores_muted_for_handoff(&mut self, now: Clock) {
-        for saved in std::mem::take(&mut self.effects.restore_pending) {
-            if !self
-                .handoff_muted
-                .iter()
-                .any(|s| (s.id, s.generation) == (saved.id, saved.generation))
-            {
-                self.handoff_muted.push(saved);
-            }
-        }
-        if !self.handoff_muted.is_empty() {
-            self.handoff_muted_at.get_or_insert(now.mono);
-        }
-    }
-
-    /// Unmute handoff streams once players have been paused long enough to
-    /// drain, or hand them to a new claim that will restore them itself.
-    fn pace_handoff_mute(&mut self, now: Clock) {
-        let Some(muted_at) = self.handoff_muted_at else {
-            return;
-        };
-        if self.output.want {
-            self.output.adopt_quieted(std::mem::take(&mut self.handoff_muted));
-        } else {
-            let quiet = if self.audio.local_playing() {
-                self.handoff_quiet_since = None;
-                false
-            } else {
-                let since = *self.handoff_quiet_since.get_or_insert(now.mono);
-                now.mono.saturating_since(since) >= HANDOFF_DRAIN_MS
-            };
-            if !quiet && now.mono.saturating_since(muted_at) < HANDOFF_MUTE_MS {
-                return;
-            }
-            self.effects.restore_pending.extend(std::mem::take(&mut self.handoff_muted));
-        }
-        self.handoff_muted_at = None;
-        self.handoff_quiet_since = None;
     }
 
     fn link_failed(&mut self, generation: Generation, busy: bool, now: Clock) {
@@ -897,7 +819,7 @@ impl Daemon {
             return;
         }
         if !busy && !self.output.holding_takeover() {
-            self.effects.restore_pending = self.audio.fail_acquisition();
+            self.output.fail_acquisition();
         }
         let reason = if busy { FailReason::Busy } else { FailReason::Transport };
         self.note_setup_failed(generation, reason, now.mono);
@@ -949,6 +871,7 @@ impl Daemon {
     }
 
     fn harvest(&mut self, now: Clock) -> Vec<Effect> {
+        self.reconnect_preferred(now);
         // A remote report that arrived just after our claim and was never
         // answered by a grant ends the claim now.
         if self.yield_pending
@@ -997,6 +920,7 @@ impl Daemon {
             self.radio_silenced = false;
             self.offer_presence(now);
             self.offer_roster(now);
+            self.offer_activity(now);
             self.queue_outgoing_route(now);
             match self.outbound.due(now.mono) {
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Letter(bytes)) => {
@@ -1010,12 +934,18 @@ impl Daemon {
                     self.note_roster_aired(now.mono);
                     effects.push(Effect::Advertise(bytes));
                 }
+                crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Activity(bytes)) => {
+                    effects.push(Effect::Advertise(bytes));
+                }
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Route(bytes)) => {
                     effects.push(Effect::Advertise(bytes));
                 }
                 crate::fleet::radio::Duty::Release => effects.push(Effect::ReleaseAir),
                 crate::fleet::radio::Duty::Hold => {}
             }
+        }
+        if let Some(bytes) = self.activity_preference.take_save() {
+            effects.push(Effect::StoreActivity(bytes));
         }
         if let Some(bytes) = self.take_roster_watermark() {
             effects.push(Effect::StoreWatermark(bytes));
@@ -1049,7 +979,7 @@ impl Daemon {
             effects.push(Effect::PausePlayers(players));
         }
         if let Some(until) = self.release_output_until {
-            if self.output.want || !self.transport_active || now.mono.0 >= until.0 {
+            if self.output.wants_output() || !self.transport_active || now.mono.0 >= until.0 {
                 self.release_output_until = None;
             } else if let Some(idle) = self.output_health.outputs.iter().find(|output| {
                 output.address.is_some() && output.address == accessory && output.state != 0
@@ -1061,7 +991,7 @@ impl Daemon {
                 self.release_output_until = None;
             }
         }
-        if !self.output.want {
+        if !self.output.wants_output() {
             self.resume_players.clear();
             self.resumed_players.clear();
         } else if !self.resume_players.is_empty() && !self.output.recovering() {
@@ -1082,7 +1012,7 @@ impl Daemon {
             effects.push(effect);
         }
         effects.extend(self.pace_audio());
-        let granted = self.output.want
+        let granted = self.output.wants_output()
             && self.connection.stage() == Stage::Ready
             && self.accessory.ownership.as_fresh() == Some(&true);
         if !granted {
@@ -1118,15 +1048,6 @@ impl Daemon {
             {
                 let id = self.output_restart_serial + 1;
                 if self.output.begin_recovery(id, address, graph, now.mono) {
-                    // This input may already have planned an unmute on arrival.
-                    // Recovery now owns these saved states until relinking ends.
-                    self.effects.restore_pending.retain(|saved| {
-                        !self
-                            .output
-                            .held
-                            .iter()
-                            .any(|held| held.id == saved.id && held.generation == saved.generation)
-                    });
                     self.output_restart_serial = id;
                     self.resume_output_on_grant = false;
                     self.rearm_after_loss = false;
@@ -1154,18 +1075,13 @@ impl Daemon {
                 )));
             }
         }
-        self.pace_handoff_mute(now);
-        if !self.effects.restore_pending.is_empty() {
-            effects.push(Effect::Restore(std::mem::take(&mut self.effects.restore_pending)));
-        }
-        if !self.effects.mute_streams.is_empty() {
-            // Ahead of the pause and the default switch in this step.
-            effects.insert(0, Effect::MuteStreams(std::mem::take(&mut self.effects.mute_streams)));
-        }
         // The Router ordered this work; translate it in one place. A quiet
         // still leads the whole step, before any control write.
-        for work in self.output.take_work() {
+        for work in self.output.take_work(now.mono, self.audio.local_playing()) {
             match work {
+                crate::audio::route::Work::Restore(streams) => {
+                    effects.push(Effect::Restore(streams));
+                }
                 crate::audio::route::Work::Quiet(streams) => {
                     effects.insert(0, Effect::MuteStreams(streams));
                 }
@@ -1206,7 +1122,7 @@ impl Daemon {
         let Some(graph) = self.last_graph.clone() else {
             return;
         };
-        if self.output.want || self.output.from.is_some() || !self.output.held.is_empty() {
+        if self.output.needs_graph() {
             self.follow_graph(&graph, now);
         }
     }
@@ -1214,33 +1130,22 @@ impl Daemon {
     fn follow_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
         self.last_graph = Some(graph.clone());
         let waiting_for_grant = self.resume_output_on_grant
-            && self.output.want
+            && self.output.wants_output()
             && self.connection.stage() == Stage::Ready;
         let outcome =
             self.output.on_graph(self.config.accessory, graph, waiting_for_grant, now.mono);
-        if !outcome.restore.is_empty() {
-            eprintln!(
-                "fleetpodsd: audio route restore={:?} held={:?}",
-                outcome.restore, self.output.held
-            );
-        }
         if let Some(failure) = outcome.failure {
             self.resume_output_on_grant = false;
             self.seat_audio_failure(failure, now);
         }
-        let sync_holds = !outcome.restore.is_empty() || !self.output.held.is_empty();
-        if sync_holds {
-            let held = self.output.held.clone();
-            self.audio.hold(&held);
-        }
         self.audio.set_routed(outcome.routed);
-        if !outcome.restore.is_empty() {
-            self.effects.restore_pending.extend(outcome.restore);
-        }
     }
 
     fn take_open_link(&mut self, now: MonoMs) -> Option<Generation> {
-        if self.pairing_elsewhere(now) || !self.connection.may_open(now) {
+        if (!self.preferred_connection_allowed() && !self.connection.apple_reconnect())
+            || self.pairing_elsewhere(now)
+            || !self.connection.may_open(now)
+        {
             return None;
         }
         let generation = self.connection.generation();

@@ -1,7 +1,6 @@
-//! Local desktop audio: profile choice, stream holds, playback observations,
+//! Local desktop audio: profile choice, playback observations,
 //! ear-detection pauses, and conversation-awareness volume.
-//! This is the only audio-server state. Routing asks for a route; it does not
-//! keep its own.
+//! Stream mute/volume holds and their restoration belong to audio::route.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -134,7 +133,6 @@ struct Ears {
 pub struct Audio {
     offers: Vec<Profile>,
     selected: Option<String>,
-    holds: Vec<StreamSnap>,
     local_playing: bool,
     routed: bool,
     observers: BTreeMap<String, UnixMs>,
@@ -164,7 +162,6 @@ impl Audio {
         Self {
             offers: Vec::new(),
             selected: None,
-            holds: Vec::new(),
             local_playing: false,
             routed: false,
             observers: BTreeMap::new(),
@@ -248,28 +245,6 @@ impl Audio {
 
     pub fn set_routed(&mut self, routed: bool) {
         self.routed = routed;
-    }
-
-    pub fn hold(&mut self, streams: &[StreamSnap]) {
-        self.holds = streams.to_vec();
-    }
-
-    /// Restore mute and volume only when both the id and the generation match.
-    /// A recycled id is left alone. The holds are then dropped.
-    pub fn restore(&mut self, live: &[StreamSnap]) -> Vec<StreamSnap> {
-        let held = std::mem::take(&mut self.holds);
-        held.into_iter()
-            .filter(|saved| {
-                live.iter()
-                    .any(|stream| stream.id == saved.id && stream.generation == saved.generation)
-            })
-            .collect()
-    }
-
-    /// The link did not come up. Restore the streams this acquisition was holding.
-    pub fn fail_acquisition(&mut self) -> Vec<StreamSnap> {
-        let held = self.holds.clone();
-        self.restore(&held)
     }
 
     pub fn player_event(&mut self, event: &PlaybackEvent, now: UnixMs) -> PlayReply {
@@ -553,20 +528,6 @@ mod tests {
         assert_eq!(audio.activate(), Some("a2dp-sink-sbc_xq"));
         audio.set_offers(without_xq);
         assert_eq!(audio.activate(), Some("a2dp-sink-sbc"));
-    }
-
-    #[test]
-    fn a_recycled_stream_id_is_not_restored() {
-        let mut audio = Audio::new();
-        audio.hold(&[StreamSnap { id: 7, generation: 1, mute: false, volume: 1.4 }]);
-        let restored =
-            audio.restore(&[StreamSnap { id: 7, generation: 2, mute: true, volume: 0.2 }]);
-        assert!(restored.is_empty());
-        audio.hold(&[StreamSnap { id: 7, generation: 2, mute: true, volume: 1.4 }]);
-        let restored =
-            audio.restore(&[StreamSnap { id: 7, generation: 2, mute: false, volume: 0.1 }]);
-        assert_eq!(restored[0].volume, 1.4);
-        assert!(restored[0].mute);
     }
 
     #[test]

@@ -1,7 +1,6 @@
 import QtQuick
 import QtQuick.Shapes
 import Qt5Compat.GraphicalEffects
-import "DotGrid.js" as Grid
 import qs.Commons as Commons
 
 // Model-specific outlines, with optional pixel art for the popup.
@@ -12,7 +11,13 @@ Item {
   property color color: Commons.Color.foreground
   // One of "buds", "pro", "max", or "unknown". Unknown uses the dotted Pro drawing.
   property string variant: "buds"
+  // Physical placement requested by the model. The icon alone retains the
+  // outgoing artwork while confirming, lifting, exiting and entering.
   property string caseState: ""
+  property string displayCaseState: ""
+  property bool initialized: false
+  readonly property int podDepartureMs: 840
+  readonly property int emptyCaseConfirmMs: 250
   property bool pairingMode: false
   property bool pixelArt: false
 
@@ -27,10 +32,10 @@ Item {
   readonly property bool isUnknown: variant === "unknown"
   readonly property bool dotted: isPro || isUnknown
   readonly property bool isMax: variant === "max"
-  readonly property bool isCase: !isMax && (caseExiting || caseState === "open" || caseState === "closed"
-    || caseState === "open-left" || caseState === "open-right" || caseState === "open-empty")
+  readonly property bool isCase: !isMax && (caseExiting || displayCaseState === "open" || displayCaseState === "closed"
+    || displayCaseState === "open-left" || displayCaseState === "open-right" || displayCaseState === "open-empty")
   readonly property bool hiResCase: iconSize >= 32
-  readonly property bool pixelCase: pixelArt && isCase && (dotted || caseState === "closed")
+  readonly property bool pixelCase: pixelArt && isCase && (dotted || displayCaseState === "closed")
   readonly property bool usesPixelArt: pixelCase || (pixelArt && dotted && !isCase)
   // Keep one renderer through either pod's departure, including the second
   // pod leaving. open-left/open-right name the pod still seated in the case.
@@ -38,8 +43,8 @@ Item {
   readonly property bool usesMeshBuds: pixelArt && dotted && !isCase
   readonly property real podsArtworkScale: 1.38
   function restingPodsTop(size) {
-    var ratio = Math.max(1, Window.window ? Window.window.devicePixelRatio : Screen.devicePixelRatio)
-    return Grid.podsArtworkTop(size, podsArtworkScale, Grid.screenPitch(Grid.pitch, ratio))
+    return pixelArtwork.item && pixelArtwork.item.restingPodsTop
+      ? pixelArtwork.item.restingPodsTop(size) : artworkTop
   }
   // Connector attachment follows the resting artwork, not the entrance
   // translation. Pods descend over the wires without pulling their ends up.
@@ -49,7 +54,7 @@ Item {
 
   // Apple's artboards sit the outline low, so the glyph is fitted to its ink box instead: x, y, width, height in artboard units.
   readonly property var ink: isCase
-    ? (caseState === "closed" ? (iconSize >= 32 ? [1.6, 15, 52.8, 36] : [4, 15, 48, 36])
+    ? (displayCaseState === "closed" ? (iconSize >= 32 ? [1.6, 15, 52.8, 36] : [4, 15, 48, 36])
       : (hiResCase ? [1.6, 8.86, 52.8, 42.14] : [4, 7, 48, 44]))
     : isPro ? [0.25, 26.25, 37.5, 25.75]
     : isMax ? [0, 12, 34, 38]
@@ -64,7 +69,7 @@ Item {
   readonly property real caseBaseline: (iconSize + 44 * fit) / 2
   readonly property real caseX: (iconSize - ink[2] * fit) / 2 - ink[0] * fit
   readonly property real caseY: caseBaseline - (ink[1] + ink[3]) * fit
-  // 1 = seated in the well, 0 = lifted clear. Not bound to caseState, so the
+  // 1 = seated in the well, 0 = lifted clear. Not bound to displayCaseState, so the
   // return trip can animate instead of snapping shut.
   property real leftSeat: 1
   property real rightSeat: 1
@@ -124,12 +129,12 @@ Item {
       else rightSeat = value
       return
     }
-    // caseStateChanged can run before usesMeshCase's binding refreshes. Set
+    // A placement change can run before usesMeshCase's binding refreshes. Set
     // timing from the requested state before starting: a running animation
     // otherwise retains the old standalone duration for this entire return.
     var meshCase = pixelArt && variant !== "max"
       && (variant === "pro" || variant === "unknown" || caseState === "closed")
-    anim.duration = meshCase ? (value === 0 ? 840 : meshReturnMs) : 420
+    anim.duration = meshCase ? (value === 0 ? podDepartureMs : meshReturnMs) : 420
     // Returns descend at constant speed from the first frame through seating.
     anim.easing.type = meshCase
       ? (value === 1 ? Easing.Linear : Easing.InOutCubic) : Easing.InOutQuad
@@ -137,12 +142,13 @@ Item {
     anim.start()
   }
 
-  function syncSeats(animate) {
-    if (caseExiting && caseState === "" && animate) return
+  function syncSeats(state, animate) {
+    closeAfterDrop.stop()
+    if (caseExiting && state === "" && animate) return
     caseExiting = false
     caseExit.stop()
     caseOut = 0
-    if (caseState === "") {
+    if (state === "") {
       // Keep the empty case renderer until it has cleared the bottom clip.
       // If the state arrives early, let the departing pods finish first.
       if (animate && seatedState === "open-empty" && pixelArt && dotted) {
@@ -172,7 +178,7 @@ Item {
     }
     budsDrop.stop()
     budsIn = 1
-    if (caseState === "closed") {
+    if (state === "closed") {
       var lifted = leftSeat < 0.98 || rightSeat < 0.98
       var wasOpen = seatedState === "" || seatedState === "open" || seatedState === "open-left"
         || seatedState === "open-right" || seatedState === "open-empty"
@@ -195,8 +201,8 @@ Item {
       return
     }
     droppingIntoClosed = false
-    var next = seatTargets(caseState)
-    seatedState = caseState
+    var next = seatTargets(state)
+    seatedState = state
     if (!animate) {
       leftLift.stop()
       rightLift.stop()
@@ -210,9 +216,63 @@ Item {
     moveSeat(rightLift, next[1])
   }
 
-  onCaseStateChanged: syncSeats(visible)
-  onVisibleChanged: if (!visible) { budsDrop.stop(); syncSeats(false) }
-  Component.onCompleted: syncSeats(false)
+  function present(state, animate) {
+    // Establish retention/return flags before changing the displayed shape.
+    // QML may update a Loader synchronously when its shape binding changes.
+    syncSeats(state, animate)
+    displayCaseState = state
+  }
+
+  function requestPlacement(animate) {
+    if (!animate) {
+      confirmEmpty.stop()
+      holdEmpty.stop()
+      budsDrop.stop()
+      present(caseState, false)
+      return
+    }
+    // Confirm a last-pod departure before changing the picture. Repeated
+    // evidence must not restart either the confirmation or the lift.
+    if (caseState === "" && !isMax
+        && (displayCaseState === "open" || displayCaseState === "open-left"
+          || displayCaseState === "open-right")) {
+      if (!confirmEmpty.running) confirmEmpty.start()
+      return
+    }
+    if (caseState === "" && holdEmpty.running) return
+    confirmEmpty.stop()
+    holdEmpty.stop()
+    present(caseState, true)
+  }
+
+  // Callers ask for connector positions, never infer them from animation flags.
+  function connectorTop(restingSize, restingOffset) {
+    return caseExiting ? restingOffset + restingPodsTop(restingSize) : artworkTop
+  }
+  function revealedConnectorTop(restingSize, restingOffset) {
+    var end = connectorTop(restingSize, restingOffset)
+    return caseExiting ? Math.min(end, artworkTop + caseOut * iconSize) : end
+  }
+
+  onCaseStateChanged: if (initialized) requestPlacement(visible)
+  onVisibleChanged: if (initialized && !visible) requestPlacement(false)
+  Component.onCompleted: { initialized = true; requestPlacement(false) }
+
+  Timer {
+    id: confirmEmpty
+    interval: root.emptyCaseConfirmMs
+    onTriggered: {
+      root.present("open-empty", true)
+      holdEmpty.start()
+    }
+  }
+  Timer {
+    id: holdEmpty
+    // The same owner schedules both departures and the empty-case hold.
+    // syncSeats also waits for actual lift completion before exiting.
+    interval: root.podDepartureMs
+    onTriggered: root.present("", true)
+  }
 
   // The bar centers whatever bounds it can measure. The bud Shape's bounding
   // rect stays empty, and an empty box is pinned by its corner to the slot
@@ -258,8 +318,8 @@ Item {
       root.caseExiting = false
       root.caseOut = 0
       root.seatedState = ""
-      root.syncSeats(false)
-      if (root.visible && root.caseState === "") budsDrop.restart()
+      root.syncSeats(root.displayCaseState, false)
+      if (root.visible && root.displayCaseState === "") budsDrop.restart()
     }
   }
 
@@ -290,7 +350,7 @@ Item {
   }
 
   Image {
-    visible: root.isCase && root.caseState === "closed" && !root.droppingIntoClosed && !root.pixelCase
+    visible: root.isCase && root.displayCaseState === "closed" && !root.droppingIntoClosed && !root.pixelCase
     source: root.isCase ? Qt.resolvedUrl(root.iconSize >= 32
       ? "assets/airpods-case-closed-large.svg"
       : "assets/airpods-case-closed.svg") : ""
@@ -308,15 +368,15 @@ Item {
 
   Image {
     id: hiResCaseImage
-    visible: root.hiResCase && root.isCase && !root.pixelCase && (root.caseState !== "closed" || root.droppingIntoClosed)
+    visible: root.hiResCase && root.isCase && !root.pixelCase && (root.displayCaseState !== "closed" || root.droppingIntoClosed)
     source: {
       // While a lifted pod drops back in, hold the full open case so the
       // popup does not blank before the closed glyph.
       var file = "airpods-case-open.svg"
       if (!root.droppingIntoClosed) {
-        if (root.caseState === "open-left") file = "airpods-case-open-left-large.svg"
-        else if (root.caseState === "open-right") file = "airpods-case-open-right-large.svg"
-        else if (root.caseState === "open-empty") file = "airpods-case-open-empty-large.svg"
+        if (root.displayCaseState === "open-left") file = "airpods-case-open-left-large.svg"
+        else if (root.displayCaseState === "open-right") file = "airpods-case-open-right-large.svg"
+        else if (root.displayCaseState === "open-empty") file = "airpods-case-open-empty-large.svg"
       }
       return Qt.resolvedUrl("assets/" + file)
     }
@@ -333,13 +393,13 @@ Item {
   }
 
   Image {
-    visible: hiResCaseImage.visible && root.caseState !== "open-empty"
+    visible: hiResCaseImage.visible && root.displayCaseState !== "open-empty"
     source: {
       var file = "airpods-case-open-seams.svg"
       if (!root.droppingIntoClosed) {
-        if (root.caseState === "open-left") file = "airpods-case-open-left-seams.svg"
-        else if (root.caseState === "open-right") file = "airpods-case-open-right-seams.svg"
-        else if (root.caseState === "open-empty") return ""
+        if (root.displayCaseState === "open-left") file = "airpods-case-open-left-seams.svg"
+        else if (root.displayCaseState === "open-right") file = "airpods-case-open-right-seams.svg"
+        else if (root.displayCaseState === "open-empty") return ""
       }
       return Qt.resolvedUrl("assets/" + file)
     }
@@ -352,7 +412,7 @@ Item {
   }
 
   Item {
-    visible: !root.hiResCase && root.isCase && (root.caseState !== "closed" || root.droppingIntoClosed)
+    visible: !root.hiResCase && root.isCase && (root.displayCaseState !== "closed" || root.droppingIntoClosed)
     width: 56 * root.fit
     height: width
     x: root.caseX
@@ -437,10 +497,11 @@ Item {
 
   Component {
     id: meshCaseComponent
-    CaseMesh {
+    MeshArtwork {
       objectName: "caseMeshArtwork"
+      artworkScale: root.podsArtworkScale
       // Seat the returning pod before closing the lid over it.
-      caseState: root.caseExiting ? "open-empty" : root.droppingIntoClosed ? "open" : root.caseState
+      caseState: root.caseExiting ? "open-empty" : root.droppingIntoClosed ? "open" : root.displayCaseState
       leftLift: root.meshLift(root.leftSeat, root.leftReturning)
       rightLift: root.meshLift(root.rightSeat, root.rightReturning)
       leftTurn: root.leftReturning ? root.returnTurn(leftLift) : 0
@@ -453,7 +514,7 @@ Item {
 
   Component {
     id: meshBudsComponent
-    BudsMesh {
+    MeshArtwork {
       objectName: "budsMeshArtwork"
       arrival: root.budsIn
       // Fill more of the popup slot without enlarging the dots themselves.
@@ -468,7 +529,7 @@ Item {
     PixelPods {
       objectName: "pixelArtwork"
       pairingMode: root.pairingMode
-      caseState: root.pixelCase ? (root.droppingIntoClosed ? "open" : root.caseState) : ""
+      caseState: root.pixelCase ? (root.droppingIntoClosed ? "open" : root.displayCaseState) : ""
       foregroundColor: artworkPalette.item.foreground
       backgroundColor: artworkPalette.item.backgroundColor
     }

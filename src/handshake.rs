@@ -53,29 +53,29 @@ impl Daemon {
                 }
             }
             Letter::Ack { id } => {
-                if self.from_enrolled_peer(from, id) && self.enrollment.mark_delivered(id) {
+                if self.matches_enrolled_peer(from, id) && self.enrollment.mark_delivered(id) {
                     self.send_offer();
                 }
             }
             Letter::Offer { id, attempt, public } => {
-                if self.from_enrolled_peer(from, id) && self.enrollment.offer(id, attempt) {
+                if self.matches_enrolled_peer(from, id) && self.enrollment.offer(id, attempt) {
                     self.offer = Some(public);
                 }
             }
             Letter::Response { id, attempt, public, confirm } => {
-                if self.from_enrolled_peer(from, id) {
+                if self.matches_enrolled_peer(from, id) {
                     self.on_response(id, attempt, &public, confirm);
                 }
             }
             Letter::Grant { id, confirm, proposal } => {
-                if self.from_enrolled_peer(from, id) {
+                if self.matches_enrolled_peer(from, id) {
                     self.on_grant(from, id, confirm, proposal);
                 }
             }
             Letter::Saved { id, .. } => {
                 // The joiner has stored the key and is waiting for commit.
                 if self.enrollment.initiator()
-                    && self.from_enrolled_peer(from, id)
+                    && self.matches_enrolled_peer(from, id)
                     && self.enrollment.phase() == crate::fleet::enroll::Phase::WaitingDone
                 {
                     self.send(from, Letter::Commit { id });
@@ -83,7 +83,7 @@ impl Daemon {
             }
             Letter::Commit { id } => {
                 if !self.enrollment.initiator()
-                    && self.from_enrolled_peer(from, id)
+                    && self.matches_enrolled_peer(from, id)
                     && self.enrollment.phase() == crate::fleet::enroll::Phase::WaitingCommit
                 {
                     self.send(from, Letter::Done { id });
@@ -91,7 +91,7 @@ impl Daemon {
                 }
             }
             Letter::Done { id } => {
-                if self.from_enrolled_peer(from, id) {
+                if self.matches_enrolled_peer(from, id) {
                     self.enrollment.note_confirmed(id);
                 }
             }
@@ -121,7 +121,7 @@ impl Daemon {
                 self.offer = None;
             }
             Letter::Rejected { id, attempt } => {
-                if self.from_enrolled_peer(from, id) {
+                if self.matches_enrolled_peer(from, id) {
                     self.enrollment.code_rejected(id, attempt);
                     self.pake = None;
                     self.offer = None;
@@ -134,7 +134,7 @@ impl Daemon {
     /// with. The radio source is self-asserted, so this does not
     /// authenticate anyone — it keeps a letter for one enrollment (or a
     /// bystander's stray fragment) from moving another enrollment's phase.
-    fn from_enrolled_peer(&self, from: Address, id: InvitationId) -> bool {
+    fn matches_enrolled_peer(&self, from: Address, id: InvitationId) -> bool {
         self.enrollment.id() == Some(id)
             && self.enrollment.peer().map(|(peer, _)| peer) == Some(from)
     }

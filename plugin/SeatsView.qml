@@ -103,11 +103,10 @@ Item {
   readonly property real artworkY: root.linkY + root.captionGap + root.caseGap
   // Lay the wires out for the incoming pods as soon as the case exits.
   // Hide the part covered by the moving lid, including the gaps between dots.
-  readonly property real connectorEndY: buds.caseExiting
-    ? root.artworkY + buds.restingPodsTop(root.budsSize) : buds.y + buds.artworkTop
-  readonly property real revealedConnectorEndY: buds.caseExiting
-    ? Math.min(connectorEndY, buds.y + buds.artworkTop + buds.caseOut * buds.iconSize)
-    : connectorEndY
+  readonly property real connectorEndY: buds.y
+    + buds.connectorTop(root.budsSize, root.artworkY - buds.y)
+  readonly property real revealedConnectorEndY: buds.y
+    + buds.revealedConnectorTop(root.budsSize, root.artworkY - buds.y)
   readonly property int connectorDrawMs: 8000
   readonly property int wireGap: 10
   readonly property int moveMs: 450

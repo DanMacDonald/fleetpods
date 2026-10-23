@@ -13,9 +13,9 @@ the plugin for visual iteration. Launch it with
 `./tools/artwork/preview --light --open` from the repository root; it needs no
 running daemon or connected earbuds.
 
-On the `experiment/3d-visuals` branch, the popup uses that renderer for
+The popup uses that renderer for
 all case states: closed, both docked, either pod out, and briefly empty when the
-second pod leaves. `CaseMesh.qml` fits the mesh to the existing artwork bounds,
+second pod leaves. `MeshArtwork.qml` fits the mesh to the existing artwork bounds,
 with a fixed camera and a 350 ms hinged lid animation. The same instance survives
 case-state changes and reversals during animation. Each pod lifts vertically
 clear of the artwork over 840 ms and returns at constant speed over 500 ms, starting
@@ -30,7 +30,7 @@ is unpaired. A later in-ear event does not
 restart an existing lift. If the case closes, returning pods seat before the lid
 closes. After the empty-case hold and both pods clearing the artwork, the empty
 case slides down through the bottom clip over 350 ms. A returning pod cancels
-that exit and restores the case. `BudsMesh.qml` then presents the standalone pair:
+that exit and restores the case. `MeshArtwork.qml` then presents the standalone pair:
 they descend at constant speed over 494 ms with tips initially inward, rotating around their
 vertical axes into an outward-facing pose similar to the old illustration.
 The connector endpoints stay fixed while the artwork moves over them.
@@ -42,7 +42,7 @@ entrance with `./tools/artwork/preview --pods-out` (also supports `--light`).
 All 3D popup states share the 3 px dot pitch and glyph weight in `DotGrid.js`.
 The light standalone pods use softer white-shell contours and volume shading
 than the case, while retaining dark vents and the same dot size.
-Dots align to the half-pixel canvas grid; artwork framing changes the mesh size,
+Dots align to physical display pixels, with consistent partial coverage at 100%; artwork framing changes the mesh size,
 not the dot size or spacing. Preview controls can override the pitch.
 Dark rendering uses the approved baseline-study settings: frontal fill 0.57
 and face brightness 0.73× on white surfaces, for both pods and case states.
@@ -53,3 +53,11 @@ experiment and its overlay remain confined to the separate art study.
 deno run --allow-read plugin/tests/model.test.js
 deno run --allow-read plugin/tests/replay.test.js
 ```
+
+`MeshArtwork.qml` is the shared framing interface for both case and standalone
+poses. `AirPodsIcon.qml` owns their presentation lifecycle, including the
+250 ms last-departure confirmation and the empty-case hold. `Service.qml`
+forwards physical placement without scheduling artwork timers, and `SeatsView`
+reads the icon's connector positions without inspecting motion flags. Rendering
+checks in `tst_MeshArtwork.qml` capture the actual painted result; motion tests
+exercise placement changes through the icon.

@@ -21,10 +21,10 @@ function screenSize(requested, dotPitch, pixelRatio) {
     Math.round(nominal * pixelRatio))) / pixelRatio
 }
 
-function podsFrameSize(size, dotPitch) {
-  return Math.floor(size / 0.90 / dotPitch) * dotPitch
-}
-
-function podsArtworkTop(size, artworkScale, dotPitch) {
-  return size / 2 - podsFrameSize(size, dotPitch) * 0.22 * artworkScale
+// Canvas rounds its backing image to physical pixels, but presents it at the
+// unrounded logical extent. Match that image's physical size exactly so the
+// scene graph cannot squeeze a gap or a dot at fractional display scales.
+function canvasScale(extent, pixelRatio) {
+  var physical = Math.max(1, extent * pixelRatio)
+  return Math.round(physical) / physical
 }

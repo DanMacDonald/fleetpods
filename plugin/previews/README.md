@@ -15,7 +15,7 @@ Drag the large artwork or use the rotation slider. Switch between earbuds, an op
 
 Use `./tools/artwork/preview --pods-out` for the standalone pair's entrance,
 beside the original 2D illustration. Replay or scrub the descent and vertical-axis
-turn, adjust dot spacing, and switch between light and dark. It uses the popup's `BudsMesh.qml`.
+turn, adjust dot spacing, and switch between light and dark. It uses the popup's `MeshArtwork.qml`.
 `--capture` saves `/tmp/fleetpods-pods-out.png` (or `-light.png` with `--light`).
 
 This study uses a simplified CC0 AirPods Pro reference mesh, with separate case and lid geometry and mirrored earbuds. See [asset provenance and regeneration](../artwork/README.md). `DotMesh.js` assembles the scene and selects one renderer for the background. `DotPods.qml` draws the resulting grid with square dots. It runs at 20 frames per second while visible; hiding or pausing it stops the timer. Colors are component inputs.
@@ -41,18 +41,22 @@ the light/dark, open/closed, and standalone-pod states before trying the plugin.
 The original Blender reference, exporter, license notes, and renderer tests are
 also retained in the repository. Blender is only needed to regenerate geometry.
 
-The experimental popup integration uses `CaseMesh.qml` to frame this same
+The experimental popup integration uses `MeshArtwork.qml` to frame this same
 renderer for every case state, including either pod out and the empty case. Its camera is fixed
 while the hinge and both pods animate; the study retains its rotation controls and all
 mesh variants. The canvas renders at the window's native device pixel ratio.
+Its displayed extent matches the rounded backing-image dimensions, so fractional
+scales do not resample a dot or squeeze a grid gap at certain popup positions.
 At 100% scaling, partial edge coverage preserves the laptop's dot weight rather
 than rounding 1.5-pixel dots up to 2 pixels. Higher scales retain whole-pixel dots.
 The grid stays pixel-aligned in both modes, and the rendering follows the window
 when it moves between monitors.
 Smoothed dark artwork keeps surface lighting separate from silhouette coverage,
 so partially covered dots fade against the background without acquiring false shadows.
-At 100% and 200%, the standalone pods also use identical geometry framing; extra
-edge clearance is reserved for fractional display scales.
+Standalone pods use the same camera framing at every display scale. The earlier
+fractional-scale inset put a shallow stem notch on the sampling boundary,
+creating isolated dark edge dots; complete-glyph and stem-edge captures cover
+100%, 160%, and 200% without that inset.
 
 The study is saved in Git as a baseline before live-plugin integration. To run
 that version later without reverting ongoing work, use
@@ -68,6 +72,17 @@ deno run --allow-read plugin/tests/silhouette.test.js
 deno run --allow-read plugin/tests/lid-face.test.js
 QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
   /usr/lib/qt6/bin/qmltestrunner -input plugin/tests/tst_DotPods.qml -import plugin/tests/imports
+```
+
+The dot-footprint regression must also run on the GPU path: the software backend
+can hide texture resampling at fractional origins. Check 100%, 160%, and 200%:
+
+```sh
+for scale in 1 1.6 2; do
+  env -u QT_QUICK_BACKEND QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=opengl \
+    QT_SCALE_FACTOR="$scale" /usr/lib/qt6/bin/qmltestrunner \
+    -input plugin/tests/tst_DotPods.qml -import plugin/tests/imports
+done
 ```
 
 The JavaScript checks include 80 exact frame digests covering both themes, all

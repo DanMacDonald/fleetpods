@@ -61,7 +61,7 @@ check("disconnected", Model.ownershipText({ connected: false, audioOwner: LOCAL 
   for (const [time, connected, left, expected] of [
     [1000, true, pod(false, true), "open-left"],
     [2000, false, pod(false, true), "open-left"],
-    [3000, false, pod(true, false), "open-empty"]
+    [3000, false, pod(true, false), ""]
   ]) {
     const status = Model.parseStatus(JSON.stringify({ schema_version: 1,
       connected, bluetooth_paired: true, pairing_keys_ready: true,
@@ -434,12 +434,12 @@ check("missing telemetry is not confirmed docked", Model.confirmedInCase(Model.L
   check("remember left out and right in", observe({ in_case: false }, { in_case: true }), "open-right")
   check("unknown preserves both individual placements", observe({ in_ear: false }, {}, "open-right"), "open-right")
   check("disconnect flags do not erase placement memory", observe({ available: false }, { available: false }, "open-right", false), "open-right")
-  check("last pod out is remembered before empty artwork confirms", observe({}, { in_case: false }, "open-right"), "open-empty")
-  check("unknown does not cancel pending empty artwork", observe({}, {}, "open-right"), "open-empty")
+  check("last pod out is remembered before empty artwork confirms", observe({}, { in_case: false }, "open-right"), "")
+  check("unknown does not cancel pending empty artwork", observe({}, {}, "open-right"), "")
   check("unknown keeps standalone pods out", observe({}, {}, ""), "")
   check("explicit return overrides remembered out", observe({ in_case: true }, {}, ""), "open-left")
   check("unknown keeps returned left pod seated", observe({}, {}, "open-left"), "open-left")
-  check("in-ear proves the left pod is out again", observe({ in_ear: true }, {}, "open-left"), "open-empty")
+  check("in-ear proves the left pod is out again", observe({ in_ear: true }, {}, "open-left"), "")
   check("both explicit returns restore docked state", observe({ in_case: true }, { in_case: true }, ""), "open")
   check("unknown keeps both previously docked pods seated", observe({}, {}), "open")
 }
@@ -464,16 +464,16 @@ check("right in ear shows the left pod remaining in the case", Model.caseIconSta
   check("return-to-case works without an ear report", icon(docked, docked, "open-left"), "open")
   check("missing case placement keeps the other bud seated", icon({ available: true }, removed), "open-left")
   check("unavailable out-of-case evidence does not remove a pod", icon(docked, { ...removed, available: false }), "open")
-  check("both explicit departures show the empty case", icon(removed, removed, "open-left"), "open-empty")
+  check("both explicit departures report pods out", icon(removed, removed, "open-left"), "")
   check("fresh departure overrides an older closed-lid state", icon(docked, removed, "closed", false, Model.LID_CLOSED), "open-left")
 }
 check("both worn buds use no case", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod), "")
 // 2026-10-04: lg-gram drew both buds worn while the right one sat in a flat case and the iPhone played.
 check("a bud that reports neither ear nor case stays in the case", Model.caseIconState(false, Model.LID_UNKNOWN,
   wornPod, restingPod, "", true, 1000, 2000, 20000, false), "open-right")
-check("second in-ear from a half-empty case shows the empty case", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod, "open-left"), "open-empty")
-check("second in-ear from a full open case shows the empty case", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod, "open"), "open-empty")
-check("empty case holds while both stay in-ear", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod, "open-empty"), "open-empty")
+check("second in-ear from a half-empty case reports pods out", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod, "open-left"), "")
+check("second in-ear from a full open case reports pods out", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod, "open"), "")
+check("empty presentation does not change placement evidence", Model.caseIconState(false, Model.LID_OPEN, wornPod, wornPod, "open-empty"), "")
 check("both worn from a closed case skip the empty flash", Model.caseIconState(false, Model.LID_CLOSED, wornPod, wornPod, "closed"), "")
 check("unknown lid defaults to closed case", Model.caseIconState(false, Model.LID_UNKNOWN, chargingPod, chargingPod), "closed")
 check("headphones never use a case icon", Model.caseIconState(true, Model.LID_CLOSED, restingPod, restingPod), "")
@@ -593,7 +593,7 @@ check('parsed unknown model int', Model.parseStatus('{"schema_version":1,"model_
   for (const [lid, leftEar, rightEar, docked, expected] of [
     [Model.LID_CLOSED, false, false, true, 'closed'],
     [Model.LID_OPEN, false, false, true, 'open'],
-    [Model.LID_UNKNOWN, true, false, false, 'open-empty'],
+    [Model.LID_UNKNOWN, true, false, false, ''],
     [Model.LID_UNKNOWN, true, true, false, ''],
     [Model.LID_UNKNOWN, true, true, false, ''],
     [Model.LID_OPEN, false, false, true, 'open'],
@@ -612,8 +612,6 @@ check('parsed unknown model int', Model.parseStatus('{"schema_version":1,"model_
     check('unpaired placement artwork ' + expected, state, expected)
     check('unpaired placement leaves batteries unknown', [status.left.level, status.right.level], [-1, -1])
     check('placement preserves pairing guidance', history.guidanceVisible, true)
-    // The empty-case animation finishes on a timer before the next icon update.
-    if (state === 'open-empty') state = ''
   }
 }
 // Detecting nearby AirPods must not hide the first-run pairing instructions.
