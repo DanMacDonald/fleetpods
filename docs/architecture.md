@@ -176,6 +176,18 @@ fails, the existing one-shot request at control readiness remains available;
 there is no additional timer or retry loop. An already present audio profile is
 not reopened just because control setup completes.
 
+When both buds are docked, Play returns the default and media streams to the
+laptop speakers immediately, including when the daemon has no active audio
+claim. Activity may still open a background control connection. The deferred
+playback claim requires fresh bud-out evidence; control readiness alone cannot
+take audio from the speakers. Battery-only setup reports that leave placement
+unknown do not satisfy that requirement.
+
+Ownership-loss recovery applies to an existing audio output. When no output
+exists, its recovery flags are cleared so a newly created output can be routed
+immediately without first restarting it. Profile requests and BlueZ reply times
+are logged separately from control setup and stream routing.
+
 Status publishes the actual BlueZ `audio_transport_active` observation, initialized
 from existing transports at startup as well as transport additions and changes. The
 panel can show local Playing and its seated device before AACP finishes when

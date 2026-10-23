@@ -1021,6 +1021,18 @@ impl Daemon {
             effects.push(effect);
         }
         effects.extend(self.pace_audio());
+        // Ownership loss can damage an existing audio node, not one that has
+        // yet to be created. Opening reports can still name the previous owner.
+        // Do not carry their recovery flags forward onto a fresh output.
+        let has_output = self.config.accessory.is_some_and(|address| {
+            self.last_graph
+                .as_ref()
+                .is_some_and(|graph| graph.sinks.iter().any(|sink| sink.address == Some(address)))
+        });
+        if !has_output {
+            self.rearm_after_loss = false;
+            self.resume_output_on_grant = false;
+        }
         let granted = self.output.wants_output()
             && self.connection.stage() == Stage::Ready
             && self.accessory.ownership.as_fresh() == Some(&true);

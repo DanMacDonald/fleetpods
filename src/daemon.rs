@@ -636,8 +636,9 @@ impl Daemon {
             } else if !self.accessory.stowed()
                 && !self.accessory.both_docked()
                 && self.preferred_connection_allowed()
-                && (self.accessory.playback_available(now.mono)
-                    || self.connection.stage() == Stage::Ready)
+                // Setup can complete with battery and roster reports alone.
+                // That says nothing about whether a docked bud has come out.
+                && self.accessory.playback_available(now.mono)
             {
                 self.deferred_playback_claim = None;
                 self.claim_playback(now);
@@ -3758,6 +3759,10 @@ impl Daemon {
             self.transport_asked = true;
             self.transport_asked_early = !ready;
             self.resume_output_on_grant = false;
+            eprintln!(
+                "fleetpodsd: requesting AirPods audio profile control_stage={}",
+                self.connection.stage().wire()
+            );
             effects.push(Effect::ConnectTransport { accessory: address });
         }
         // Codec changes still require setup; opening the audio profile does not.
@@ -3888,7 +3893,6 @@ impl Daemon {
             return;
         };
         if self.accessory.both_docked()
-            && self.output.wants_output()
             && crate::audio::route::playback_started(
                 self.last_graph.as_ref(),
                 graph,
@@ -3975,15 +3979,11 @@ impl Daemon {
     /// only pauses; a play while docked belongs on the speakers. The deferred
     /// claim still takes the pods back once a bud comes out.
     fn return_to_speakers(&mut self, now: Clock) {
-        if !self.output.wants_output() {
-            return;
-        }
         eprintln!("fleetpodsd: both pods are in the case; playing on the speakers");
         self.seat.step_back(now);
         self.routing.release_audio();
         self.resume_output_on_grant = false;
         self.output.return_to_speakers();
-        self.replan(now);
     }
 
     pub(crate) fn claim_playback(&mut self, now: Clock) {
@@ -3998,6 +3998,7 @@ impl Daemon {
         if self.accessory.stowed() || self.accessory.both_docked() {
             self.deferred_playback_claim = Some(now.mono);
             self.return_to_speakers(now);
+            self.replan(now);
             return;
         }
         if self.connection.stage() != Stage::Ready
@@ -4006,7 +4007,7 @@ impl Daemon {
         {
             // A historical sighting or an open case is not evidence that the
             // buds can play. Probe the link without muting speaker playback;
-            // claim only when a bud is out or the control link becomes ready.
+            // claim only when a bud is out, independently of control readiness.
             self.deferred_playback_claim = Some(now.mono);
             self.open_connection(now.mono);
             return;
@@ -7505,6 +7506,158 @@ mod tests {
     }
 
     #[test]
+    fn background_control_readiness_does_not_take_docked_playback_from_speakers() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+
+        let mut daemon = Daemon::new("gram");
+        daemon.set_local_address(Some(addr(1)));
+        let now = Clock::new(4_000, clock().unix.0);
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.select_accessory(Some(addr(3)));
+        daemon.connection.note_bluez(false);
+        let docked = Pod {
+            battery: Battery::new(75, true).unwrap(),
+            in_ear: Some(false),
+            in_case: Some(true),
+        };
+        daemon.note_pod(false, docked, now.mono);
+        daemon.note_pod(true, docked, now.mono);
+        daemon.note_lid(true, MonoMs(1));
+        let graph = Graph {
+            default_sink: "speakers".into(),
+            sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
+            cards: vec![],
+            streams: vec![LiveStream {
+                id: 1,
+                generation: 10,
+                sink: "speakers".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 1.0,
+                corked: false,
+            }],
+        };
+        daemon.step(Input::Audio(graph.clone()), now);
+        daemon.step(Input::Players(Vec::new()), now);
+        let activity = daemon.step(Input::Command(Command::Activity), now);
+        assert!(activity.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+        let generation = daemon.connection.generation();
+        let mut effects = daemon
+            .step(
+                Input::Player {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: Some(true),
+                },
+                at(100),
+            )
+            .effects;
+        assert!(!daemon.output.wants_output());
+
+        // Gram, 2026-10-23: setup's battery-only reports replaced the docked
+        // placement with unknown. A ready control link then took speaker audio.
+        daemon.step(Input::ControlSocket { up: true, generation }, at(200));
+        for packet in [
+            vec![1, 0, 4, 0, 1],
+            vec![4, 0, 4, 0, 0x2b, 0, 1],
+            vec![4, 0, 4, 0, 0x2e, 0, 1, 2, 0],
+            vec![4, 0, 4, 0, 4, 0, 2, 4, 1, 75, 1, 1, 2, 1, 76, 1, 1],
+        ] {
+            effects.extend(daemon.step(Input::Accessory { generation, packet }, at(300)).effects);
+        }
+        assert_eq!(daemon.connection.stage(), Stage::Ready);
+        assert!(!daemon.accessory.playback_available(at(300).mono));
+        assert!(!daemon.accessory.both_docked());
+        for ms in [500, 2_000, 9_000] {
+            effects.extend(daemon.step(Input::Tick, at(ms)).effects);
+            effects.extend(daemon.step(Input::Audio(graph.clone()), at(ms)).effects);
+            assert!(!daemon.output.wants_output(), "control readiness is not bud-out evidence");
+            assert!(daemon.output.held_streams().is_empty());
+        }
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::MuteStreams(_) | Effect::MoveStreams(_) | Effect::ConnectTransport { .. }
+            )),
+            "{effects:?}"
+        );
+        daemon.accessory.note_placement(false, Some(true), Some(false), at(10_000).mono);
+        daemon.step(Input::Tick, at(10_000));
+        assert!(daemon.output.wants_output(), "a bud-out report permits the pending takeover");
+    }
+
+    #[test]
+    fn docked_play_returns_an_unclaimed_airpods_default_to_speakers() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+
+        for mpris in [true, false] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            daemon.select_accessory(Some(addr(3)));
+            for right in [false, true] {
+                daemon.accessory.note_placement(right, Some(false), Some(true), now.mono);
+            }
+            let mut graph = Graph {
+                default_sink: "pods".into(),
+                sinks: vec![
+                    Sink { name: "speakers".into(), address: None, profile: None },
+                    Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    },
+                ],
+                cards: vec![],
+                streams: vec![],
+            };
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon.step(Input::Players(Vec::new()), now);
+            assert!(!daemon.output.wants_output());
+            let mut effects = Vec::new();
+            if mpris {
+                effects.extend(
+                    daemon
+                        .step(
+                            Input::Player {
+                                service: "org.mpris.MediaPlayer2.brave".into(),
+                                playing: Some(true),
+                            },
+                            now,
+                        )
+                        .effects,
+                );
+            }
+            graph.streams.push(LiveStream {
+                id: 1,
+                generation: 10,
+                sink: "pods".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 1.0,
+                corked: false,
+            });
+            effects.extend(daemon.step(Input::Audio(graph), now).effects);
+            assert!(!daemon.output.wants_output());
+            assert!(
+                effects.iter().any(|e| matches!(e,
+                    Effect::SetDefaultSink { name } if name == "speakers"
+                )),
+                "mpris={mpris}: {effects:?}"
+            );
+            assert!(
+                effects.iter().any(|e| matches!(e,
+                    Effect::MoveStreams(moved) if moved.sink == "speakers"
+                )),
+                "mpris={mpris}: {effects:?}"
+            );
+            assert!(!effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))));
+        }
+    }
+
+    #[test]
     fn unavailable_pods_leave_speaker_playback_audible_through_connection_retries() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::step::{Effect, Input};
@@ -8484,6 +8637,86 @@ mod tests {
             assert_eq!(restarted, state != 0, "sink state {state} flagged {flagged}");
             assert!(!daemon.rearm_after_loss);
             assert!(!daemon.resume_output_on_grant);
+        }
+    }
+
+    #[test]
+    fn a_new_audio_output_is_routed_without_restarting_it_for_an_old_ownership_loss() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+
+        for old_output in [true, false] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            let pods = Sink {
+                name: "pods".into(),
+                address: Some(addr(3)),
+                profile: Some("a2dp-sink".into()),
+            };
+            let mut graph = Graph {
+                default_sink: "speakers".into(),
+                sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
+                cards: vec![],
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "speakers".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            if old_output {
+                graph.sinks.push(pods.clone());
+            }
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            graph.sinks.retain(|s| s.address.is_none());
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon.step(
+                Input::Player {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: Some(true),
+                },
+                now,
+            );
+            // Opening reports may name the old owner before granting this play.
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            daemon.step(Input::Observation(Observation::Ownership(true)), now);
+            graph.streams[0].mute = true;
+            daemon.step(Input::Audio(graph.clone()), now);
+            graph.sinks.push(pods);
+            let arrived = daemon.step(Input::Audio(graph.clone()), now);
+            assert!(
+                !arrived.effects.iter().any(|e| matches!(
+                    e,
+                    Effect::RestartOutput { .. } | Effect::RearmOutput { .. }
+                )),
+                "old_output={old_output}: {:?}",
+                arrived.effects
+            );
+            assert_eq!(daemon.output_restart_serial, 0);
+            assert!(
+                arrived.effects.iter().any(|e| matches!(e,
+                    Effect::SetDefaultSink { name } if name == "pods"
+                )),
+                "route as soon as the sink arrives: {:?}",
+                arrived.effects
+            );
+            graph.default_sink = "pods".into();
+            let selected = daemon.step(Input::Audio(graph), now);
+            assert!(
+                selected.effects.iter().any(|e| matches!(e,
+                    Effect::MoveStreams(moved) if moved.sink == "pods"
+                )),
+                "move immediately after selection: {:?}",
+                selected.effects
+            );
         }
     }
 

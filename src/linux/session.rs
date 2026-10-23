@@ -1471,7 +1471,20 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 eprintln!("fleetpodsd: bluetooth disconnect failed: {err}");
             }
         }
-        CallKind::Profile | CallKind::Remove => {
+        CallKind::Profile => {
+            eprintln!(
+                "fleetpodsd: AirPods audio profile reply after {} ms: {}",
+                call.sent.elapsed().as_millis(),
+                match &result {
+                    CallResult::Done => "connected".to_string(),
+                    CallResult::Failed { name, message } => format!("{name}: {message}"),
+                }
+            );
+            if let Some(err) = failed {
+                eprintln!("fleetpodsd: bluetooth call failed: {err}");
+            }
+        }
+        CallKind::Remove => {
             if let Some(err) = failed {
                 eprintln!("fleetpodsd: bluetooth call failed: {err}");
             }
