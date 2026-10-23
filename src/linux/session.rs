@@ -1524,6 +1524,10 @@ fn remember_inventory(
             let _ = reports.send(Input::Controller(address));
         }
     }
+    if let Some(device) = bluez::select(&live.devices, configured) {
+        let active = inventory.transports.get(&device.address).copied().unwrap_or(false);
+        let _ = reports.send(Input::Transport { active });
+    }
 }
 
 fn sync(reports: &Sender<Input>, configured: Option<Address>, live: &mut Live) {
@@ -2432,6 +2436,7 @@ mod advertisement_tests {
             bluez::Inventory {
                 adapters: HashMap::from([("/org/bluez/hci0".into(), address)]),
                 devices: Vec::new(),
+                transports: HashMap::new(),
             },
         );
         assert_eq!(live.adapter_path.as_deref(), Some("/org/bluez/hci0"));

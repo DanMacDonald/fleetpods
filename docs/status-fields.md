@@ -12,6 +12,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `supports_*` | Model capability table |
 | `local_name`, `local_address` | This host, learned at runtime |
 | `connected` | Control socket is observed up. Not setup-ready, not BlueZ |
+| `audio_transport_active` | BlueZ reports the selected accessory’s A2DP transport actively streaming. Separate from control readiness, a selected sink, and a player’s Playing state |
 | `bluez_connected` | BlueZ reported up. Unknown and down both become `false` here |
 | `bluetooth_paired` | The selected accessory has a local BlueZ pairing. Removing the device or clearing both `Paired` and `Bonded` returns this to `false`, cancels connection attempts, and restores pairing guidance. Saved accessory keys alone do not count as Bluetooth pairing |
 | `bluetooth_bonded` | BlueZ confirms saved Bluetooth pairing keys for the selected accessory. `null` means not yet observed; separate from `Trusted`, the current connection, and accessory keys. An explicit `false` blocks Apple-seat Reconnect and shows pairing guidance without discarding the current connection |

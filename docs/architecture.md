@@ -161,3 +161,28 @@ traffic retain precedence. While a route exchange is live, telemetry waits for
 its completion/retry window. This keeps handoff traffic ahead of display updates;
 it is not a guarantee of subsecond delivery over BLE. Both hosts need the new
 version to share telemetry; older hosts continue with direct BLE observations.
+
+
+## Audio before control readiness
+
+AACP control setup and A2DP audio are separate connections. A playback claim can
+open the missing audio profile alongside a control attempt that the existing
+link lifecycle has already authorized. `pace_audio` uses the current generation's
+`link_asked` marker, an opening stage, and the preferred-connector gate. Merely
+waiting for admission, background control setup without a playback claim, and
+canceled attempts cannot initiate early audio. Codec selection and disruptive
+output recovery still require a ready control link. If an early profile request
+fails, the existing one-shot request at control readiness remains available;
+there is no additional timer or retry loop. An already present audio profile is
+not reopened just because control setup completes.
+
+Status publishes the actual BlueZ `audio_transport_active` observation, initialized
+from existing transports at startup as well as transport additions and changes. The
+panel can show local Playing and its seated device before AACP finishes when
+Bluetooth is connected, A2DP is active, local playback is routed to AirPods, and
+there is no contradictory known owner or docked-pod report. A player or selected
+sink alone is insufficient. The raw control stage and connected flag remain
+unchanged; the diagram and headline describe working playback instead of an
+ongoing control recovery. If the transport stops, ordinary control progress
+becomes visible again. Legacy snapshots without transport evidence keep their
+previous presentation behavior.

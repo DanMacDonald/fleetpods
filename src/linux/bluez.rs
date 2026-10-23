@@ -88,6 +88,7 @@ pub struct Bus {
 pub struct Inventory {
     pub adapters: HashMap<String, Address>,
     pub devices: Vec<Device>,
+    pub transports: HashMap<Address, bool>,
 }
 
 impl Bus {
@@ -98,7 +99,11 @@ impl Bus {
     pub fn inventory(&self) -> Result<Inventory, String> {
         let proxy = self.connection.with_proxy("org.bluez", "/", Duration::from_secs(2));
         let objects = proxy.get_managed_objects().map_err(|err| err.to_string())?;
-        Ok(Inventory { adapters: adapters_from(&objects), devices: devices_from(&objects) })
+        Ok(Inventory {
+            adapters: adapters_from(&objects),
+            devices: devices_from(&objects),
+            transports: transports_from(&objects),
+        })
     }
 
     pub fn connect(&self, path: &str) -> Result<ConnectResult, String> {
@@ -381,12 +386,7 @@ fn properties(message: &Message) -> Option<Notice> {
     let (interface, changed, _invalid): (String, Props, Vec<String>) = message.read3().ok()?;
     if interface == "org.bluez.MediaTransport1" {
         trace_transport(&path, &changed, "event");
-        let state = prop_string(&changed, "State")?;
-        let device = path
-            .split('/')
-            .find(|part| part.starts_with("dev_"))
-            .and_then(|part| Address::parse(&part["dev_".len()..].replace('_', ":")));
-        return Some(Notice::Transport { device, active: state == "active" });
+        return transport_notice(&path, &changed);
     }
     if interface == "org.bluez.Adapter1" {
         if let Some(address) =
@@ -480,6 +480,7 @@ fn added(message: &Message) -> Option<Notice> {
     let (path, interfaces): (dbus::Path, HashMap<String, Props>) = message.read2().ok()?;
     if let Some(props) = interfaces.get("org.bluez.MediaTransport1") {
         trace_transport(&path, props, "snapshot");
+        return transport_notice(&path, props);
     }
     if let Some(props) = interfaces.get("org.bluez.Adapter1") {
         if let Some(address) = prop_string(props, "Address").and_then(|text| Address::parse(&text))
@@ -551,6 +552,31 @@ pub enum ConnectResult {
 type Props = HashMap<String, Variant<Box<dyn RefArg>>>;
 type Interfaces = HashMap<String, Props>;
 type Objects = HashMap<dbus::Path<'static>, Interfaces>;
+
+fn transport_notice(path: &str, props: &Props) -> Option<Notice> {
+    let state = prop_string(props, "State")?;
+    let device = path
+        .split('/')
+        .find(|part| part.starts_with("dev_"))
+        .and_then(|part| Address::parse(&part["dev_".len()..].replace('_', ":")));
+    Some(Notice::Transport { device, active: state == "active" })
+}
+
+fn transports_from(objects: &Objects) -> HashMap<Address, bool> {
+    let mut transports = HashMap::new();
+    for (path, interfaces) in objects {
+        let Some(props) = interfaces.get("org.bluez.MediaTransport1") else { continue };
+        if let Some(Notice::Transport { device: Some(device), active }) =
+            transport_notice(path, props)
+        {
+            // Multiple codec endpoints can coexist; an idle one does not erase
+            // another endpoint that is actively streaming at startup.
+            let current = transports.entry(device).or_insert(false);
+            *current |= active;
+        }
+    }
+    transports
+}
 
 fn adapters_from(objects: &Objects) -> HashMap<String, Address> {
     let mut adapters = HashMap::new();
@@ -917,5 +943,33 @@ mod tests {
             }
             _ => panic!("expected adapter power"),
         }
+    }
+    #[test]
+    fn inventory_and_added_objects_report_already_streaming_audio() {
+        let device = Address::parse("02:00:00:00:00:01").unwrap();
+        let mut objects = Objects::new();
+        for (endpoint, state) in [("sep1/fd0", "idle"), ("sep2/fd1", "active")] {
+            let path = format!("/org/bluez/hci0/dev_02_00_00_00_00_01/{endpoint}");
+            let props: Props = HashMap::from([(
+                "State".into(),
+                Variant(Box::new(state.to_string()) as Box<dyn RefArg>),
+            )]);
+            objects.insert(
+                dbus::Path::from(path.clone()),
+                HashMap::from([("org.bluez.MediaTransport1".into(), props)]),
+            );
+            let notice =
+                Message::new_signal("/", "org.freedesktop.DBus.ObjectManager", "InterfacesAdded")
+                    .unwrap()
+                    .append2(
+                        dbus::Path::from(path.clone()),
+                        objects.get(&dbus::Path::from(path)).unwrap(),
+                    );
+            assert!(matches!(added(&notice), Some(Notice::Transport { device: Some(d), active })
+                if d == device && active == (state == "active")));
+        }
+        assert_eq!(transports_from(&objects), HashMap::from([(device, true)]));
+        objects.remove(&dbus::Path::from("/org/bluez/hci0/dev_02_00_00_00_00_01/sep2/fd1"));
+        assert_eq!(transports_from(&objects), HashMap::from([(device, false)]));
     }
 }

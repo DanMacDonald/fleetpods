@@ -64,6 +64,7 @@ function defaultStatus() {
     audioSourceType: -1,
     audioOwner: { holder: "", playing: false },
     remotePlaying: false,
+    audioTransportActive: false,
     ownershipIntent: "none",
     remotePeerCount: -1,
     handoffResult: "none",
@@ -314,6 +315,7 @@ function parseStatus(raw) {
   status.audioSourceType = [0, 1, 2].indexOf(parsed.audio_source_type) >= 0 ? parsed.audio_source_type : -1
   var owner = parsed.audio_owner || {}
   status.audioOwner = { holder: ["local", "remote"].indexOf(owner.holder) >= 0 ? owner.holder : "", playing: owner.playing === true }
+  status.audioTransportActive = parsed.audio_transport_active === true
   status.remotePlaying = parsed.remote_playing === true
   status.nativeHandoff = parsed.native_handoff && parsed.native_handoff.enabled === true ? parsed.native_handoff : null
   status.ownershipIntent = String(parsed.ownership_intent || "none")
@@ -834,7 +836,21 @@ function handoffPhaseLabel(phase) {
 // and playing when a current source report decided it.
 function audioOwner(status) {
   var owner = status.connected && status.audioOwner
-  return owner ? owner : { holder: "", playing: false }
+  if (owner && owner.holder) return owner
+  if (transportPlaybackConfirmed(status)) return { holder: "local", playing: true }
+  return owner || { holder: "", playing: false }
+}
+
+// AACP can reconnect while A2DP is streaming. A player, selected sink, or
+// Bluetooth ACL alone does not prove playback. Preserve a known other owner.
+function transportPlaybackConfirmed(status) {
+  if (status.transportPlaybackConfirmed === true) return true
+  var owner = status.connected && status.audioOwner
+  if (owner && owner.holder && !(owner.holder === "local" && owner.playing)) return false
+  var audio = status.nativeHandoff
+  return !!(status.bluezConnected === true && status.audioTransportActive === true
+    && audio && audio.audio_active === true && audio.audio_output === "airpods"
+    && audio.yielded !== true && !podsDocked(status))
 }
 
 // Docking silences playback without changing which connected device holds the seat.
@@ -1054,7 +1070,7 @@ function connectionPresentation(status, previous, nowMs) {
   var rosterUnknown = !directRoster
     && (previous.rosterUnknown === true || (!status.connected && !!previous.lastKnown))
   var shared = !docked && !directRoster ? fleetRosterView(status) : null
-  var observingFleet = shared && !status.connected && !status.bluezConnected && !joinReleased(status)
+  var observingFleet = shared && !status.connected && !bluetoothSetupPending(status) && !joinReleased(status)
   if (shared) remembered = { fromFleet: true, unconfirmed: true, seenMs: nowMs,
     seats: shared.seats, linuxHeld: false, label: shared.sourceLabel || shared.reporterLabel }
   if (remembered && remembered.fromFleet && directRoster) remembered = null
@@ -1099,13 +1115,13 @@ function connectionPresentation(status, previous, nowMs) {
   var fleetMemoryMs = 30000
   if (remembered && remembered.fromFleet) {
     var control = status.controlConnection || {}
-    var joining = status.connected || status.bluezConnected || controlOpening(control)
+    var joining = status.connected || bluetoothSetupPending(status) || controlOpening(control)
       || (status.fleet && status.fleet.routing && status.fleet.routing.busy)
     var remaining = Math.max(0, fleetMemoryMs - (nowMs - remembered.seenMs))
     var provisional = !observingFleet && joining && remaining > 0 ? Object.assign({}, remembered) : null
     // The helper leaves once it lets go. This laptop is seated only when its own roster confirms it.
     var joinRouting = status.fleet && status.fleet.routing
-    var released = status.connected || status.bluezConnected || joinReleased(status)
+    var released = status.connected || bluetoothSetupPending(status) || joinReleased(status)
       || (joinRouting && joinRouting.phase === "success")
     if (provisional && released) {
       var helper = joinRouting && joinRouting.peer ? normalizeAddress(joinRouting.peer) : ""
@@ -1173,10 +1189,11 @@ function ownershipText(status) {
     : holder === "remote" ? "Audio owned by another device" : "Audio ownership unknown")
 }
 
-// Bluetooth visibility and a setup attempt do not confirm this laptop's seat.
+// A ready control link or observed local AirPods playback confirms this laptop's seat.
 function localSeatConnected(status) {
   var control = status.controlConnection || {}
-  return status.connected === true && (!control.stage || control.stage === "ready")
+  return transportPlaybackConfirmed(status)
+    || (status.connected === true && (!control.stage || control.stage === "ready"))
 }
 
 // Past admission the helper has let go, so its last roster broadcast is out of date. The helper keeps its seat only
@@ -1230,9 +1247,16 @@ function fleetViewSubtitle(view) {
   return view.sourcePlaying ? playingLabel(view.sourceLabel, fleet) : fleetLabel(fleet, view.sourceLabel)
 }
 
+// An ACL can outlive the control socket, including across daemon restarts.
+// Only an actual setup stage makes that ACL evidence of a join in progress.
+// Older daemons without a control stage retain their previous presentation.
+function bluetoothSetupPending(status) {
+  var control = status.controlConnection
+  return status.bluezConnected === true && (!control || !control.stage || controlOpening(control))
+}
+
 function fleetSeatView(status) {
-  var lostControl = status.controlConnection && status.controlConnection.stage === "interrupted"
-  return status.connected || (status.bluezConnected && !lostControl) || joinReleased(status) ? null : fleetRosterView(status)
+  return status.connected || bluetoothSetupPending(status) || joinReleased(status) ? null : fleetRosterView(status)
 }
 
 function fleetRosterView(status) {
@@ -1267,7 +1291,7 @@ function seatPresentation(status, takingOmarchySeat, heldOmarchySeat) {
   var local = normalizeAddress(status.localAddress)
   var localConnected = status.daemonReachable && localSeatConnected(status)
   var fleet = status.daemonReachable ? fleetSeatView(status) : null
-  var refreshing = !!(status.daemonReachable && connection.refreshing
+  var refreshing = !!(status.daemonReachable && !transportPlaybackConfirmed(status) && connection.refreshing
     && ((!takingOmarchySeat && !status.connecting) || (connection.snapshot && connection.snapshot.unconfirmed)
       || (status.controlConnection && status.controlConnection.peer_reconnect)))
   var previous = refreshing ? connection.snapshot : null
@@ -1303,7 +1327,7 @@ function seatPresentation(status, takingOmarchySeat, heldOmarchySeat) {
   // The pods can confirm their peers before this laptop finishes setup. That
   // fresh roster already confirms the Apple seat, independently of our readiness.
   var directRoster = status.connected && status.peerListUpdated > 0
-  var appleSeatUnknown = !!status.daemonReachable && !directRoster
+  var appleSeatUnknown = !!status.daemonReachable && !transportPlaybackConfirmed(status) && !directRoster
     && (!localConnected || connection.rosterUnknown) && !fleet
     && !(previous && (previous.handover || previous.fromFleet))
     && !docked && (seats.apple.length > 0 || rememberedApple.length > 0
@@ -1387,9 +1411,10 @@ function seatPresentation(status, takingOmarchySeat, heldOmarchySeat) {
 
 // Steady states are drawn by the subtitle and the seats; this line reports only what this laptop is doing.
 function localConnectionLabel(status) {
+  if (transportPlaybackConfirmed(status)) return ""
   var control = status.controlConnection || {}
   if (control.stage === "interrupted") return "Disconnected · waiting for activity or Play"
-  if (status.connected || status.bluezConnected)
+  if (status.connected || bluetoothSetupPending(status))
     return control.stage && control.stage !== "ready" ? "This laptop is waiting for the AirPods to confirm" : ""
   // A closed case holds no link, so a reconnect there says nothing useful.
   if (status.caseConfirmedDocked || confirmedInCase(status.caseLidState, status.left, status.right)) return "AirPods in case"
@@ -1670,15 +1695,17 @@ function statusLogPods(s) {
     daemonReachable: s.daemonReachable, statusLoaded: s.statusLoaded, lastError: s.lastError,
     connectionPresentation: s.presentation, localSeatHeld: s.localSeatHeld, fleet: s.fleet,
     audioRoute: s.audioRoute, idleAudioReady: idleAudioReady(st), localPlaybackConfirmed: confirmedLocalPlayback(st),
+    transportPlaybackConfirmed: transportPlaybackConfirmed(st),
     localAudioState: native ? native.audio_state || "" : "", localAudioFailure: native ? native.failure || "" : "",
     nativeHandoff: s.nativeHandoff,
     // The ring and the drawing line follow a fleet ask and a socket that is opening, not only a handoff.
-    connecting: s.connecting || openingControlLink(s.connected === true, st.controlConnection, s.fleet && s.fleet.routing),
+    connecting: !transportPlaybackConfirmed(st) && (s.connecting
+      || openingControlLink(s.connected === true, st.controlConnection, s.fleet && s.fleet.routing)),
     connectionAttempting: s.attempting, handoffPhase: s.handoffPhase,
     // Completed and connected before connecting goes false, so the ring can fill and fade instead of hiding.
     connectionCompleted: !!native && native.completed === true,
     connected: s.connected, ownershipIntent: s.ownershipIntent, wantOmarchySeat: s.wantOmarchySeat,
-    bluezConnected: st.bluezConnected === true, holdingOmarchySeat: st.holdingOmarchySeat === true,
+    bluezConnected: st.bluezConnected === true, holdingOmarchySeat: !transportPlaybackConfirmed(st) && st.holdingOmarchySeat === true,
     connectedPeers: st.connectedPeers || [], localAddress: st.localAddress || "", localName: st.localName || "",
     lastAdvertisementMs: Number(st.lastAdvertisementMs || 0), remoteSourceAddress: st.remoteSourceAddress || "",
     rosterAudioOwner: st.rosterAudioOwner || "", devices: st.devices || {},
@@ -1828,7 +1855,8 @@ function statusLogInputs(s, now) {
   var fleetView = seat.fleetView, previous = seat.previousConnection
   var inCase = pods.caseConfirmedDocked || confirmedInCase(pods.iconLidState, pods.leftPod, pods.rightPod)
   var caseClosed = podsInClosedCase(pods)
-  var control = caseQuietConnection(pods.controlConnection, inCase && pods.iconLidState !== LID_OPEN)
+  var control = pods.transportPlaybackConfirmed ? null
+    : caseQuietConnection(pods.controlConnection, inCase && pods.iconLidState !== LID_OPEN)
   // A link lost during admission belongs to the fleet switch.
   if (s.seatHandoff && control && control.stage === "interrupted") control = null
   var controlDescription = controlConnectionLabel(control)
@@ -1886,6 +1914,7 @@ function statusLogInputs(s, now) {
   var live = !pods.daemonReachable ? { kind: "offline" }
     : pairingRequired ? { kind: "pairingRequired" }
     : caseClosed ? { kind: "caseClosed" }
+    : pods.transportPlaybackConfirmed ? { kind: "audio", text: playingLabel(hostLabel(pods.localName), "Omarchy") }
     : fleetView && !fleetView.pending ? { kind: "audio", text: seat.audioSubtitle }
     : seat.appleSeatUnknown && elsewhere ? { kind: "elsewhere" }
     : controlDescription !== "" ? { kind: control.stage === "waiting" ? "waiting"

@@ -2376,6 +2376,82 @@ check('unavailable membership waits for the keyring',
 check('restored membership clears the keyring wait',
   Model.parseStatus('{"schema_version":1,"fleet":{"enrolled":true,"waiting_for_keyring":false}}').fleetWaitingForKeyring, false)
 
+// A2DP was active for 38 seconds while the XPS control socket recovered.
+// Draw the observed playback without pretending that control setup completed.
+{
+  const address = '02:00:00:00:00:01'
+  const opening = { ...Model.defaultStatus(), ok: true, connected: false,
+    bluetoothPaired: true, pairingKeysReady: true, bluezConnected: true,
+    localAddress: address, localName: 'omarchy-xps', ownershipIntent: 'claim', wantOmarchySeat: true,
+    controlConnection: { stage: 'connecting' }, audioOwner: UNKNOWN,
+    devices: { [address]: { label: 'omarchy-xps', kind: 'omarchy' },
+      '02:00:00:00:00:02': { label: 'iPhone', kind: 'apple' } },
+    left: { ...Model.defaultPod(), available: true, inEar: true, inCase: false, level: 79 },
+    right: { ...Model.defaultPod(), available: true, inEar: true, inCase: false, level: 80 },
+    nativeHandoff: { enabled: true, audio_active: true, audio_output: 'airpods', playing: true,
+      audio_state: 'playing', connecting: false, yielded: false } }
+  let state = Model.statusLog(Model.statusLogState(), { ev: 'status', t: 1000, status: opening })
+  check('a selected sink and player do not prove sound before control', state.subtitle, 'Connecting')
+  const streaming = { ...opening, audioTransportActive: true }
+  state = Model.statusLog(state, { ev: 'status', t: 2000, status: streaming })
+  check('streaming during control recovery has a Playing header', state.subtitle, 'Omarchy fleet · omarchy-xps · Playing')
+  check('streaming completes the visual dial', state.view.connecting, false)
+  check('streaming seats the local laptop', state.seat.seats.omarchy.map(d => d.address), [address])
+  check('streaming animates the audio owner', state.seat.audioPlaying, true)
+  check('streaming does not fabricate a control socket', state.view.connected, false)
+  check('streaming keeps raw control diagnostics', state.view.controlConnection.stage, 'connecting')
+  check('streaming clears the connection prompt', state.seat.omarchyTransitionLabel, '')
+  check('streaming stops a live Connecting log row', state.rows.some(r => r.live && r.event.kind === 'connecting'), false)
+  const ready = { ...streaming, connected: true, controlConnection: { stage: 'ready' },
+    connectedPeers: [address], audioOwner: LOCAL_PLAYING }
+  state = Model.statusLog(state, { ev: 'status', t: 3000, status: ready })
+  check('control readiness does not replace Playing', state.subtitle, 'Omarchy fleet · omarchy-xps · Playing')
+  for (const [label, patch] of [
+    ['transport stops', { audioTransportActive: false }],
+    ['Bluetooth drops', { bluezConnected: false }],
+    ['player pauses', { nativeHandoff: { ...opening.nativeHandoff, audio_active: false } }],
+    ['speakers selected', { nativeHandoff: { ...opening.nativeHandoff, audio_output: 'speakers' } }],
+    ['known remote owner', { connected: true, audioOwner: REMOTE_PLAYING }],
+    ['both buds docked', { left: { inCase: true, inEar: false }, right: { inCase: true, inEar: false } }],
+  ]) {
+    check('unconfirmed audio: ' + label, Model.confirmedLocalPlayback({ ...streaming, ...patch }), false)
+  }
+  const stopped = Model.statusLog(Model.statusLogState(), { ev: 'status', t: 4000,
+    status: { ...streaming, audioTransportActive: false } })
+  check('a stopped transport resumes control progress', stopped.view.connecting, true)
+  check('transport status parses strictly', Model.parseStatus('{"schema_version":1,"audio_transport_active":true}').audioTransportActive, true)
+  check('old daemons do not imply a transport', Model.parseStatus('{"schema_version":1}').audioTransportActive, false)
+}
+
+// Gram restarted with its old ACL still up, no control link, and no route.
+// Fresh XPS rosters must not perpetually renew an invented switch.
+{
+  const gram = '02:00:00:00:00:01', xps = '02:00:00:00:00:02'
+  const idle = { ...Model.defaultStatus(), ok: true, connected: false, bluezConnected: true,
+    bluetoothPaired: true, pairingKeysReady: true, localAddress: gram, localName: 'lg-gram',
+    controlConnection: { stage: 'idle' }, audioOwner: REMOTE_PLAYING,
+    devices: { [gram]: { kind: 'omarchy', label: 'lg-gram' }, [xps]: { kind: 'omarchy', label: 'omarchy-xps' } },
+    fleet: { routing: { phase: 'idle', busy: false }, roster: {
+      reporter: xps, peers: [xps], audio_source: xps, audio_idle: false, pending: false } } }
+  let state = Model.statusLogState()
+  for (const t of [1000, 4000, 10000, 35000, 130000]) {
+    state = Model.statusLog(state, { ev: 'status', t, status: idle })
+    check('idle ACL does not switch at ' + t, state.seat.switching, false)
+    check('idle ACL has no transition prompt at ' + t, state.seat.omarchyTransitionLabel, '')
+    check('idle Gram observes the seated XPS at ' + t, state.seat.seats.omarchy.map(d => d.address), [xps])
+    check('idle Gram shows XPS playback at ' + t, state.subtitle, 'Omarchy fleet · omarchy-xps · Playing')
+  }
+  check('idle ACL does not promise control confirmation', Model.localConnectionLabel(idle), '')
+  state = Model.statusLog(state, { ev: 'status', t: 131000, status: {
+    ...idle, fleet: { routing: { phase: 'idle', busy: false } } } })
+  check('a missing roster cannot turn an idle ACL into a switch', state.seat.switching, false)
+  state = Model.statusLog(state, { ev: 'status', t: 132000, status: {
+    ...idle, controlConnection: { stage: 'connecting' } } })
+  check('an actual control attempt still transitions', state.seat.switching, true)
+  state = Model.statusLog(state, { ev: 'status', t: 133000, status: idle })
+  check('canceling a real attempt restores fleet observation', state.seat.switching, false)
+}
+
 if (failures > 0) {
   console.log(failures + " failed")
   Deno.exit(1)

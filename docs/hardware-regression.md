@@ -77,3 +77,18 @@ This is a hardware checklist, not a claim of completed hardware validation. The 
 - Open/close the case where only one laptop receives the newest BLE reading.
   A newer local case/lid observation must survive an older fleet observation.
   Closing the case can end the control link; BLE remains the fallback afterward.
+
+
+## Audio starts before control setup
+
+- With a genuine playback request and the audio profile absent, confirm the
+  authorized control attempt and A2DP profile request start together. Compare
+  first active audio transport with the later control-ready event; startup time
+  still depends on the AirPods and Bluetooth controller.
+- Repeat after opening the case, an explicit Connect/Play, and a fleet handoff.
+  Admission and preferred-connector policy must still gate opening a connection.
+  Background desktop activity alone must not request an audio profile.
+- While audio is streaming and control reconnects, verify the panel keeps the
+  XPS seated and shows Playing, with no connecting spinner. Pausing or dropping
+  the audio transport should restore ordinary connection progress if control
+  is still opening. Raw status must retain the true control stage.

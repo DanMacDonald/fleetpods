@@ -135,6 +135,7 @@ pub struct Daemon {
     reopen_hold_until: Option<MonoMs>,
     codec_asked: Option<String>,
     transport_asked: bool,
+    transport_asked_early: bool,
     pub(crate) staged_controls: Vec<Vec<u8>>,
     pub(crate) peers_seated: Vec<Address>,
     pub(crate) output: crate::audio::route::Router,
@@ -362,6 +363,7 @@ impl Daemon {
             reopen_hold_until: None,
             codec_asked: None,
             transport_asked: false,
+            transport_asked_early: false,
             staged_controls: Vec::new(),
             peers_seated: Vec::new(),
             output: crate::audio::route::Router::new(),
@@ -540,6 +542,7 @@ impl Daemon {
                 })
             })
             .unwrap_or(Value::Null);
+        value["audio_transport_active"] = serde_json::json!(self.transport_active);
         value["nearby_airpods"] = self.nearby_pods.status(now.mono);
         value["audio_output_health"] = serde_json::json!({
             "state": self.config.accessory.and_then(|a| self.output_health.output(a)).map(|o| o.state),
@@ -3470,6 +3473,7 @@ impl Daemon {
         self.routing.claim_audio();
         self.output.claim();
         self.transport_asked = false;
+        self.transport_asked_early = false;
         self.audio.clear_yield();
     }
 
@@ -3497,6 +3501,7 @@ impl Daemon {
         self.seat.step_back(now);
         self.routing.release_audio();
         self.transport_asked = false;
+        self.transport_asked_early = false;
         let players = self.audio.yield_playback();
         if !players.is_empty() {
             self.effects.pause_players = players;
@@ -3534,6 +3539,7 @@ impl Daemon {
                 self.seat.begin_reconnect(now);
                 self.output.handoff(self.config.accessory, self.last_graph.as_ref(), now.mono);
                 self.transport_asked = false;
+                self.transport_asked_early = false;
                 let players = self.audio.yield_playback();
                 if !players.is_empty() {
                     self.effects.pause_players = players;
@@ -3713,8 +3719,21 @@ impl Daemon {
         let Some(address) = self.config.accessory else {
             return effects;
         };
-        if !self.output.wants_output() || self.connection.stage() != Stage::Ready {
+        let ready = self.connection.stage() == Stage::Ready;
+        // The existing link lifecycle authorizes opening (including fleet
+        // admission and the preferred connector). Audio shares that decision,
+        // but need not wait for the separate control handshake to finish.
+        let opening = self.connection.stage().is_opening()
+            && self.link_asked == Some(self.connection.generation())
+            && self.preferred_connection_allowed();
+        if !self.output.wants_output() || (!ready && !opening) {
             return effects;
+        }
+        // If the early request failed, retain the established one-shot attempt
+        // at control readiness. Never create another profile retry loop.
+        if ready && self.transport_asked_early {
+            self.transport_asked = false;
+            self.transport_asked_early = false;
         }
         let card = self
             .last_graph
@@ -3732,13 +3751,18 @@ impl Daemon {
                             .is_some_and(|profile| profile.contains("a2dp-sink"))
                 })
             });
-        // Local playback must open A2DP even before an ownership report arrives.
+        // Local playback opens A2DP in parallel with an authorized control attempt.
         // A control-only link has no audio card until ConnectProfile succeeds;
         // waiting for a grant here can leave playback on the speakers forever.
         if !transport_up && !self.transport_asked {
             self.transport_asked = true;
+            self.transport_asked_early = !ready;
             self.resume_output_on_grant = false;
             effects.push(Effect::ConnectTransport { accessory: address });
+        }
+        // Codec changes still require setup; opening the audio profile does not.
+        if !ready {
+            return effects;
         }
         let (Some(profile), Some(card)) = (self.audio.selected(), card) else {
             return effects;
@@ -11500,5 +11524,85 @@ mod tests {
                 assert!(follower.fleet_pod_state(now).is_none());
             }
         }
+    }
+    #[test]
+    fn a_play_opens_audio_alongside_an_authorized_control_attempt() {
+        use crate::pods::link::OpenStep;
+        use crate::step::{Effect, Input};
+        let now = clock();
+        let mut daemon = Daemon::new("xps");
+        daemon.select_accessory(Some(addr(3)));
+        daemon.claim_playback(now);
+        assert_eq!(daemon.connection.stage(), Stage::Connecting);
+        // Merely entering an opening stage has not authorized a radio action yet.
+        assert!(daemon.pace_audio().is_empty());
+        let start = daemon.step(Input::Tick, now);
+        assert!(start.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+        assert!(start.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        let generation = daemon.connection.generation();
+        daemon.note_socket(true, generation, now.mono);
+        for stage in [OpenStep::Handshake, OpenStep::Features, OpenStep::Notifications] {
+            assert!(daemon.connection.advance(stage, generation, now.mono));
+            let next = daemon.step(Input::Tick, now);
+            assert!(!next.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        }
+        // A missing/failed early profile still gets the original ready-stage attempt.
+        assert!(daemon.mark_control_ready(generation));
+        let retry = daemon.step(Input::Tick, now);
+        assert!(retry.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        assert!(daemon.pace_audio().is_empty());
+    }
+
+    #[test]
+    fn early_audio_obeys_playback_intent_and_connection_authorization() {
+        let now = clock();
+        let mut daemon = Daemon::new("xps");
+        daemon.select_accessory(Some(addr(3)));
+        daemon.open_connection(now.mono);
+        daemon.link_asked = Some(daemon.connection.generation());
+        assert!(daemon.pace_audio().is_empty(), "background control does not open audio");
+        daemon.output.claim();
+        daemon.link_asked = None;
+        assert!(
+            daemon.pace_audio().is_empty(),
+            "unstarted/admission-waiting link cannot open audio"
+        );
+        daemon.link_asked = Some(daemon.connection.generation());
+        daemon.keyring_locked = true;
+        assert!(daemon.pace_audio().is_empty(), "locked authorization blocks early audio");
+        daemon.keyring_locked = false;
+        daemon.connection.wait_for_request();
+        assert!(daemon.pace_audio().is_empty(), "a canceled attempt cannot open audio");
+    }
+
+    #[test]
+    fn an_early_transport_that_arrives_is_not_reopened_at_control_readiness() {
+        use crate::audio::route::{Graph, Sink};
+        use crate::step::{Effect, Input};
+        let now = clock();
+        let mut daemon = Daemon::new("xps");
+        daemon.select_accessory(Some(addr(3)));
+        daemon.claim_playback(now);
+        daemon.step(Input::Tick, now);
+        assert!(daemon.transport_asked_early);
+        daemon.last_graph = Some(Graph {
+            default_sink: "pods".into(),
+            sinks: vec![Sink {
+                name: "pods".into(),
+                address: Some(addr(3)),
+                profile: Some("a2dp-sink".into()),
+            }],
+            cards: vec![],
+            streams: vec![],
+        });
+        let generation = daemon.connection.generation();
+        daemon.note_socket(true, generation, now.mono);
+        daemon.connection.advance(crate::pods::link::OpenStep::Notifications, generation, now.mono);
+        assert!(daemon.mark_control_ready(generation));
+        assert!(!daemon.pace_audio().iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        daemon.step(Input::Transport { active: true }, now);
+        assert_eq!(daemon.status_value(now)["audio_transport_active"], true);
+        daemon.step(Input::Transport { active: false }, now);
+        assert_eq!(daemon.status_value(now)["audio_transport_active"], false);
     }
 }
