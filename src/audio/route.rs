@@ -74,6 +74,9 @@ struct RouteState {
     recovery: Option<Recovery>,
     start_after_relink: Option<Restart>,
     relinked_at: Option<MonoMs>,
+    /// Released with the pods still connected: move streams off them too.
+    returning: bool,
+    asked_return: Option<MonoMs>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,6 +152,8 @@ impl RouteState {
             recovery: None,
             start_after_relink: None,
             relinked_at: None,
+            returning: false,
+            asked_return: None,
         }
     }
 
@@ -319,6 +324,7 @@ impl Router {
 
     pub fn claim(&mut self) {
         self.state.want = true;
+        self.state.returning = false;
         // Transfer originals before the next graph can snapshot a muted stream.
         if let Some(handoff) = self.handoff.take() {
             self.state.adopt_quieted(handoff.streams);
@@ -326,6 +332,13 @@ impl Router {
     }
     pub fn release(&mut self) {
         self.state.want = false;
+    }
+    /// Give playback back to the speakers while the pods stay connected, as
+    /// when both are docked in an open case. A plain release only restores the
+    /// default; streams this daemon moved keep the pods as their target.
+    pub fn return_to_speakers(&mut self) {
+        self.state.want = false;
+        self.state.returning = true;
     }
     pub fn wants_output(&self) -> bool {
         self.state.want
@@ -343,7 +356,10 @@ impl Router {
         self.state.holding_takeover()
     }
     pub fn needs_graph(&self) -> bool {
-        self.state.want || self.state.from.is_some() || !self.state.held.is_empty()
+        self.state.want
+            || self.state.returning
+            || self.state.from.is_some()
+            || !self.state.held.is_empty()
     }
 
     /// Saved states from an acquisition that muted streams before routing.
@@ -765,7 +781,21 @@ fn release(
     state.asked_move = None;
     state.want = false;
     let on_accessory = accessory_sink.is_some_and(|sink| sink.name == graph.default_sink);
-    if !on_accessory && restore.is_empty() {
+    let speakers = if state.returning {
+        state.from.clone().or_else(|| speaker_sink(graph, accessory_sink))
+    } else {
+        state.from.clone()
+    };
+    let returning: Vec<StreamTarget> = match accessory_sink {
+        Some(sink) if state.returning => graph
+            .streams
+            .iter()
+            .filter(|stream| stream.sink == sink.name && returnable(stream))
+            .map(target)
+            .collect(),
+        _ => Vec::new(),
+    };
+    if !on_accessory && restore.is_empty() && returning.is_empty() {
         return RouteAction {
             routed: false,
             quiet: Vec::new(),
@@ -778,8 +808,15 @@ fn release(
             failure: None,
         };
     }
+    let move_streams = match speakers.clone() {
+        Some(sink) if !returning.is_empty() && due(&state.asked_return, now) => {
+            state.asked_return = Some(now);
+            Some(Move { sink, streams: returning })
+        }
+        _ => None,
+    };
     let set_default = if on_accessory {
-        state.from.clone().and_then(|from| {
+        speakers.and_then(|from| {
             if due(&state.asked_default, now) {
                 state.asked_default = Some(now);
                 Some(from)
@@ -796,7 +833,7 @@ fn release(
         routed: false,
         quiet: Vec::new(),
         set_default,
-        move_streams: None,
+        move_streams,
         restore,
         state,
         restart_output: None,
@@ -976,6 +1013,29 @@ pub fn playing_on_speakers(graph: &Graph, from: Option<&str>) -> bool {
     graph.streams.iter().any(|stream| {
         managed(stream) && !is_speaker_chain(stream) && follows_seat(&stream.sink, from)
     })
+}
+
+/// Anything on the pods but event sounds, playing or not: a play is
+/// often reported before its stream uncorks.
+fn returnable(stream: &LiveStream) -> bool {
+    let role = stream.role.to_ascii_lowercase();
+    role != "event" && role != "notification" && !is_speaker_chain(stream)
+}
+
+/// The laptop speakers when no claim recorded where playback came from.
+/// A filter on the speakers (the Omarchy tuning) is what the user hears.
+fn speaker_sink(graph: &Graph, accessory: Option<&Sink>) -> Option<String> {
+    let mut found: Option<&Sink> = None;
+    for sink in &graph.sinks {
+        if accessory.is_some_and(|pods| pods.name == sink.name) || !follows_seat(&sink.name, None) {
+            continue;
+        }
+        if !sink.name.starts_with("alsa_output") {
+            return Some(sink.name.clone());
+        }
+        found.get_or_insert(sink);
+    }
+    found.map(|sink| sink.name.clone())
 }
 
 fn is_speaker_chain(stream: &LiveStream) -> bool {

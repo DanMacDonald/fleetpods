@@ -3863,6 +3863,18 @@ impl Daemon {
         let Some(accessory) = self.config.accessory else {
             return;
         };
+        if self.accessory.both_docked()
+            && self.output.wants_output()
+            && crate::audio::route::playback_started(
+                self.last_graph.as_ref(),
+                graph,
+                accessory,
+                self.output.source_sink(),
+            )
+        {
+            self.return_to_speakers(now);
+            return;
+        }
         if self.output.wants_output()
             || self.connection.stage() != Stage::Ready
             || self.audio.yielded()
@@ -3934,6 +3946,22 @@ impl Daemon {
         self.claim_playback(now);
     }
 
+    /// Docked pods in an open case stay connected for a while (XPS,
+    /// 2026-10-23: 23 s), and a play went to them in the case. Docking alone
+    /// only pauses; a play while docked belongs on the speakers. The deferred
+    /// claim still takes the pods back once a bud comes out.
+    fn return_to_speakers(&mut self, now: Clock) {
+        if !self.output.wants_output() {
+            return;
+        }
+        eprintln!("fleetpodsd: both pods are in the case; playing on the speakers");
+        self.seat.step_back(now);
+        self.routing.release_audio();
+        self.resume_output_on_grant = false;
+        self.output.return_to_speakers();
+        self.replan(now);
+    }
+
     pub(crate) fn claim_playback(&mut self, now: Clock) {
         self.activity_at = None;
         if self.hold_pairing_connection(now.mono) {
@@ -3945,6 +3973,7 @@ impl Daemon {
         // local playback would sit silent for seconds before falling back.
         if self.accessory.stowed() || self.accessory.both_docked() {
             self.deferred_playback_claim = Some(now.mono);
+            self.return_to_speakers(now);
             return;
         }
         if self.connection.stage() != Stage::Ready
@@ -7613,6 +7642,83 @@ mod tests {
                 || matches!(effect, Effect::MuteStreams(_))
         }));
         assert!(daemon.audio.local_playing());
+    }
+
+    #[test]
+    fn a_play_with_both_pods_docked_in_an_open_case_goes_to_the_speakers() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+        // XPS, 2026-10-23 14:47: playing on the pods, both docked with the lid
+        // open, then play. The pods stayed connected for 23 s and Brave
+        // played into the case.
+        let brave = "org.mpris.MediaPlayer2.brave";
+        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
+        let graph = |sink: &str, corked: bool| Graph {
+            default_sink: sink.into(),
+            sinks: vec![
+                Sink { name: "omarchy_speaker_tuning".into(), address: None, profile: None },
+                Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                },
+            ],
+            cards: vec![],
+            streams: vec![LiveStream {
+                id: 9,
+                generation: 7554,
+                sink: sink.into(),
+                role: "".into(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 1.0,
+                corked,
+            }],
+        };
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        ready_link(&mut daemon, now);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::Accessory { generation, packet: ears(0x00, 0x00) }, now);
+        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
+        daemon.step(Input::Audio(graph("omarchy_speaker_tuning", false)), now);
+        daemon.step(Input::Players(Vec::new()), now);
+        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
+        daemon.step(Input::Audio(graph("pods", false)), at(100));
+        assert!(daemon.output.wants_output());
+        // Both docked: the ear pause pauses Brave and nothing else moves.
+        daemon.step(Input::Accessory { generation, packet: ears(0x02, 0x02) }, at(1_000));
+        let docked = daemon.step(Input::Tick, at(1_500));
+        assert!(docked.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+        assert!(!docked.effects.iter().any(|e| matches!(e, Effect::SetDefaultSink { .. })));
+        daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, at(1_600));
+        daemon.step(Input::Audio(graph("pods", true)), at(1_700));
+        // Play: back to the speakers, both the default and Brave's stream.
+        let mut effects = daemon
+            .step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_000))
+            .effects;
+        effects.extend(daemon.step(Input::Audio(graph("pods", false)), at(3_100)).effects);
+        assert!(!daemon.output.wants_output());
+        assert!(
+            effects.iter().any(|e| matches!(e,
+            Effect::SetDefaultSink { name } if name == "omarchy_speaker_tuning")),
+            "{effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(e,
+            Effect::MoveStreams(moved) if moved.sink == "omarchy_speaker_tuning"
+                && moved.streams.iter().any(|s| s.generation == 7554))),
+            "{effects:?}"
+        );
+        assert!(!effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))), "{effects:?}");
+        daemon.step(Input::Audio(graph("omarchy_speaker_tuning", false)), at(3_200));
+        let settled = daemon.step(Input::Tick, at(4_500));
+        assert!(!settled.effects.iter().any(|e| matches!(e, Effect::MoveStreams(_))));
+        // A bud out of the case takes the pods back for the waiting play.
+        daemon.step(Input::Accessory { generation, packet: ears(0x00, 0x02) }, at(6_000));
+        daemon.step(Input::Tick, at(6_500));
+        assert!(daemon.output.wants_output());
     }
 
     #[test]

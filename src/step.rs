@@ -268,7 +268,8 @@ pub enum Effect {
     SetDefaultSink {
         name: String,
     },
-    /// Move these streams onto the accessory sink. The serial must still match.
+    /// Move these streams onto a sink: the accessory, or the speakers when
+    /// docked pods hand playback back. The serial must still match.
     MoveStreams(Move),
 }
 
