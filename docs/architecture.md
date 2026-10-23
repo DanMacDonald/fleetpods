@@ -30,7 +30,7 @@ The Quickshell panel lives in `plugin/` at the repository root, next to `src/`. 
 | `panel::ipc` | Nothing. Framing and verb parsing | What a verb means |
 | `daemon` | Nothing of its own. One `step` sends each input to one module | A second copy of that module's fields |
 
-`linux` is the edge: hostname, random bytes, signals, the two filesystem locations, BlueZ, the Secret Service, and PipeWire. `fleetpodsd` calls `Daemon::step` and performs the effects. The daemon chooses each version-1 letter fragment and each version-2 public presence frame. A letter takes the next slot. Presence airs for 500 ms every 5 s. An open fleet sends version 4, sealed with the fleet key and the routing session. A roster snapshot alternates with presence on the same cadence. A routing packet takes the idle slot before either of them. Discovery stays up while this host has a controller address; releasing the advertisement leaves that scan running. A proximity-pairing advertisement is a separate input. The daemon accepts it when the stored resolving key matches, or when no key is stored and the model is recognized. Once the control link is ready, bud battery stays with that link; the lid and the case battery still follow the advertisement. The BlueZ thread only writes the service data, forwards Apple manufacturer data, and starts or stops the scan it was given. It also forwards logind sleep, bluetoothd leaving or returning, and the controller's power. The audio thread reports when its server context dies. The hidden source `fleetpods.hires-microphone` is published while a Pro 3 link is ready. Capture starts when that source is streaming and not muted. A format other than 32-bit float, mono, at the delivery rate is not played. A failed stream is opened again after five seconds. The WirePlumber hook in `wireplumber/` keeps playback on A2DP and is not installed. Those inputs run the existing interrupt path: a link that was up is dropped, the ownership report is cleared, and the playback claim stays. The radio stays quiet until the machine can use the controller again. A return waits two seconds before that link is opened again, and a second interruption during the wait does not cancel it. The BlueZ thread does not attach the control socket during that wait. A disconnect the user asked for is not opened again. A control-socket drop clears the local report and leaves the fleet transaction alone. The control socket is polled on its own with the bus; a BlueZ call does not stop that read. Adapters do not grow a second connection state machine.
+`linux` is the edge: hostname, random bytes, signals, the two filesystem locations, BlueZ, the Secret Service, and PipeWire. `fleetpodsd` calls `Daemon::step` and performs the effects. The daemon chooses each version-1 letter fragment and each version-2 public presence frame. A letter takes the next slot. Presence airs for 500 ms every 3 s. An open fleet sends version 4, sealed with the fleet key and the routing session. A roster snapshot alternates with presence on the same cadence. A routing packet takes the idle slot before either of them. Discovery stays up while this host has a controller address; releasing the advertisement leaves that scan running. A proximity-pairing advertisement is a separate input. The daemon accepts it when the stored resolving key matches, or when no key is stored and the model is recognized. Once the control link is ready, bud battery stays with that link; the lid and the case battery still follow the advertisement. The BlueZ thread only writes the service data, forwards Apple manufacturer data, and starts or stops the scan it was given. It also forwards logind sleep, bluetoothd leaving or returning, and the controller's power. The audio thread reports when its server context dies. The hidden source `fleetpods.hires-microphone` is published while a Pro 3 link is ready. Capture starts when that source is streaming and not muted. A format other than 32-bit float, mono, at the delivery rate is not played. A failed stream is opened again after five seconds. The WirePlumber hook in `wireplumber/` keeps playback on A2DP and is not installed. Those inputs run the existing interrupt path: a link that was up is dropped, the ownership report is cleared, and the playback claim stays. The radio stays quiet until the machine can use the controller again. A return waits two seconds before that link is opened again, and a second interruption during the wait does not cancel it. The BlueZ thread does not attach the control socket during that wait. A disconnect the user asked for is not opened again. A control-socket drop clears the local report and leaves the fleet transaction alone. The control socket is polled on its own with the bus; a BlueZ call does not stop that read. Adapters do not grow a second connection state machine.
 
 ## One step
 
@@ -113,3 +113,51 @@ Do not add an event bus, an actor framework, or a trait per operating system to 
 - Serde on the state structs. The wire format is built in `panel::status` so a JSON key cannot become an internal field by accident.
 - A claim that the `pf1` postcard matches the C++ daemon's advertisement bytes. The context string and service UUID stay fixed in `fleet::wire`.
 - Microphone PCM, packet bytes copied from the AGPL decoder, and any recording of the user.
+
+
+## Shared pod telemetry
+
+`fleet::pod_state::Sharing` owns version 10 pod-state packets, publication cadence,
+replay tracking, expiry, and the panel's source selection. The connected fleet
+seat owner alone publishes its direct observations. The remembered preferred
+connector is not the telemetry authority; a connected follower or a machine
+without the seat does not publish. Existing packet versions are unchanged.
+
+The 133-byte frame is `10 || seal_fleet("fleetpods-pod-state-v1", fleet_id,
+fleet_key, body)`. Its 104-byte body contains reporter (6), accessory (6), the
+presence/roster session (16), sequence (8), sent Unix milliseconds (8), followed
+by six 10-byte readings: left battery, right battery, left placement, right
+placement, case battery, and lid. Each reading has two value bytes and its
+original observation Unix milliseconds (8); integers are big endian. Batteries
+use level/charging; placements use in-ear/in-case. Optional booleans use 255 for
+unknown. Lid uses 0=open, 1=closed and a reserved 255 byte. An absent reading is
+`255,255` with timestamp zero. Refreshing the envelope never refreshes those
+observation times.
+
+Only authenticated current members for the selected accessory enter the cache.
+Sequences reject repeats/reordering within a session; replacement sessions must
+have a later sent time. A report is usable for ten seconds, bounded by both the
+sender's envelope and the local reception clock, with the existing five-second
+future-clock allowance. The panel additionally requires a matching fresh roster
+session that names the reporter as connected and holding the seat. Telemetry
+cannot nominate its own reporter. A roster withdrawal, fleet reset, accessory
+change, or loss of membership prevents selection immediately.
+
+Direct observations remain in `pods::reports::Accessory`. Status resolves a
+separate view: a ready local control link keeps its own bud readings; disconnected
+hosts prefer the fresh owner's bud readings. Lid and case battery only replace
+older local observations and never outlive their observation freshness window.
+Missing remote readings leave the local source available. Expired or unavailable
+fleet reports fall back to local BLE evidence. The diagnostic `fleet_pod_state`
+field identifies the report and which fields were used. This projection updates
+the plugin's telemetry, not connection admission, local ear-triggered player
+control, or ownership. Received reports are never re-advertised.
+
+Changed values coalesce into at most one offered snapshot per second; unchanged
+values refresh every three seconds. One replaceable queue slot prevents a backlog
+of intermediate states. The existing 500 ms radio slots and requested 100–150 ms
+advertising interval are unchanged. Pairing fragments and urgent roster/activity
+traffic retain precedence. While a route exchange is live, telemetry waits for
+its completion/retry window. This keeps handoff traffic ahead of display updates;
+it is not a guarantee of subsecond delivery over BLE. Both hosts need the new
+version to share telemetry; older hosts continue with direct BLE observations.

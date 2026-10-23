@@ -21,8 +21,6 @@ pub struct PresenceMark {
 pub struct PresenceAir {
     mark: Option<PresenceMark>,
     aired: Option<MonoMs>,
-    public_aired: Option<MonoMs>,
-    public_next: bool,
 }
 
 impl PresenceAir {
@@ -31,26 +29,23 @@ impl PresenceAir {
     }
 
     /// Whether a presence announcement is due, and if so whether the sealed
-    /// form should air instead of the public one.
+    /// form should air instead of the public one. Only a host with no fleet
+    /// airs the public form: an enrolled host never broadcasts its address,
+    /// name, or enrollment in cleartext, so unenrolled scanners cannot see
+    /// it. A keyring-locked host has no fleet loaded and airs public with an
+    /// unknown enrollment flag, like an unenrolled host.
     pub fn due(&self, mark: &PresenceMark, now: MonoMs, refresh_ms: u64) -> Option<bool> {
         let changed = self.mark.as_ref() != Some(mark);
         let aged = self.aired.is_none_or(|at| now.saturating_since(at) >= refresh_ms);
         if !changed && !aged {
             return None;
         }
-        let public_due =
-            self.public_aired.is_none_or(|at| now.saturating_since(at) >= refresh_ms * 2);
-        let private = changed || if mark.handoff { !public_due } else { !self.public_next };
-        Some(private)
+        Some(mark.fleet.is_some())
     }
 
-    pub fn note_aired(&mut self, mark: PresenceMark, now: MonoMs, public: bool) {
+    pub fn note_aired(&mut self, mark: PresenceMark, now: MonoMs) {
         self.aired = Some(now);
-        if public {
-            self.public_aired = Some(now);
-        }
         self.mark = Some(mark);
-        self.public_next = !public;
     }
 
     pub fn reset(&mut self) {

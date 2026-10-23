@@ -55,3 +55,25 @@ Run with the new daemon on every fleet host. With the pods in a closed case, use
 Repeat with B asleep before opening the case. A must stay disconnected beyond discovery expiry and the old reconnect grace. Restart A and verify that B remains preferred. Fresh input or explicit Connect on A should make A preferred. A phone already playing on the pods must retain its existing activity protection. Check that a superseded pending connection restores the original mute and volume of any held speaker streams.
 
 This is a hardware checklist, not a claim of completed hardware validation. The automated two-daemon regression covers radio exchange, persisted preference, case reopen, absent owner, unsolicited attach, explicit Connect, and cancellation of a superseded opening attempt. Radio isolation can leave devices with different last-heard activity; do not infer consensus from a single host's status.
+
+
+## Fleet pod-state sharing
+
+- With XPS holding the seat and Gram disconnected, lift/dock each bud and insert/
+  remove it from an ear. Compare status `left`, `right`, `lid_state`, and
+  `fleet_pod_state` on both hosts. Gram should identify XPS as reporter and use its
+  bud readings while remaining disconnected. State changes coalesce within one
+  second before the next available radio slot; reception is not guaranteed.
+- Check `fleet_pod_state.age_ms` stays below ten seconds while the owner publishes.
+  Duplicate packets must not refresh the age. Record arrival latency across
+  several transitions; do not infer airtime utilization from payload size alone.
+- Let the owner stop reporting. Within ten seconds of its last envelope, Gram
+  should return to its own BLE observations (`fleet_pod_state: null`). Explicit
+  owner roster withdrawal should stop selection sooner. Reconnect/seat policy
+  must remain unchanged.
+- Switch the seat in both directions while playing audio. The new owner should
+  publish; the old owner should stop. Check handoff completion and audio for
+  regressions; telemetry intentionally waits during route exchanges.
+- Open/close the case where only one laptop receives the newest BLE reading.
+  A newer local case/lid observation must survive an older fleet observation.
+  Closing the case can end the control link; BLE remains the fallback afterward.

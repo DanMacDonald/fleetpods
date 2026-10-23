@@ -165,7 +165,13 @@ impl Daemon {
         // A response for another attempt (stale, duplicated, or forged)
         // must not touch the live SPAKE state: finish() is one-shot, so
         // consuming it here would stall the real attempt until the TTL.
-        if attempt != self.enrollment.code_attempt() {
+        // The same applies after acceptance: a verbatim replay of the
+        // accepted response arrives in WaitingAck/WaitingDone, and running
+        // it through finish() again would clear the pake the pending grant
+        // still seals with.
+        if attempt != self.enrollment.code_attempt()
+            || self.enrollment.phase() != crate::fleet::enroll::Phase::Inviting
+        {
             return;
         }
         let Some(pake) = self.pake.as_mut() else {
@@ -387,6 +393,30 @@ mod tests {
         assert!(inviter.pake.is_some());
         assert_eq!(inviter.enrollment.phase(), Phase::Inviting);
         assert_eq!(inviter.enrollment.code_attempt(), 0);
+    }
+
+    #[test]
+    fn a_replayed_response_after_acceptance_keeps_the_live_pake() {
+        let (mut inviter, _joiner, now) = authenticated_pair(None);
+        assert_eq!(inviter.enrollment.phase(), Phase::WaitingDone);
+        assert!(inviter.pake.is_some());
+        // A nearby radio captured the joiner's response verbatim (its
+        // public and confirm travel in the plaintext letter) and rebroadcasts
+        // it under a fresh fragment id. It must not consume or clear the
+        // pake the staged grant still seals with.
+        inviter.deliver(
+            address(2),
+            Letter::Response {
+                id: InvitationId::new([5; 16]),
+                attempt: 0,
+                public: vec![0x42; 32],
+                confirm: [0; 32],
+            },
+            now,
+        );
+        assert_eq!(inviter.enrollment.phase(), Phase::WaitingDone);
+        assert_eq!(inviter.enrollment.code_attempt(), 0);
+        assert!(inviter.pake.is_some());
     }
 
     #[test]

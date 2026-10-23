@@ -12,6 +12,7 @@ pub mod enroll;
 pub mod letter;
 pub mod members;
 pub mod nearby;
+pub mod pod_state;
 pub mod postcard;
 pub mod presence;
 pub mod radio;

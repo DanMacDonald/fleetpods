@@ -169,6 +169,7 @@ pub struct Schedule {
     on_air: bool,
     presence: Option<Vec<u8>>,
     activity: Option<Vec<u8>>,
+    pod_state: Option<Vec<u8>>,
     presence_urgent: bool,
     roster: Option<Vec<u8>>,
     roster_remaining: u8,
@@ -197,6 +198,7 @@ impl Schedule {
             on_air: false,
             presence: None,
             activity: None,
+            pod_state: None,
             presence_urgent: false,
             roster: None,
             roster_remaining: 0,
@@ -225,6 +227,16 @@ impl Schedule {
     /// Activity has a single replaceable slot, refreshed by its owner module.
     pub fn offer_activity(&mut self, frame: Vec<u8>) {
         self.activity = Some(frame);
+    }
+
+    /// Latest snapshot replaces unsent intermediate changes. Cadence is bounded
+    /// by pod_state::Sharing; control traffic always keeps priority.
+    pub fn offer_pod_state(&mut self, frame: Vec<u8>) {
+        self.pod_state = Some(frame);
+    }
+
+    pub fn clear_pod_state(&mut self) {
+        self.pod_state = None;
     }
 
     pub fn clear_activity(&mut self) {
@@ -410,6 +422,14 @@ impl Schedule {
             self.mark_aired(now);
             return Some(Item::Activity(bytes));
         }
+        // A handoff keeps its full rotation; telemetry resumes after its
+        // acknowledgement/retry window, carrying only the latest snapshot.
+        if self.route.is_none() {
+            if let Some(bytes) = self.pod_state.take() {
+                self.mark_aired(now);
+                return Some(Item::PodState(bytes));
+            }
+        }
         // Previous-daemon rotation: presence, roster, then the repeated
         // enrollment packet. Routing still takes the later slots.
         if self.repeat.is_some() && self.route.is_none() {
@@ -487,6 +507,7 @@ impl Default for Schedule {
 /// Which advertisement `due` chose. The caller does not read the bytes to find out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
+    PodState(Vec<u8>),
     Activity(Vec<u8>),
     Letter(Vec<u8>),
     Presence(Vec<u8>),
@@ -747,5 +768,22 @@ mod tests {
             matches!(schedule.due(MonoMs(30_001)), Duty::Publish(Item::Roster(bytes)) if bytes == vec![7])
         );
         assert!(matches!(schedule.due(MonoMs(30_501)), Duty::Release));
+    }
+    #[test]
+    fn telemetry_coalesces_and_waits_for_handoff_without_speeding_up_the_radio() {
+        let mut schedule = Schedule::new();
+        schedule.offer_pod_state(vec![10, 1]);
+        schedule.offer_pod_state(vec![10, 2]);
+        schedule.offer_route(vec![6], MonoMs(1500));
+        assert_eq!(schedule.due(MonoMs(0)), Duty::Publish(Item::Route(vec![6])));
+        assert_eq!(schedule.due(MonoMs(499)), Duty::Hold);
+        assert_eq!(schedule.due(MonoMs(500)), Duty::Publish(Item::Route(vec![6])));
+        schedule.offer_roster_change(vec![7]);
+        assert_eq!(schedule.due(MonoMs(1000)), Duty::Publish(Item::Roster(vec![7])));
+        assert_eq!(schedule.due(MonoMs(1600)), Duty::Publish(Item::PodState(vec![10, 2])));
+        assert_eq!(schedule.due(MonoMs(1700)), Duty::Hold);
+        schedule.offer_pod_state(vec![10, 3]);
+        schedule.clear_pod_state();
+        assert!(!matches!(schedule.due(MonoMs(2100)), Duty::Publish(Item::PodState(_))));
     }
 }

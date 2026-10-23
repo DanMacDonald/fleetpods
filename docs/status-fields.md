@@ -7,6 +7,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | Field | Source |
 | --- | --- |
 | `schema_version` | Constant `1` |
+| `fleet_pod_state` | Selected authenticated owner telemetry, or `null`. Contains `reporter`, `sequence`, `sent_ms`, `age_ms`, and `used_fields` (`left`, `right`, `case`, `lid`). Selection requires the matching live seat roster/session and expires after ten seconds |
 | `device_name`, `model_name`, `model_int`, `model_number`, `is_pro_series`, `is_headset` | Accessory identity |
 | `supports_*` | Model capability table |
 | `local_name`, `local_address` | This host, learned at runtime |
@@ -101,3 +102,11 @@ Before pairing-mode focus, an observed open case with both buds docked takes pri
 Public setup presence (version 5) advertises an optional enrollment flag alongside the host name and address, without a fleet identifier or key. Versions 2, 3, and 4 remain readable. An enrolled discovered peer offers **Join fleet**; an unjoined or older peer offers **Add to fleet**. A join request asks the enrolled peer to provide the code and initiate the authenticated exchange, preserving that peer's fleet key.
 
 When this computer already has a fleet, Join first asks “You are currently in a fleet. Leave it?” Yes confirms a local fleet reset before requesting the invitation. No offers “Invite <device name> to your fleet instead?” A second No closes the choice without changing membership. An incoming invitation from outside the current fleet asks the same question before code entry. AirPods pairing survives leaving a fleet, and a failed keyring deletion prevents joining. Conflicting grants are rejected before any keyring write. The finishing stages have no Cancel button; closing them only dismisses the dialog.
+
+
+Pod placement/battery and lid fields can use the resolved fleet telemetry view.
+A local ready control link retains its own bud reports; a disconnected device
+prefers fresh owner telemetry. Case/lid use the newer observation, with their
+original freshness limits. Unknown remote fields and expired reports fall back
+to direct evidence. The raw local accessory observations and connection state
+are not overwritten. See [shared pod telemetry](architecture.md#shared-pod-telemetry).

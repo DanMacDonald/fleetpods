@@ -497,6 +497,8 @@ impl Daemon {
                     self.radio_inbox.accept(&bytes, self.local_address, now.mono)
                 {
                     self.hear_radio(&frame, Some(source), now);
+                } else if bytes.first() == Some(&crate::fleet::pod_state::VERSION) {
+                    self.hear_pod_state(&bytes, now);
                 } else if bytes.first() == Some(&crate::fleet::activity::VERSION) {
                     self.hear_activity(&bytes, now);
                 } else if let Some(sight) = self.read_presence(&bytes, now.unix) {
@@ -921,13 +923,17 @@ impl Daemon {
             self.offer_presence(now);
             self.offer_roster(now);
             self.offer_activity(now);
+            self.offer_pod_state(now);
             self.queue_outgoing_route(now);
             match self.outbound.due(now.mono) {
+                crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::PodState(bytes)) => {
+                    effects.push(Effect::Advertise(bytes));
+                }
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Letter(bytes)) => {
                     effects.push(Effect::Advertise(bytes));
                 }
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Presence(bytes)) => {
-                    self.note_presence_aired(now.mono, crate::fleet::presence::is_public(&bytes));
+                    self.note_presence_aired(now.mono);
                     effects.push(Effect::Advertise(bytes));
                 }
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Roster(bytes)) => {

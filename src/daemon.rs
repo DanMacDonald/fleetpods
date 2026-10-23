@@ -221,6 +221,7 @@ pub struct Daemon {
     idle_claimed: Option<(Address, MonoMs)>,
     activity_at: Option<MonoMs>,
     pub(crate) activity_preference: crate::fleet::activity::Preference,
+    pod_state: crate::fleet::pod_state::Sharing,
     route_seq: u64,
     route_air_tx: Option<u64>,
     route_air_at: Option<MonoMs>,
@@ -416,6 +417,7 @@ impl Daemon {
             idle_claimed: None,
             activity_at: None,
             activity_preference: crate::fleet::activity::Preference::default(),
+            pod_state: crate::fleet::pod_state::Sharing::default(),
             route_seq: 0,
             route_air_tx: None,
             route_air_at: None,
@@ -438,6 +440,8 @@ impl Daemon {
         if self.config.accessory != address {
             self.bluetooth_bonded = None;
             self.activity_preference.select_accessory(address);
+            self.pod_state.scope(None);
+            self.outbound.clear_pod_state();
         }
         self.config.accessory = address;
     }
@@ -496,7 +500,31 @@ impl Daemon {
 
     pub fn status_value(&self, now: Clock) -> Value {
         let resolved = self.resolved(now);
-        let mut value = status::project(&self.snapshot(now, &resolved));
+        let telemetry = self.fleet_pod_state(now);
+        let projected = telemetry.map(|packet| {
+            crate::fleet::pod_state::Sharing::project(
+                packet,
+                &self.accessory,
+                self.connection.stage() == Stage::Ready,
+                now,
+            )
+        });
+        let mut snapshot = self.snapshot(now, &resolved);
+        if let Some((accessory, _)) = &projected {
+            snapshot.accessory = accessory;
+        }
+        let mut value = status::project(&snapshot);
+        value["fleet_pod_state"] = telemetry
+            .map(|packet| {
+                serde_json::json!({
+                    "reporter": packet.identity.reporter.display(),
+                    "sequence": packet.sequence,
+                    "sent_ms": packet.sent.0,
+                    "age_ms": now.unix.0.saturating_sub(packet.sent.0),
+                    "used_fields": projected.as_ref().map(|(_, used)| used),
+                })
+            })
+            .unwrap_or(Value::Null);
         value["fleet_preference"] = self
             .preferred_connector()
             .map(|record| {
@@ -1061,11 +1089,11 @@ impl Daemon {
     }
 
     /// Queue one presence frame when the refresh interval has passed.
-    /// Idle hosts alternate public discovery and authenticated presence.
-    /// A handoff starts with authenticated presence, then uses the background
-    /// three-second cadence. Public discovery stays available every six seconds.
-    /// Completion replies use the same cadence. Losing a presence packet must
-    /// not make the peer wait for the idle public/private cycle to validate us.
+    /// An enrolled host airs only sealed presence, on the three-second
+    /// cadence, handoff or idle. Only a host with no fleet loaded airs the
+    /// public setup frame, so fleet members stay invisible to unenrolled
+    /// scanners. Completion replies use the same cadence. Losing a presence
+    /// packet must not make the peer wait for a later cycle to validate us.
     pub(crate) fn offer_presence(&mut self, now: Clock) {
         let Some(address) = self.local_address else {
             self.outbound.clear_presence();
@@ -2225,12 +2253,12 @@ impl Daemon {
         Some(self.peers.export_air())
     }
 
-    pub(crate) fn note_presence_aired(&mut self, now: MonoMs, public: bool) {
+    pub(crate) fn note_presence_aired(&mut self, now: MonoMs) {
         let Some(address) = self.local_address else {
             return;
         };
         let mark = self.presence_plan(address, now);
-        self.presence_air.note_aired(mark, now, public);
+        self.presence_air.note_aired(mark, now);
     }
 
     pub fn set_profiles(&mut self, profiles: Vec<Profile>) {
@@ -2463,6 +2491,7 @@ impl Daemon {
         self.outbound = crate::fleet::radio::Schedule::new();
         self.discovery = Discovery::new();
         self.activity_preference.clear();
+        self.pod_state.scope(None);
         self.peers.invalidate();
         self.roster_dirty = true;
         self.held_peers.clear();
@@ -2965,6 +2994,89 @@ impl Daemon {
         if let Some(frame) = self.activity_preference.offer(record, local, now, &keys) {
             self.outbound.offer_activity(frame);
         }
+    }
+
+    /// Telemetry follows the live seat, not the remembered reconnect preference.
+    /// A ready link alone does not entitle a second connected laptop to publish.
+    pub(crate) fn offer_pod_state(&mut self, now: Clock) {
+        let scope = self
+            .membership
+            .fleet()
+            .zip(self.config.accessory)
+            .map(|(fleet, accessory)| (fleet.id.bytes(), accessory));
+        self.pod_state.scope(scope);
+        let eligible = !self.keyring_locked
+            && self.connection.stage() == Stage::Ready
+            && self.local_address.is_some()
+            && self.roster_audio(now).0 == self.local_address;
+        let (Some((_, accessory)), Some(local)) = (scope, self.local_address) else {
+            self.pod_state.stop_publishing();
+            self.outbound.clear_pod_state();
+            return;
+        };
+        if !eligible {
+            self.pod_state.stop_publishing();
+            self.outbound.clear_pod_state();
+            return;
+        }
+        let fleet_id = self.membership.fleet().unwrap().id;
+        let session = self.routing_session(Some(fleet_id));
+        if session == [0; 16] {
+            return;
+        }
+        let fleet = self.membership.fleet().unwrap();
+        let keys =
+            crate::fleet::presence::FleetKeys { id: fleet.id.bytes(), key: *fleet.key.as_bytes() };
+        let identity = crate::fleet::pod_state::Identity { reporter: local, accessory, session };
+        if let Some(frame) = self.pod_state.offer(identity, &self.accessory, now, &keys) {
+            self.outbound.offer_pod_state(frame);
+        }
+    }
+
+    pub(crate) fn hear_pod_state(&mut self, bytes: &[u8], now: Clock) {
+        if self.keyring_locked {
+            return;
+        }
+        let (Some(fleet), Some(accessory)) = (self.membership.fleet(), self.config.accessory)
+        else {
+            return;
+        };
+        let keys =
+            crate::fleet::presence::FleetKeys { id: fleet.id.bytes(), key: *fleet.key.as_bytes() };
+        let local = self.local_address;
+        self.pod_state.hear(bytes, &keys, accessory, now, |reporter| {
+            Some(reporter) != local && fleet.members.iter().any(|m| m.address == reporter)
+        });
+    }
+
+    fn fleet_pod_state(&self, now: Clock) -> Option<&crate::fleet::pod_state::Packet> {
+        if self.keyring_locked {
+            return None;
+        }
+        let fleet = self.membership.fleet()?;
+        let accessory = self.config.accessory?;
+        let Holder::Remote { address: Some(address), .. } = self.resolved(now).holder else {
+            return None;
+        };
+        if !self.membership.contains(address) {
+            return None;
+        }
+        let report = self.peers.fresh_from(now, accessory, address)?;
+        if report.pending
+            || report.audio_source != Some(address)
+            || !report.peers.contains(&address)
+        {
+            return None;
+        }
+        self.pod_state.current(
+            fleet.id.bytes(),
+            crate::fleet::pod_state::Identity {
+                reporter: address,
+                accessory,
+                session: report.wire_session?,
+            },
+            now,
+        )
     }
 
     /// The remembered host alone reacts to availability. A sleeping owner is
@@ -9029,18 +9141,25 @@ mod tests {
     }
 
     #[test]
-    fn enrolled_presence_is_publicly_discoverable_without_granting_membership() {
+    fn enrolled_presence_is_sealed_only_and_invisible_without_the_fleet_key() {
         use crate::fleet::presence;
         use crate::step::Input;
-        let mut sender = Daemon::new("xps");
-        sender.set_local_address(Some(addr(1)));
-        sender.restore_fleet(Fleet {
+        let fleet = Fleet {
             id: FleetId::new([3; 16]),
             key: GroupKey::new([0x11; 32]),
-            members: vec![Member { address: addr(1), label: "xps".into() }],
-        });
-        let mut listener = Daemon::new("gram");
-        listener.set_local_address(Some(addr(2)));
+            members: vec![
+                Member { address: addr(1), label: "xps".into() },
+                Member { address: addr(2), label: "gram".into() },
+            ],
+        };
+        let mut sender = Daemon::new("xps");
+        sender.set_local_address(Some(addr(1)));
+        sender.restore_fleet(fleet.clone());
+        let mut unenrolled = Daemon::new("gram");
+        unenrolled.set_local_address(Some(addr(2)));
+        let mut member = Daemon::new("gram");
+        member.set_local_address(Some(addr(2)));
+        member.restore_fleet(fleet);
         let mut public = 0;
         let mut private = 0;
         for elapsed in (0..=20_000).step_by(500) {
@@ -9054,17 +9173,21 @@ mod tests {
                     if bytes[0] == presence::SEALED_SESSION {
                         private += 1;
                     }
-                    listener.step(Input::Advertisement(bytes), now);
+                    unenrolled.step(Input::Advertisement(bytes.clone()), now);
+                    member.step(Input::Advertisement(bytes), now);
                 }
             }
         }
-        assert!(public > 0 && private > 0);
-        assert!(listener.saved_fleet().is_none());
-        let nearby =
-            listener.discovery.hosts().iter().find(|host| host.address == addr(1)).unwrap();
+        assert_eq!(public, 0);
+        assert!(private > 0);
+        // Without the fleet key the sender does not exist; sighting it
+        // sealed still grants the member listener no new membership.
+        assert!(unenrolled.saved_fleet().is_none());
+        assert!(unenrolled.discovery.hosts().iter().all(|host| host.address != addr(1)));
+        let nearby = member.discovery.hosts().iter().find(|host| host.address == addr(1)).unwrap();
         assert_eq!(nearby.name, "xps");
-        assert!(!nearby.authenticated);
-        assert!(nearby.session.is_none());
+        assert!(nearby.authenticated);
+        assert!(nearby.session.is_some());
     }
 
     #[test]
@@ -9162,17 +9285,23 @@ mod tests {
         assert!(completed_at.is_some(), "handoff waited for idle presence refresh");
 
         // Fast private refresh is bounded by the confirmation packet lifetime;
-        // normal public discovery must become available again afterward.
+        // enrolled hosts keep airing sealed presence afterward and never
+        // resume public discovery.
         for daemon in [&mut gram, &mut xps] {
             let mut public = false;
+            let mut private = false;
             let idle_at = crate::fleet::route_air::LIFETIME_MS + 10_000;
             for elapsed in (idle_at..=idle_at + 10_000).step_by(500) {
                 let now = Clock::new(initial.mono.0 + elapsed, initial.unix.0 + elapsed);
-                public |= daemon.step(Input::Tick, now).effects.iter().any(|effect| {
-                    matches!(effect, Effect::Advertise(bytes) if presence::is_public(bytes))
-                });
+                for effect in daemon.step(Input::Tick, now).effects {
+                    if let Effect::Advertise(bytes) = effect {
+                        public |= presence::is_public(&bytes);
+                        private |= bytes[0] == presence::SEALED_SESSION;
+                    }
+                }
             }
-            assert!(public, "public discovery must resume after handoff confirmation");
+            assert!(!public, "enrolled presence must stay sealed after a handoff");
+            assert!(private, "sealed presence must continue after a handoff");
         }
     }
 
@@ -10806,6 +10935,178 @@ mod tests {
             advance_clock(&mut now, 120_000);
             assert!(!opens(&a.step(Input::Tick, now).effects));
             assert_eq!(a.preferred_connector().unwrap().owner, addr(2));
+        }
+    }
+    mod shared_pod_states {
+        use super::*;
+        use crate::fleet::{members::Fleet, pod_state, radio};
+        use crate::step::{Effect, Input};
+
+        fn pair(now: Clock) -> (Daemon, Daemon) {
+            let mut owner = Daemon::new("xps");
+            owner.set_local_address(Some(addr(1)));
+            ready_link(&mut owner, now);
+            owner.note_ownership(true, now.mono);
+            owner.note_source(true, 2, now.mono);
+            owner.note_pod_peers(vec![addr(1)], now.unix);
+            owner.accessory.note_placement(false, Some(true), Some(false), now.mono);
+            owner.accessory.note_lid(LidState::Open, now.mono);
+            let mut follower = Daemon::new("gram");
+            follower.set_local_address(Some(addr(2)));
+            follower.select_accessory(Some(addr(3)));
+            follower.accessory.note_placement(false, Some(false), Some(true), now.mono);
+            for daemon in [&mut owner, &mut follower] {
+                daemon.restore_fleet(Fleet {
+                    id: FleetId::new([3; 16]),
+                    key: GroupKey::new([0x11; 32]),
+                    members: vec![
+                        Member { address: addr(1), label: "xps".into() },
+                        Member { address: addr(2), label: "gram".into() },
+                    ],
+                });
+            }
+            owner.outbound = radio::Schedule::new();
+            (owner, follower)
+        }
+
+        fn frame(owner: &mut Daemon, now: Clock) -> Vec<u8> {
+            owner.offer_pod_state(now);
+            match owner.outbound.due(now.mono) {
+                radio::Duty::Publish(radio::Item::PodState(bytes)) => bytes,
+                other => panic!("expected telemetry: {other:?}"),
+            }
+        }
+
+        fn roster(owner: &mut Daemon, follower: &mut Daemon, now: Clock) {
+            let mut roster = owner.roster_snapshot(now).unwrap().air;
+            roster.sequence = 1;
+            follower.observe_nearby(
+                host_id(Some(addr(1))),
+                addr(1),
+                "xps",
+                now.unix,
+                true,
+                Some(roster.session),
+            );
+            follower.hear_roster(roster, now);
+        }
+
+        #[test]
+        fn a_disconnected_follower_uses_owner_state_then_falls_back_without_echo_or_connect() {
+            let mut now = clock();
+            let (mut owner, mut follower) = pair(now);
+            let bytes = frame(&mut owner, now);
+            let received = follower.step(Input::Advertisement(bytes.clone()), now);
+            assert!(!received.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            let generation = follower.connection.generation();
+            // Telemetry cannot authorize itself before the matching seat roster arrives.
+            assert!(follower.status_value(now)["fleet_pod_state"].is_null());
+            roster(&mut owner, &mut follower, now);
+            let status = follower.status_value(now);
+            assert_eq!(status["left"]["in_ear"], true);
+            assert_eq!(status["left"]["in_case"], false);
+            assert_eq!(status["fleet_pod_state"]["reporter"], addr(1).display());
+            assert_eq!(follower.accessory.left_placement.known().unwrap().in_case, Some(true));
+            assert_eq!(follower.connection.generation(), generation);
+            assert_ne!(follower.connection.stage(), Stage::Ready);
+            // Its newer BLE placement cannot overrule a live owner on the panel.
+            follower.accessory.note_placement(
+                false,
+                Some(false),
+                Some(true),
+                now.mono.saturating_add(100),
+            );
+            assert_eq!(follower.status_value(now)["left"]["in_ear"], true);
+            follower.outbound = radio::Schedule::new();
+            follower.offer_pod_state(now);
+            assert_eq!(follower.outbound.due(now.mono), radio::Duty::Hold);
+            advance_clock(&mut now, pod_state::TTL_MS);
+            let fallback = follower.status_value(now);
+            assert!(fallback["fleet_pod_state"].is_null());
+            assert_eq!(fallback["left"]["in_case"], true);
+            // A replay does not restart the freshness window.
+            follower.hear_pod_state(&bytes, now);
+            assert!(follower.status_value(now)["fleet_pod_state"].is_null());
+        }
+
+        #[test]
+        fn normal_radio_rotation_delivers_changes_and_recovers_a_missed_snapshot() {
+            let mut now = clock();
+            let (mut owner, mut follower) = pair(now);
+            let mut packets = 0;
+            let mut learned = false;
+            for tick in 0..40 {
+                advance_clock(&mut now, 500);
+                if tick == 20 {
+                    owner.accessory.note_placement(false, Some(false), Some(true), now.mono);
+                }
+                let outbound = owner.step(Input::Tick, now);
+                for effect in outbound.effects {
+                    if let Effect::Advertise(bytes) = effect {
+                        if bytes[0] == pod_state::VERSION {
+                            packets += 1;
+                            if packets == 1 {
+                                continue;
+                            } // lose a whole advertising slot
+                        }
+                        let received = follower.step(Input::Advertisement(bytes), now);
+                        assert!(!received
+                            .effects
+                            .iter()
+                            .any(|e| matches!(e, Effect::OpenLink { .. })));
+                        assert!(!received.effects.iter().any(|e| matches!(e,
+                            Effect::Advertise(bytes) if bytes[0] == pod_state::VERSION)));
+                    }
+                }
+                if tick < 20 && follower.fleet_pod_state(now).is_some() {
+                    assert_eq!(follower.status_value(now)["left"]["in_ear"], true);
+                    learned = true;
+                }
+            }
+            assert!(learned, "a periodic refresh must recover the missed first snapshot");
+            assert!((3..=9).contains(&packets), "bounded telemetry slots: {packets}");
+            assert!(follower.fleet_pod_state(now).is_some());
+            assert_eq!(follower.status_value(now)["left"]["in_case"], true);
+            assert_ne!(follower.connection.stage(), Stage::Ready);
+        }
+
+        #[test]
+        fn seat_loss_and_explicit_roster_withdrawal_stop_sharing() {
+            let mut now = clock();
+            let (mut owner, mut follower) = pair(now);
+            let bytes = frame(&mut owner, now);
+            follower.hear_pod_state(&bytes, now);
+            roster(&mut owner, &mut follower, now);
+            assert!(follower.fleet_pod_state(now).is_some());
+            advance_clock(&mut now, 1000);
+            owner.note_ownership(false, now.mono);
+            owner.accessory.note_remote_address(addr(2), now.mono);
+            owner.outbound = radio::Schedule::new();
+            owner.offer_pod_state(now);
+            assert_eq!(owner.outbound.due(now.mono), radio::Duty::Hold);
+            let mut withdrawn = owner.roster_snapshot(now).unwrap().air;
+            withdrawn.sequence = 2;
+            withdrawn.peers.clear();
+            withdrawn.audio_source = None;
+            follower.hear_roster(withdrawn, now);
+            assert!(follower.fleet_pod_state(now).is_none());
+        }
+
+        #[test]
+        fn changing_accessory_or_resetting_fleet_drops_shared_state() {
+            for reset in [false, true] {
+                let now = clock();
+                let (mut owner, mut follower) = pair(now);
+                follower.hear_pod_state(&frame(&mut owner, now), now);
+                roster(&mut owner, &mut follower, now);
+                assert!(follower.fleet_pod_state(now).is_some());
+                if reset {
+                    follower.reset_fleet();
+                } else {
+                    follower.select_accessory(Some(addr(9)));
+                }
+                assert!(follower.fleet_pod_state(now).is_none());
+            }
         }
     }
 }
