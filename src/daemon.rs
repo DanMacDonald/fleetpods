@@ -24,7 +24,7 @@ use crate::panel::ipc::{Command, FleetCommand, Response};
 use crate::panel::status::{self, Snapshot};
 use crate::pods::link::{Connection, FailReason, Stage};
 use crate::pods::prefs::Config;
-use crate::pods::reports::{Accessory, Pod};
+use crate::pods::reports::{Accessory, Placement, Pod};
 use crate::pods::setup::Setup;
 use crate::types::{
     code, Address, Clock, Code, FleetId, Generation, HostId, InvitationId, LidState, Model, MonoMs,
@@ -220,6 +220,10 @@ pub struct Daemon {
     peer_playback: std::collections::HashMap<Address, (bool, MonoMs)>,
     idle_claimed: Option<(Address, MonoMs)>,
     activity_at: Option<MonoMs>,
+    /// Whether a bud is in an ear, and since when.
+    worn: Option<(bool, MonoMs)>,
+    /// When the pods last went from out of both ears into one.
+    inserted_at: Option<MonoMs>,
     pub(crate) activity_preference: crate::fleet::activity::Preference,
     pod_state: crate::fleet::pod_state::Sharing,
     route_seq: u64,
@@ -416,6 +420,8 @@ impl Daemon {
             peer_playback: std::collections::HashMap::new(),
             idle_claimed: None,
             activity_at: None,
+            worn: None,
+            inserted_at: None,
             activity_preference: crate::fleet::activity::Preference::default(),
             pod_state: crate::fleet::pod_state::Sharing::default(),
             route_seq: 0,
@@ -911,7 +917,35 @@ impl Daemon {
         if self.accessory.both_docked() != was_docked {
             self.effects.announce_dirty = true;
         }
+        let ear =
+            |pod: &crate::types::Evidence<Placement>| pod.as_fresh().and_then(|pod| pod.in_ear);
+        let (left, right) =
+            (ear(&self.accessory.left_placement), ear(&self.accessory.right_placement));
+        self.note_ears(left, right, at, at);
         self.hold_stowed_connection();
+    }
+
+    /// An insertion is a bud going in after both were out for a second. The
+    /// first reading after a restart or a new link is not one, and neither is
+    /// a pod briefly misreporting the other (XPS, 2026-10-19: four flips in 0.4 s).
+    fn note_wearing(&mut self, at: MonoMs) {
+        const OUT_SETTLE_MS: u64 = 1_000;
+        let ear =
+            |pod: &crate::types::Evidence<Placement>| pod.as_fresh().and_then(|pod| pod.in_ear);
+        let worn = match (ear(&self.accessory.left_placement), ear(&self.accessory.right_placement))
+        {
+            (Some(true), _) | (_, Some(true)) => true,
+            (Some(false), Some(false)) => false,
+            _ => return,
+        };
+        match self.worn {
+            Some((previous, _)) if previous == worn => {}
+            Some((false, since)) if at.saturating_since(since) >= OUT_SETTLE_MS => {
+                self.inserted_at = Some(at);
+                self.worn = Some((true, at));
+            }
+            _ => self.worn = Some((worn, at)),
+        }
     }
 
     fn hold_stowed_connection(&mut self) -> bool {
@@ -2767,8 +2801,39 @@ impl Daemon {
     }
 
     pub fn note_ears(&mut self, left: Option<bool>, right: Option<bool>, at: MonoMs, now: MonoMs) {
-        self.audio.ears(left, right, self.config.ear, at);
-        self.audio.ears_tick(self.config.ear, now);
+        let action = self.audio.ears(left, right, self.config.ear, at);
+        self.apply_ear_action(action);
+        let action = self.audio.ears_tick(self.config.ear, now);
+        self.apply_ear_action(action);
+        self.note_wearing(at);
+    }
+
+    /// Settle a removal or reinsertion that has waited out its debounce
+    /// without a newer report.
+    pub(crate) fn tick_ears(&mut self, now: MonoMs) {
+        let action = self.audio.ears_tick(self.config.ear, now);
+        self.apply_ear_action(action);
+    }
+
+    fn apply_ear_action(&mut self, action: crate::audio::play::EarAction) {
+        use crate::audio::play::EarAction;
+        match action {
+            EarAction::Hold => {}
+            EarAction::Pause => {
+                let players = self.audio.ear_paused().to_vec();
+                eprintln!("fleetpodsd: a bud left the ear; pausing {players:?}");
+                self.effects.pause_players.extend(players);
+            }
+            EarAction::Resume => {
+                let players = self.audio.take_ear_paused();
+                eprintln!("fleetpodsd: the buds are back in; resuming {players:?}");
+                for player in players {
+                    if !self.resume_players.contains(&player) {
+                        self.resume_players.push(player);
+                    }
+                }
+            }
+        }
     }
 
     pub fn note_remote_player(&mut self, address: Address, now: MonoMs) {
@@ -3821,6 +3886,52 @@ impl Daemon {
             self.claim_seat(now);
             eprintln!("fleetpodsd: routing new playback through already-owned AirPods");
         }
+    }
+
+    /// Putting the pods in while the speakers play is play intent for that
+    /// playback. Wait for the link and an ownership report; never take the
+    /// pods from a device playing on them, or from one whose state is unknown.
+    pub(crate) fn follow_insertion(&mut self, now: Clock) {
+        const INSERTION_GRACE_MS: u64 = 15_000;
+        let Some(at) = self.inserted_at else {
+            return;
+        };
+        if now.mono.saturating_since(at) > INSERTION_GRACE_MS || self.output.wants_output() {
+            self.inserted_at = None;
+            return;
+        }
+        if self.connection.stage() != Stage::Ready
+            || self.routing.phase().busy()
+            || self.connection.apple_reconnect()
+            || self.accessory.both_docked()
+        {
+            return;
+        }
+        let Some(graph) = self.last_graph.as_ref() else {
+            return;
+        };
+        if !crate::audio::route::playing_on_speakers(graph, self.output.source_sink()) {
+            return;
+        }
+        // Taking the pods from an idle device needs a player to confirm the
+        // claim; a stream-only player would hold the speakers muted for nothing.
+        let free = match self.resolved(now).holder {
+            Holder::Local { .. } => true,
+            Holder::Remote { address: Some(peer), playing: false } => {
+                self.audio.local_playing()
+                    && matches!(self.remote_playback(peer, now), Some((false, _)))
+            }
+            Holder::Remote { .. } | Holder::Unknown => false,
+        };
+        if !free || self.outside_device_playing(now) {
+            return;
+        }
+        self.inserted_at = None;
+        eprintln!(
+            "fleetpodsd: pods put in while the speakers play; moving playback to the AirPods"
+        );
+        self.remember_activity(now);
+        self.claim_playback(now);
     }
 
     pub(crate) fn claim_playback(&mut self, now: Clock) {
@@ -7425,6 +7536,181 @@ mod tests {
         let status = daemon.status_value(now);
         assert_eq!(status["control_connection"]["stage"], "idle");
         assert_eq!(status["waiting_for_playback"], false);
+    }
+
+    #[test]
+    fn taking_a_bud_out_pauses_brave_and_putting_it_back_resumes_it() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+        let brave = "org.mpris.MediaPlayer2.brave";
+        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        ready_link(&mut daemon, now);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
+        daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, now);
+        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
+        daemon.step(
+            Input::Audio(Graph {
+                default_sink: "pods".into(),
+                sinks: vec![Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                }],
+                cards: vec![],
+                streams: vec![LiveStream {
+                    id: 9,
+                    generation: 9,
+                    sink: "pods".into(),
+                    role: "".into(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            }),
+            now,
+        );
+        assert!(daemon.audio.routed());
+        let mut effects = Vec::new();
+        let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
+            effects.extend(daemon.step(input, clock).effects);
+        };
+        feed(&mut daemon, Input::Accessory { generation, packet: ears(0x00, 0x00) }, at(100));
+        feed(&mut daemon, Input::Tick, at(600));
+        feed(&mut daemon, Input::Accessory { generation, packet: ears(0x01, 0x00) }, at(1_000));
+        // The control link reports a change once; the tick settles it.
+        feed(&mut daemon, Input::Tick, at(1_500));
+        let paused: Vec<_> =
+            effects.iter().filter(|e| matches!(e, Effect::PausePlayers(_))).cloned().collect();
+        assert_eq!(paused.len(), 1, "{effects:?}");
+        assert!(
+            matches!(&paused[0], Effect::PausePlayers(players) if players == &[brave.to_string()])
+        );
+        effects.clear();
+        let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
+            effects.extend(daemon.step(input, clock).effects);
+        };
+        feed(&mut daemon, Input::Player { service: brave.into(), playing: Some(false) }, at(1_600));
+        feed(&mut daemon, Input::Accessory { generation, packet: ears(0x00, 0x00) }, at(3_000));
+        feed(&mut daemon, Input::Tick, at(3_500));
+        let resumed = effects
+            .iter()
+            .filter(
+                |e| matches!(e, Effect::ResumePlayers(players) if players == &[brave.to_string()]),
+            )
+            .count();
+        assert_eq!(resumed, 1, "{effects:?}");
+        // Our own resume is not a new play that claims again.
+        let claim = [4, 0, 4, 0, 9, 0, 6, 1, 0, 0, 0];
+        let replayed =
+            daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_600));
+        assert!(!replayed.effects.iter().any(|effect| {
+            matches!(effect, Effect::WriteControl { bytes, .. } if bytes == &claim)
+                || matches!(effect, Effect::MuteStreams(_))
+        }));
+        assert!(daemon.audio.local_playing());
+    }
+
+    #[test]
+    fn putting_the_pods_in_moves_speaker_playback_unless_a_phone_plays() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        // XPS, 2026-10-23 14:31: Brave kept playing on the speakers after
+        // both pods went in, until a pause and play moved it.
+        let claim = [4, 0, 4, 0, 9, 0, 6, 1, 0, 0, 0];
+        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
+        let owners = [
+            "local",
+            "idle phone",
+            "playing phone",
+            "already worn",
+            "silent speakers",
+            "no player",
+        ];
+        for owner in owners {
+            let mut daemon = Daemon::new("omarchy-xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            let local = addr(2);
+            let phone = Address::parse("28:02:2E:BF:7F:7D").unwrap();
+            daemon.set_local_address(Some(local));
+            ready_link(&mut daemon, now);
+            let generation = daemon.connection().generation();
+            // Brave was already playing when the daemon first looked.
+            let players = if owner == "no player" {
+                Vec::new()
+            } else {
+                vec![crate::audio::play::PlayerSeen {
+                    service: "org.mpris.MediaPlayer2.brave".into(),
+                    playing: true,
+                }]
+            };
+            daemon.step(Input::Players(players), now);
+            daemon.step(
+                Input::Audio(Graph {
+                    default_sink: "speakers".into(),
+                    sinks: vec![
+                        Sink { name: "speakers".into(), address: None, profile: None },
+                        Sink {
+                            name: "pods".into(),
+                            address: Some(addr(3)),
+                            profile: Some("a2dp-sink".into()),
+                        },
+                    ],
+                    cards: Vec::new(),
+                    streams: vec![LiveStream {
+                        id: 7,
+                        generation: 7260,
+                        sink: "speakers".into(),
+                        role: String::new(),
+                        node: "Brave".into(),
+                        mute: false,
+                        volume: 1.0,
+                        corked: owner == "silent speakers",
+                    }],
+                }),
+                now,
+            );
+            if owner == "local" {
+                daemon.step(Input::Observation(Observation::Ownership(true)), now);
+            } else {
+                daemon.note_pod_peers(vec![local, phone], now.unix);
+                daemon.step(
+                    Input::Observation(Observation::Source {
+                        local: false,
+                        kind: 2,
+                        remote: Some(phone),
+                    }),
+                    now,
+                );
+                daemon.step(Input::Observation(Observation::Ownership(false)), now);
+                daemon.note_peer_playback(phone, owner == "playing phone", at(1).mono);
+            }
+            if owner != "already worn" {
+                daemon.step(Input::Accessory { generation, packet: ears(0x02, 0x02) }, at(10));
+            }
+            assert!(!daemon.output.wants_output(), "{owner}: claimed before the pods went in");
+            let worn =
+                daemon.step(Input::Accessory { generation, packet: ears(0x00, 0x00) }, at(2_000));
+            let tick = daemon.step(Input::Tick, at(2_100));
+            let moved = owner == "local" || owner == "idle phone";
+            assert_eq!(daemon.output.wants_output(), moved, "{owner}");
+            let wrote_claim = worn.effects.iter().chain(&tick.effects).any(
+                |effect| matches!(effect, Effect::WriteControl { bytes, .. } if bytes == &claim),
+            );
+            assert_eq!(wrote_claim, moved, "{owner}");
+            // One insertion is one claim, not a standing order.
+            if moved {
+                daemon.step(Input::Command(Command::HandoffRelease), at(3_000));
+                daemon.step(Input::Tick, at(3_100));
+                assert!(!daemon.output.wants_output(), "{owner}: reclaimed after a release");
+            }
+        }
     }
 
     #[test]

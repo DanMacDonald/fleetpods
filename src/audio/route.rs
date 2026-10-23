@@ -971,6 +971,13 @@ pub fn playback_started(
     })
 }
 
+/// Audible playback on the laptop speakers, which putting the pods in moves.
+pub fn playing_on_speakers(graph: &Graph, from: Option<&str>) -> bool {
+    graph.streams.iter().any(|stream| {
+        managed(stream) && !is_speaker_chain(stream) && follows_seat(&stream.sink, from)
+    })
+}
+
 fn is_speaker_chain(stream: &LiveStream) -> bool {
     stream.node.contains("omarchy_speaker_tuning")
 }

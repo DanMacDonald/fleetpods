@@ -125,9 +125,14 @@ struct Duck {
 struct Ears {
     left: Option<bool>,
     right: Option<bool>,
-    settled: Removal,
+    /// Unknown until the first reading, which is a baseline and not a change.
+    settled: Option<Removal>,
     pending: Option<(Removal, MonoMs)>,
     paused_by_us: bool,
+    /// The players a removal paused, which reinsertion plays again.
+    paused: Vec<String>,
+    /// How many buds were worn before that removal; reinsertion resumes at it.
+    resume_at: u8,
 }
 
 pub struct Audio {
@@ -171,9 +176,11 @@ impl Audio {
             ears: Ears {
                 left: None,
                 right: None,
-                settled: Removal::None,
+                settled: None,
                 pending: None,
                 paused_by_us: false,
+                paused: Vec::new(),
+                resume_at: 2,
             },
             conversation_suspended: None,
             known_players: BTreeMap::new(),
@@ -193,6 +200,8 @@ impl Audio {
             .collect();
         self.yielded = true;
         self.socket_playing = false;
+        // Another device has the pods now; putting a bud back must not resume here.
+        self.forget_ear_pause();
         self.recompute_local();
         playing
     }
@@ -284,7 +293,7 @@ impl Audio {
                 self.observers.insert(event.application.clone(), now);
                 if event.kind == PlayKind::Play {
                     self.yielded = false;
-                    self.ears.paused_by_us = false;
+                    self.forget_ear_pause();
                 }
                 self.socket_playing = match event.kind {
                     PlayKind::Play => true,
@@ -334,7 +343,7 @@ impl Audio {
                 if fresh {
                     // The user's new play supersedes an earlier removal pause.
                     // Snapshots and repeated Playing reports do not clear it.
-                    self.ears.paused_by_us = false;
+                    self.forget_ear_pause();
                 }
                 if self.yielded {
                     if was != Some(true) && now_playing {
@@ -422,14 +431,17 @@ impl Audio {
             self.ears.pending = None;
             return EarAction::Hold;
         };
-        if removal != self.ears.settled {
+        if self.ears.settled.is_none() {
+            self.ears.settled = Some(removal);
+            return EarAction::Hold;
+        }
+        if Some(removal) != self.ears.settled {
             match self.ears.pending {
                 Some((pending, since))
                     if pending == removal && now.saturating_since(since) >= EAR_DEBOUNCE_MS =>
                 {
-                    self.ears.settled = removal;
                     self.ears.pending = None;
-                    self.ear_effect(behavior)
+                    self.settle(removal, behavior)
                 }
                 Some((pending, _)) if pending == removal => EarAction::Hold,
                 _ => {
@@ -450,32 +462,75 @@ impl Audio {
         if now.saturating_since(since) < EAR_DEBOUNCE_MS {
             return EarAction::Hold;
         }
-        self.ears.settled = removal;
         self.ears.pending = None;
-        self.ear_effect(behavior)
+        self.settle(removal, behavior)
     }
 
-    fn ear_effect(&mut self, behavior: EarBehavior) -> EarAction {
-        let should_pause = match behavior {
-            EarBehavior::Disabled => false,
-            EarBehavior::PauseOne => self.ears.settled != Removal::None,
-            EarBehavior::PauseBoth => self.ears.settled == Removal::Both,
+    /// A removal pauses when fewer buds are worn than before, so a bud left
+    /// in the case is not a removal. Only MPRIS players playing through the
+    /// pods are paused: the daemon cannot pause anything else, and playback on
+    /// the speakers is not the pods' to pause. `local_playing` follows only a
+    /// pause that is sent.
+    fn settle(&mut self, removal: Removal, behavior: EarBehavior) -> EarAction {
+        let worn = |removal: Removal| match removal {
+            Removal::None => 2,
+            Removal::One => 1,
+            Removal::Both => 0,
         };
+        let before = self.ears.settled.map_or(2, worn);
+        self.ears.settled = Some(removal);
+        let now_worn = worn(removal);
+        let should_pause = now_worn < before
+            && match behavior {
+                EarBehavior::Disabled => false,
+                EarBehavior::PauseOne => true,
+                EarBehavior::PauseBoth => removal == Removal::Both,
+            };
         if should_pause {
-            if self.local_playing {
-                self.ears.paused_by_us = true;
-                self.local_playing = false;
-                EarAction::Pause
+            if self.ears.paused_by_us || !self.routed || self.yielded {
+                return EarAction::Hold;
+            }
+            let playing: Vec<String> = self
+                .known_players
+                .iter()
+                .filter(|(_, on)| **on)
+                .map(|(service, _)| service.clone())
+                .collect();
+            if playing.is_empty() {
+                return EarAction::Hold;
+            }
+            self.ears.paused_by_us = true;
+            self.ears.paused = playing;
+            self.ears.resume_at = before;
+            self.local_playing = false;
+            EarAction::Pause
+        } else if self.ears.paused_by_us && now_worn >= self.ears.resume_at {
+            self.ears.paused_by_us = false;
+            if self.routed && !self.yielded {
+                self.local_playing = true;
+                EarAction::Resume
             } else {
+                self.ears.paused.clear();
+                self.recompute_local();
                 EarAction::Hold
             }
-        } else if self.ears.paused_by_us {
-            self.ears.paused_by_us = false;
-            self.local_playing = true;
-            EarAction::Resume
         } else {
             EarAction::Hold
         }
+    }
+
+    /// The players the last removal paused. A resume takes them.
+    pub fn ear_paused(&self) -> &[String] {
+        &self.ears.paused
+    }
+
+    pub fn take_ear_paused(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.ears.paused)
+    }
+
+    fn forget_ear_pause(&mut self) {
+        self.ears.paused_by_us = false;
+        self.ears.paused.clear();
     }
 }
 
@@ -541,16 +596,29 @@ mod tests {
         assert_eq!(audio.end_duck(), Some(0.8));
     }
 
+    const BRAVE: &str = "org.mpris.MediaPlayer2.brave";
+
+    /// Brave playing through the pods with both buds in.
+    fn worn_and_playing() -> Audio {
+        let mut audio = Audio::new();
+        audio.startup_players(&[]);
+        assert!(audio.update_player(BRAVE, Some(true)));
+        audio.set_routed(true);
+        assert_eq!(
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(0)),
+            EarAction::Hold
+        );
+        audio
+    }
+
     #[test]
     fn a_fresh_play_overrides_an_ear_pause_but_a_snapshot_does_not() {
         for browser in [false, true] {
-            let mut audio = Audio::new();
-            let service = "org.mpris.MediaPlayer2.brave";
-            audio.startup_players(&[]);
-            assert!(audio.update_player(service, Some(true)));
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(0));
-            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(400)), EarAction::Pause);
-            audio.update_player(service, Some(false));
+            let mut audio = worn_and_playing();
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(100));
+            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(500)), EarAction::Pause);
+            assert_eq!(audio.ear_paused(), [BRAVE]);
+            audio.update_player(BRAVE, Some(false));
             let mut event = PlaybackEvent {
                 kind: PlayKind::Snapshot,
                 application: "browser".into(),
@@ -572,39 +640,32 @@ mod tests {
                     PlayReply::Accepted { claim: true }
                 );
             } else {
-                assert!(audio.update_player(service, Some(true)), "a new MPRIS play must claim");
+                assert!(audio.update_player(BRAVE, Some(true)), "a new MPRIS play must claim");
             }
             assert!(audio.local_playing(), "the old ear pause must not suppress explicit play");
             assert_eq!(
-                audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(500)),
+                audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(600)),
                 EarAction::Hold
             );
             assert!(audio.local_playing(), "unchanged placement must not pause it again");
+            // The user's play replaced our pause, so reinsertion resumes nothing.
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(700));
+            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_100)), EarAction::Hold);
         }
     }
 
     #[test]
     fn a_flicker_does_not_pause_and_only_our_pause_resumes() {
-        let mut audio = Audio::new();
-        audio.player_event(
-            &PlaybackEvent {
-                kind: PlayKind::Play,
-                application: "browser".into(),
-                time: UnixMs(1_000),
-                player: "tab".into(),
-                token: "t1".into(),
-                playing: true,
-            },
-            UnixMs(1_000),
-        );
+        let mut audio = worn_and_playing();
         assert_eq!(
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(0)),
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(100)),
             EarAction::Hold
         );
         assert_eq!(
-            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(50)),
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(150)),
             EarAction::Hold
         );
+        assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_000)), EarAction::Hold);
         assert!(audio.local_playing());
         assert_eq!(
             audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(1_000)),
@@ -612,26 +673,66 @@ mod tests {
         );
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_400)), EarAction::Pause);
         assert!(!audio.local_playing());
-        audio.player_event(
-            &PlaybackEvent {
-                kind: PlayKind::Pause,
-                application: "browser".into(),
-                time: UnixMs(1_500),
-                player: "tab".into(),
-                token: "t2".into(),
-                playing: false,
-            },
-            UnixMs(1_500),
-        );
-        // The user paused after we did. Reinsertion must not steal playback back
-        // once our own pause was already overtaken... we still paused_by_us.
-        // The second event sets local_playing false. Resume still belongs to us
-        // because we paused first. That matches "resume only what we paused".
+        // Our own pause reported back, then the second bud out: no second pause.
+        audio.update_player(BRAVE, Some(false));
+        audio.ears(Some(false), Some(false), EarBehavior::PauseOne, MonoMs(1_500));
+        assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_900)), EarAction::Hold);
+        // One bud back is not yet the two that were worn.
+        audio.ears(Some(true), Some(false), EarBehavior::PauseOne, MonoMs(2_000));
+        assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_400)), EarAction::Hold);
+        audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(2_500));
+        assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_900)), EarAction::Resume);
+        assert_eq!(audio.take_ear_paused(), vec![BRAVE.to_string()]);
+    }
+
+    #[test]
+    fn only_a_removal_through_the_pods_pauses_a_player_the_daemon_can_pause() {
+        let removal = |audio: &mut Audio| {
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(100));
+            audio.ears_tick(EarBehavior::PauseOne, MonoMs(500))
+        };
+        // A bud left in the case from the start is not a removal.
+        let mut audio = Audio::new();
+        audio.startup_players(&[]);
+        audio.update_player(BRAVE, Some(true));
+        audio.set_routed(true);
         assert_eq!(
-            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(2_000)),
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(0)),
             EarAction::Hold
         );
-        assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_400)), EarAction::Resume);
+        assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_000)), EarAction::Hold);
+        assert!(audio.local_playing());
+        // Playback on the speakers is not the pods' to pause.
+        let mut speakers = worn_and_playing();
+        speakers.set_routed(false);
+        assert_eq!(removal(&mut speakers), EarAction::Hold);
+        assert!(speakers.local_playing());
+        // A browser tab without MPRIS cannot be paused, so it is not marked paused.
+        let mut tab = Audio::new();
+        tab.startup_players(&[]);
+        tab.set_routed(true);
+        tab.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(0));
+        let play = PlaybackEvent {
+            kind: PlayKind::Play,
+            application: "browser".into(),
+            time: UnixMs(1_000),
+            player: "tab".into(),
+            token: "t1".into(),
+            playing: true,
+        };
+        tab.player_event(&play, UnixMs(1_000));
+        assert_eq!(removal(&mut tab), EarAction::Hold);
+        assert!(tab.local_playing());
+        // Pause on both removed waits for the second bud.
+        let mut both = worn_and_playing();
+        both.ears(Some(false), Some(true), EarBehavior::PauseBoth, MonoMs(100));
+        assert_eq!(both.ears_tick(EarBehavior::PauseBoth, MonoMs(500)), EarAction::Hold);
+        both.ears(Some(false), Some(false), EarBehavior::PauseBoth, MonoMs(600));
+        assert_eq!(both.ears_tick(EarBehavior::PauseBoth, MonoMs(1_000)), EarAction::Pause);
+        // Another device taking the pods ends the pause; reinsertion resumes nothing.
+        both.yield_playback();
+        both.ears(Some(true), Some(true), EarBehavior::PauseBoth, MonoMs(1_100));
+        assert_eq!(both.ears_tick(EarBehavior::PauseBoth, MonoMs(1_500)), EarAction::Hold);
     }
 
     #[test]

@@ -887,6 +887,8 @@ impl Daemon {
         let mut effects = Vec::new();
         self.introduce_peers();
         self.claim_idle_on_activity(now);
+        self.tick_ears(now.mono);
+        self.follow_insertion(now);
         if let Some(labels) = self.take_apple_names() {
             effects.push(Effect::StoreDevices(labels));
         }
