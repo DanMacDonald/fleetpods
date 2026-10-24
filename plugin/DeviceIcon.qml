@@ -14,8 +14,9 @@ Item {
   readonly property int glowFadeMs: 400
   required property color lineColor
   required property color screenFill
+  readonly property color litColor: screenFill.hslLightness > 0.5 ? lineColor : Qt.lighter(lineColor, 1.16)
   // Strokes blend toward the screen but stay opaque, so the ellipse never shows through.
-  readonly property color strokeColor: selected ? lineColor : Qt.tint(
+  readonly property color strokeColor: selected ? litColor : Qt.tint(
     Qt.rgba(screenFill.r, screenFill.g, screenFill.b, 1),
     Qt.rgba(lineColor.r, lineColor.g, lineColor.b, level === 1 ? 0.65 : 0.4))
   readonly property int artworkPadding: 15
@@ -57,7 +58,7 @@ Item {
         readonly property int beat: Math.floor(index / musicNotes.streamCount)
         property real progress: 0
         text: index % 2 === 0 ? "♪" : "♫"
-        color: root.lineColor
+        color: root.litColor
         font.family: "sans-serif"
         font.pixelSize: 14
         x: (root.width - width) / 2 + (stream - 1) * musicNotes.streamSpacing
@@ -98,7 +99,7 @@ Item {
       objectName: "halo"
       anchors.fill: parent
       source: halo
-      color: root.lineColor
+      color: root.litColor
       opacity: root.selected && root.playing ? 1 : 0
       visible: opacity > 0
       Behavior on opacity { NumberAnimation { duration: root.glowFadeMs; easing.type: Easing.OutSine } }

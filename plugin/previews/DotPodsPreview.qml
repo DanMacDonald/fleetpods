@@ -22,6 +22,8 @@ Window {
     : Qt.application.arguments.indexOf("--open") >= 0 ? "open" : ""
   property bool moving: Qt.application.arguments.indexOf("--capture") < 0
   property bool lightTheme: Qt.application.arguments.indexOf("--light") >= 0
+  property bool highlighted: Qt.application.arguments.indexOf("--dim") < 0
+  property bool hoverHighlight: false
   property real angle: -0.32
   property real spacing: Grid.pitch
   readonly property color background: lightTheme ? "#efeee8" : "#1c1d26"
@@ -112,6 +114,7 @@ Window {
             width: Math.min(parent.width, parent.height)
             height: width
             foregroundColor: window.foreground
+            highlighted: window.hoverHighlight ? rotationArea.containsMouse : window.highlighted
             backgroundColor: window.background
             shadowColor: window.shade
             caseState: window.state
@@ -119,7 +122,9 @@ Window {
             yaw: window.angle
             dotPitch: window.spacing
             MouseArea {
+              id: rotationArea
               anchors.fill: parent
+              hoverEnabled: true
               property real previousX: 0
               cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
               onPressed: function(mouse) { previousX = mouse.x }
@@ -172,6 +177,17 @@ Window {
             Choice { label: window.lightTheme ? "Dark" : "Light"; onClicked: window.lightTheme = !window.lightTheme }
           }
           RowLayout {
+            Choice { label: "Hover"; selected: window.hoverHighlight; onClicked: window.hoverHighlight = true }
+            Choice {
+              label: "Highlighted"; selected: !window.hoverHighlight && window.highlighted
+              onClicked: { window.highlighted = true; window.hoverHighlight = false }
+            }
+            Choice {
+              label: "Dim"; selected: !window.hoverHighlight && !window.highlighted
+              onClicked: { window.highlighted = false; window.hoverHighlight = false }
+            }
+          }
+          RowLayout {
             spacing: 8
             Choice { label: "Left out"; selected: window.state === "open-right"; onClicked: window.state = "open-right" }
             Choice { label: "Right out"; selected: window.state === "open-left"; onClicked: window.state = "open-left" }
@@ -201,7 +217,8 @@ Window {
           Label { text: "AT POPUP SIZE"; font.pixelSize: 10; font.letterSpacing: 1 }
           Text {
             Layout.fillWidth: true
-            text: "128 px · theme-aware\nAnimation pauses when hidden."
+            text: window.hoverHighlight ? "128 px · theme-aware\nHover to highlight each sample."
+              : "128 px · theme-aware\nHighlighted / Dim to compare."
             textFormat: Text.PlainText
             color: window.muted
             font.pixelSize: 12
@@ -220,10 +237,12 @@ Window {
               Layout.preferredWidth: 128
               Layout.preferredHeight: 128
               foregroundColor: window.foreground
+              highlighted: window.hoverHighlight ? sampleHover.hovered : window.highlighted
               backgroundColor: window.background
               shadowColor: window.shade
               caseState: sample.modelData.state
               animating: false
+              HoverHandler { id: sampleHover }
             }
             Label {
               Layout.alignment: Qt.AlignHCenter

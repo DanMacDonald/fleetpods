@@ -10,6 +10,9 @@ Item {
   property color foregroundColor: "#e6e5df"
   property color shadowColor: "#465675"
   readonly property bool lightBackground: backgroundColor.hslLightness > 0.5
+  property bool highlighted: true
+  // Keep the theme hue; give the lit dots the same lift as the selected device.
+  readonly property color litForeground: lightBackground ? foregroundColor : Qt.lighter(foregroundColor, 1.16)
   property string caseState: ""
   property bool animating: true
   // The popup supplies an already animated pose that survives image switches.
@@ -79,7 +82,7 @@ Item {
   onSmoothSamplingChanged: canvas.requestPaint()
   onAlignDotsToPixelsChanged: canvas.requestPaint()
   onPixelRatioChanged: canvas.requestPaint()
-  onForegroundColorChanged: canvas.requestPaint()
+  onLitForegroundChanged: canvas.requestPaint()
   onShadowColorChanged: canvas.requestPaint()
   onBackgroundColorChanged: canvas.requestPaint()
 
@@ -93,6 +96,8 @@ Item {
 
   Canvas {
     id: canvas
+    opacity: root.highlighted ? 1 : 0.62
+    Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutSine } }
     // Canvas already renders at the window's device pixel ratio. An extra 2x
     // texture followed by downsampling creates uneven dots at fractional DPI.
     width: Math.ceil(root.width)
@@ -117,7 +122,7 @@ Item {
         { left: root.leftTurn, right: root.rightTurn })
       var values = frame.values
       var style = Mesh.dotStyle(frame.tonal, pitch, root.backgroundColor,
-        root.foregroundColor, root.shadowColor)
+        root.litForeground, root.shadowColor)
       var size = Math.min(pitch * 0.85, style.size * root.dotScale)
       if (root.alignDotsToPixels) size = Grid.screenSize(size, pitch, root.pixelRatio)
       var bands = new Uint8Array(values.length)

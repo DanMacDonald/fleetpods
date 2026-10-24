@@ -20,6 +20,7 @@ Item {
   readonly property int emptyCaseConfirmMs: 250
   property bool pairingMode: false
   property bool pixelArt: false
+  property bool highlighted: true
 
   width: iconSize
   height: iconSize
@@ -499,6 +500,7 @@ Item {
     id: meshCaseComponent
     MeshArtwork {
       objectName: "caseMeshArtwork"
+      highlighted: root.highlighted
       artworkScale: root.podsArtworkScale
       // Seat the returning pod before closing the lid over it.
       caseState: root.caseExiting ? "open-empty" : root.droppingIntoClosed ? "open" : root.displayCaseState
@@ -516,6 +518,7 @@ Item {
     id: meshBudsComponent
     MeshArtwork {
       objectName: "budsMeshArtwork"
+      highlighted: root.highlighted
       arrival: root.budsIn
       // Fill more of the popup slot without enlarging the dots themselves.
       artworkScale: root.podsArtworkScale

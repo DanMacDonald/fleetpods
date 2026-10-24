@@ -36,7 +36,7 @@ function dotStyle(pitch, background, shadow) {
   return { levels: 16, size: Math.max(0.85, pitch * 0.40), base: shadow,
     exponent: 0.85, level: function(value) {
       if (value <= 0) return 0
-      if (value > 0.40) value = 0.40 + (value - 0.40) * 1.60
+      if (value > 0.40) value = 0.40 + (value - 0.40) * 1.85
       var t = Math.max(0, Math.min(1, (value - 0.16) / 0.64))
       return Math.max(1, Math.ceil(t * t * (3 - 2 * t) * 16))
     } }

@@ -13,6 +13,15 @@ Run the interactive preview from the repository root:
 
 Drag the large artwork or use the rotation slider. Switch between earbuds, an open case, a closed case, either pod out, or both out; pause the motion, adjust the grid spacing, or switch the background. Use Open and Left out / Right out / Both out to review the lift/return tweens, or launch with `--left-out`, `--right-out`, or `--empty`. The bottom row shows the artwork at the popup's 128-pixel size.
 
+The interactive preview starts in Highlighted mode. Select Hover to highlight
+each artwork under the pointer and dim it when it leaves, including the
+popup-size samples. Dragging the large artwork still rotates it. Use
+Highlighted / Dim to hold either state; `--dim` starts in the subdued state,
+and captures default to Highlighted.
+Highlighted is the popup default. Both states use the
+same renderer and theme hues, with a brighter foreground and lifted lit tones
+on dark backgrounds; Dim fades the painted dots to 62% opacity.
+
 Use `./tools/artwork/preview --pods-out` for the standalone pair's entrance,
 beside the original 2D illustration. Replay or scrub the descent and vertical-axis
 turn, adjust dot spacing, and switch between light and dark. It uses the popup's `MeshArtwork.qml`.

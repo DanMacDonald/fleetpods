@@ -8,6 +8,7 @@ Item {
   id: root
   required property color foregroundColor
   required property color backgroundColor
+  property bool highlighted: true
   property string caseState: ""
   property real leftLift: caseState === "open-right" || caseState === "open-empty" ? 1 : 0
   property real rightLift: caseState === "open-left" || caseState === "open-empty" ? 1 : 0
@@ -54,6 +55,7 @@ Item {
     budsArrival: root.arrival
     animatePodLifts: false
     foregroundColor: root.foregroundColor
+    highlighted: root.highlighted
     backgroundColor: root.backgroundColor
     shadowColor: Qt.tint(root.backgroundColor, Qt.rgba(root.foregroundColor.r,
       root.foregroundColor.g, root.foregroundColor.b, 0.08))

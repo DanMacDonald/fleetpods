@@ -48,6 +48,12 @@ Dark rendering uses the approved baseline-study settings: frontal fill 0.57
 and face brightness 0.73× on white surfaces, for both pods and case states.
 Matte recesses and dark materials retain their original shading. The Fresnel
 experiment and its overlay remain confined to the separate art study.
+Dark artwork and selected device icons now lift the theme foreground brightness
+by 16%, with lit dot tones reaching that endpoint sooner. Geometry, material
+lighting, dot spacing, and theme hues stay the same. `highlighted` defaults to
+true on the mesh components and `AirPodsIcon`; false fades the dots to 62%
+opacity over 180 ms. The popup currently uses the highlighted state throughout.
+Light-theme artwork keeps its original palette, with the same optional dim state.
 
 ```
 deno run --allow-read plugin/tests/model.test.js
