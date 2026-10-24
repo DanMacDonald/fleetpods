@@ -404,6 +404,7 @@ impl Daemon {
                 None
             }
             Input::Bluez(up) => {
+                self.note_acl(up, now.unix);
                 self.note_bluez(up);
                 None
             }

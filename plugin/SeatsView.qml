@@ -207,6 +207,7 @@ Item {
     objectName: "omarchySeat"
     title: "Omarchy"
     orderName: "omarchy"
+    joinOrdered: true
     statusText: root.omarchyTransitionLabel
     switching: root.attemptKind === "switching"
     connecting: root.attemptActive
@@ -495,6 +496,9 @@ Item {
     id: seat
     required property var layout
     property string orderName: ""
+    /// The pair comes in the daemon's join order, the same on every laptop,
+    /// instead of the order this panel happened to see devices arrive in.
+    property bool joinOrdered: false
     readonly property var savedOrder: root.savedOrders && root.savedOrders[orderName] || ({})
     readonly property string actionLabel: layout.actionLabel
     readonly property bool actionEnabled: layout.actionEnabled
@@ -593,9 +597,9 @@ Item {
         return Model.normalizeAddress(device.address || "") === Model.normalizeAddress(root.localAddress)
       })
     }
-    // Pair order is by arrival: when a second device joins, the newcomer
-    // takes the left slot and the device already seated slides right,
-    // whichever laptop is drawing the seat.
+    // Pair order is by arrival. A join-ordered seat takes it from the daemon
+    // (oldest left, newest right). Otherwise, when a second device joins
+    // in view, the newcomer takes the left slot and the seated one slides right.
     property var pairOrder: []
     /// The seat order of the last pair, kept after the seat empties: the
     /// tray places the risen pair on the sides they sat on.
@@ -608,6 +612,7 @@ Item {
       const saved = savedOrder.pair
       if (!pairOrderGuessed || !saved || saved.length !== 2) return
       if (pairOrder.length === 2) {
+        if (joinOrdered) return
         const restored = root.restoredOrder(saved, pairOrder)
         if (!restored) return
         pairOrder = restored
@@ -623,7 +628,11 @@ Item {
     onSeatedChanged: {
       const list = seated || []
       const keys = list.map(seatedKey)
-      if (list.length === 2) {
+      if (list.length === 2 && joinOrdered) {
+        pairOrderGuessed = false
+        if (!root.sameOrder(keys, pairOrder)) pairOrder = keys.slice()
+        if (!root.sameOrder(pairOrder, lastPairOrder)) lastPairOrder = pairOrder.slice()
+      } else if (list.length === 2) {
         const samePair = pairOrder.length === 2
           && pairOrder.every(function (key) { return keys.indexOf(key) >= 0 })
         if (!samePair) {
@@ -663,8 +672,8 @@ Item {
     property string lastOccupantAddress: ""
     onOccupantChanged: if (occupant) lastOccupantAddress = Model.normalizeAddress(occupant.address || "")
     // This laptop is taking the seat but has not landed yet: the seated
-    // device slides to the right slot at once, so the takeover reads as
-    // responsive and the left slot is already clear when it arrives.
+    // device moves to the left slot at once, so the takeover reads as
+    // responsive and the right slot, where the newest laptop sits, is clear.
     readonly property bool pairIncoming: switching && !occupantTwo && !!occupant
       && root.localAddress !== ""
       && Model.normalizeAddress(occupant.address || "") !== Model.normalizeAddress(root.localAddress)
@@ -1174,11 +1183,9 @@ Item {
 
       Occupant {
         id: firstPerson
-        x: seat.occupantTwo
+        x: seat.occupantTwo || seat.pairIncoming
           ? parent.width / 2 - iconStack.centerDistance / 2 - iconWidth / 2
-          : seat.pairIncoming
-            ? parent.width / 2 + iconStack.centerDistance / 2 - iconWidth / 2
-            : (parent.width - iconWidth) / 2
+          : (parent.width - iconWidth) / 2
         channel: seat
         visible: !!seat.occupant && !seat.occupant.standIn
         label: seat.occupantLabel

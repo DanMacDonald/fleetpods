@@ -201,6 +201,14 @@ pub struct Daemon {
     /// resets the saved roster instead of reviving remembered seat members.
     pod_list_seen: bool,
     pod_peers_at: Option<crate::types::UnixMs>,
+    /// The pods' devices in the order they joined, oldest first, kept while
+    /// this laptop's Bluetooth link stays up. Every panel draws the Omarchy
+    /// seat from it, so all of them put the newest laptop on the right.
+    pod_order: Vec<Address>,
+    /// This laptop saw the order form. One that restarted onto a live link
+    /// follows the other laptop's roster instead.
+    pod_order_seen: bool,
+    acl_up_at: Option<crate::types::UnixMs>,
     /// A conflicting authenticated roster asks us to verify this socket, not
     /// to trust the peer over a working local connection.
     roster_probe: Option<(Generation, MonoMs)>,
@@ -329,6 +337,10 @@ const REJOIN_DELAY_MS: u64 = 2_000;
 /// insists, and the next play is the user's call.
 const REJOIN_WINDOW_MS: u64 = 20_000;
 
+/// A first device list this soon after the Bluetooth link came up shows
+/// who was on the pods before this laptop joined.
+const JOIN_WITNESS_MS: u64 = 30_000;
+
 /// An incoming invitation held aside across a fleet reset (see
 /// [`Daemon::take_invitation`]).
 pub(crate) struct InvitationSave {
@@ -429,6 +441,9 @@ impl Daemon {
             pod_peers_known: false,
             pod_list_seen: false,
             pod_peers_at: None,
+            pod_order: Vec::new(),
+            pod_order_seen: false,
+            acl_up_at: None,
             roster_probe: None,
             roster_probe_after: None,
             displaced: false,
@@ -721,6 +736,65 @@ impl Daemon {
 
     pub fn note_bluez(&mut self, up: bool) {
         self.connection.note_bluez(up);
+    }
+
+    /// Join order lives as long as the Bluetooth link. A link that comes up
+    /// while this daemon watches marks the moment this laptop joined.
+    pub(crate) fn note_acl(&mut self, up: bool, now: crate::types::UnixMs) {
+        if !up {
+            self.pod_order.clear();
+            self.pod_order_seen = false;
+            self.acl_up_at = None;
+        } else if self.connection.bluez() == Some(false) {
+            self.acl_up_at = Some(now);
+        }
+    }
+
+    /// Put a device list from the pods in join order. Devices already there
+    /// when this laptop joined are older; later arrivals go last.
+    fn join_order(&mut self, peers: &[Address], now: crate::types::UnixMs) -> Vec<Address> {
+        self.pod_order.retain(|peer| peers.contains(peer));
+        if self.pod_order.is_empty() {
+            let joined =
+                self.acl_up_at.is_some_and(|at| now.0.saturating_sub(at.0) <= JOIN_WITNESS_MS);
+            let local = self.local_address.filter(|local| joined && peers.contains(local));
+            self.pod_order = peers.iter().copied().filter(|peer| Some(*peer) != local).collect();
+            if let Some(local) = local {
+                self.pod_order.push(local);
+            } else {
+                // Restarted onto a live link: an order both laptops compute
+                // alike until the other laptop's roster says otherwise.
+                self.pod_order.sort_by_key(|peer| peer.bytes());
+            }
+            self.pod_order_seen = local.is_some() || peers.len() < 2;
+        } else {
+            if self.pod_order.len() < 2 {
+                self.pod_order_seen = true;
+            }
+            for peer in peers {
+                if !self.pod_order.contains(peer) {
+                    self.pod_order.push(*peer);
+                }
+            }
+        }
+        self.pod_order.clone()
+    }
+
+    /// A laptop that did not see the order form takes the other laptop's.
+    fn follow_roster_order(&mut self, reported: &[Address]) {
+        let same = reported.len() == self.pod_order.len()
+            && reported.iter().all(|peer| self.pod_order.contains(peer));
+        if self.pod_order_seen || !same || reported == self.pod_order.as_slice() {
+            return;
+        }
+        self.pod_order = reported.to_vec();
+        if self.pod_peers.len() == reported.len()
+            && reported.iter().all(|peer| self.pod_peers.contains(peer))
+        {
+            self.pod_peers = reported.to_vec();
+            self.roster_dirty = true;
+            self.effects.announce_dirty = true;
+        }
     }
 
     pub fn note_profile_pending(&mut self, pending: bool) {
@@ -1483,6 +1557,7 @@ impl Daemon {
             // Only accepted reports may update this cache; late/replayed or
             // other-accessory packets must not restore an obsolete seat.
             if !remembered.is_empty() {
+                self.follow_roster_order(&remembered);
                 self.held_peers = remembered.clone();
                 self.held_reporter = Some(snapshot.reporter);
             } else if self.held_reporter == Some(snapshot.reporter) {
@@ -1772,9 +1847,12 @@ impl Daemon {
     }
 
     pub(crate) fn note_pod_peers(&mut self, peers: Vec<Address>, now: crate::types::UnixMs) {
-        if self.pod_peers_known && self.pod_peers == peers {
+        let same = self.pod_peers.len() == peers.len()
+            && peers.iter().all(|peer| self.pod_peers.contains(peer));
+        if self.pod_peers_known && same {
             return;
         }
+        let peers = self.join_order(&peers, now);
         self.pod_peers_known = true;
         self.pod_list_seen = true;
         self.peer_playback.retain(|peer, _| peers.contains(peer));
@@ -6334,6 +6412,10 @@ mod tests {
             assert_eq!(daemon.routing.admit(tx, true, Some(retained)), Admit::Beside);
             daemon.open_connection(now.mono);
             let generation = daemon.connection.generation();
+            // This laptop's Bluetooth link comes up as it joins beside the gram.
+            daemon.note_bluez(false);
+            daemon.note_acl(true, now.unix);
+            daemon.note_bluez(true);
             daemon.note_socket(true, generation, now.mono);
             // Gram's empty roster has not arrived yet. Neither a fresh cached
             // roster nor its held fallback may put a released helper back.
@@ -6361,6 +6443,86 @@ mod tests {
                 serde_json::json!([gram.display(), local.display()])
             );
         }
+    }
+
+    #[test]
+    fn both_laptops_list_the_pods_in_join_order_with_the_newest_last() {
+        use crate::fleet::members::Fleet;
+        use crate::fleet::roster_air::Snapshot;
+        // Addresses sort the other way round, so address order cannot pass for join order.
+        let xps = addr(4);
+        let gram = addr(2);
+        let now = clock();
+        let peers = |daemon: &Daemon| daemon.status_value(now)["connected_peers"].clone();
+        let laptop = |name: &str, local: Address, joins: bool| {
+            let mut daemon = Daemon::new(name);
+            daemon.set_local_address(Some(local));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: xps, label: "omarchy-xps".into() },
+                    Member { address: gram, label: "lg-gram".into() },
+                ],
+            });
+            if joins {
+                daemon.note_bluez(false);
+                daemon.note_acl(true, now.unix);
+                daemon.note_bluez(true);
+            }
+            ready_link(&mut daemon, now);
+            daemon
+        };
+        let roster = |reporter: Address, listed: Vec<Address>| Snapshot {
+            reporter,
+            session: [1; 16],
+            sequence: 1,
+            sent: now.unix,
+            accessory: addr(3),
+            peers: listed,
+            audio_source: None,
+            last_use: UnixMs(0),
+            pending: false,
+            audio_idle: true,
+        };
+        let expected = serde_json::json!([xps.display(), gram.display()]);
+
+        // The XPS was alone; the gram joins and the pods list it first.
+        let mut first = laptop("omarchy-xps", xps, true);
+        first.note_pod_peers(vec![xps], now.unix);
+        first.note_pod_peers(vec![gram, xps], now.unix);
+        assert_eq!(peers(&first), expected);
+        // The gram finds the XPS already there, whatever order the pods use.
+        let mut joiner = laptop("lg-gram", gram, true);
+        joiner.note_pod_peers(vec![gram, xps], now.unix);
+        assert_eq!(peers(&joiner), expected);
+
+        // A control socket reset on a live Bluetooth link keeps the order.
+        let generation = first.connection().generation();
+        first.note_socket(false, generation, now.mono);
+        ready_link(&mut first, now);
+        first.note_pod_peers(vec![gram, xps], now.unix);
+        assert_eq!(peers(&first), expected);
+        // It saw the gram join, so a disagreeing roster does not move it.
+        first.observe_nearby(host_id(Some(gram)), gram, "lg-gram", now.unix, true, Some([1; 16]));
+        first.hear_roster(roster(gram, vec![gram, xps]), now);
+        assert_eq!(peers(&first), expected);
+
+        // Restarted onto the live link: address order until the gram's roster.
+        let mut restarted = laptop("omarchy-xps", xps, false);
+        restarted.note_pod_peers(vec![xps, gram], now.unix);
+        assert_eq!(peers(&restarted), serde_json::json!([gram.display(), xps.display()]));
+        restarted.observe_nearby(
+            host_id(Some(gram)),
+            gram,
+            "lg-gram",
+            now.unix,
+            true,
+            Some([1; 16]),
+        );
+        restarted.hear_roster(roster(gram, vec![xps, gram]), now);
+        assert_eq!(peers(&restarted), expected);
+        assert_eq!(restarted.roster_peers(now), vec![xps, gram]);
     }
 
     #[test]
@@ -6400,10 +6562,11 @@ mod tests {
             },
             now,
         );
-        assert_eq!(daemon.roster_peers(now), vec![local, gram]);
+        // The gram's roster does not name us yet, so it joined first.
+        assert_eq!(daemon.roster_peers(now), vec![gram, local]);
         assert_eq!(
             daemon.status_value(now)["connected_peers"],
-            serde_json::json!([local.display(), gram.display()])
+            serde_json::json!([gram.display(), local.display()])
         );
         // The other laptop explicitly leaving removes it again.
         daemon.hear_roster(

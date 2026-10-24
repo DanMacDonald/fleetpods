@@ -25,7 +25,9 @@ pub fn complete_solo_list(
         return listed.to_vec();
     };
     if report.contains(&reporter) && report.iter().all(|peer| *peer == local || *peer == reporter) {
-        return vec![local, reporter];
+        // Join order: the reporter was on the pods first unless it already
+        // lists this laptop, in which case both keep its order.
+        return if report.contains(&local) { report.to_vec() } else { vec![reporter, local] };
     }
     listed.to_vec()
 }

@@ -179,6 +179,18 @@ play, a disconnect, docking the buds, a preference change, or outside
 playback cancels the rejoin. One rejoin runs per 20 s; a second reset in that
 window waits for the user's next play.
 
+## Seat order
+
+The pods' own device list is not in join order. The daemon keeps one: a
+first list soon after this laptop's Bluetooth link came up puts the devices
+already there ahead of this laptop, and a device that appears later goes
+last. The order survives a control socket reset and ends with the Bluetooth
+link. The roster carries it, so a laptop off the pods draws the same order.
+A daemon that restarted onto a live link did not see the order form: it
+uses address order until the other laptop's roster names the same devices,
+then follows that. Status lists `connected_peers` in this order, and the
+panel draws the Omarchy seat oldest left, newest right on every laptop.
+
 ## Audio before control readiness
 
 AACP control setup and A2DP audio are separate connections. A playback claim can

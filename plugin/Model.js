@@ -1469,16 +1469,9 @@ function appleSeat(appleDevices, availableApple, activeAddress, reconnect, trayA
 }
 
 function omarchySeat(omarchyDevices, availableOmarchy, activeAddress, connected, linuxHeld, ownershipUnknown, localAddress) {
-  // This laptop takes the left slot of a pair, so the device arriving from
-  // the tray lands leftmost and the one already seated slides right. Without
-  // a known local address, fall back to label order.
-  var local = normalizeAddress(localAddress)
-  var devices = omarchyDevices.slice().sort(function (a, b) {
-    var aLocal = local !== "" && normalizeAddress(a.address) === local ? 0 : 1
-    var bLocal = local !== "" && normalizeAddress(b.address) === local ? 0 : 1
-    return aLocal - bLocal
-      || String(a.label).localeCompare(String(b.label)) || String(a.address).localeCompare(String(b.address))
-  })
+  // The daemon lists the pods' devices in join order on every laptop: the
+  // oldest takes the left slot and the newest the right, wherever this panel runs.
+  var devices = omarchyDevices.slice()
   return {
     devices: devices, waiting: availableOmarchy,
     showWaiting: availableOmarchy.length > 0 || (!ownershipUnknown && linuxHeld),

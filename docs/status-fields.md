@@ -53,7 +53,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `ownership_intent` | Routing intent: `none`, `claim`, `release`. Desktop activity does not set `claim` |
 | `handoff_result` | Routing handoff result. `none` until a control write exists |
 | `remote_peer_count` | `-1` until the control socket is up and a fresh roster names peers |
-| `connected_peers` | Those roster peers while the list is non-empty. An empty list keeps the last non-empty one while the laptop that sent it is still nearby. Fleet members that announced they are seated are included too. Only while the socket is up |
+| `connected_peers` | Those roster peers while the list is non-empty. An empty list keeps the last non-empty one while the laptop that sent it is still nearby. Fleet members that announced they are seated are included too. Only while the socket is up. Listed in join order, oldest first, the same on every laptop; the panel draws the Omarchy seat left to right from it |
 | `want_omarchy_seat` | Routing seat intent |
 | `holding_omarchy_seat` | Seat is wanted and the control socket is not up |
 | `devices` | Open fleet members (`discovered: false`, `nearby` when a sealed sighting is fresh), nearby hosts available for enrollment (`discovered: true`), and all saved Apple devices (`kind: apple`, `nearby: false`). A saved member advertising that it is unjoined appears as discovered while that hint is fresh, unless fresh authenticated presence takes precedence. This does not erase saved membership. A saved entry does not imply a connection; `connected_peers` supplies that evidence. Omitted when empty |

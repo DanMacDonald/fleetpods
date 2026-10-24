@@ -316,43 +316,42 @@ TestCase {
 
   SignalSpy { id: orderDrawn; signalName: "orderDrawn" }
 
-  function test_restartKeepsTheSavedPairOrder() {
+  function test_restartDrawsTheDaemonPairOrderOverASavedOne() {
     var first = { address: "02:00:00:00:00:01", label: "Laptop A", onAcl: true }
     var second = { address: "02:00:00:00:00:02", label: "Laptop B", onAcl: true }
     var keys = [Model.normalizeAddress(first.address), Model.normalizeAddress(second.address)]
-    // Both devices are already seated at startup, so no arrival orders them.
-    var fresh = createTemporaryObject(view, this, { omarchyDevices: [first, second] })
-    compare(findChild(fresh, "omarchySeat").occupant.address, first.address)
-
+    // The daemon's join order is the same on every laptop; this panel's
+    // saved order from before a restart could disagree with the other's.
     var item = createTemporaryObject(view, this, {
       savedOrders: { omarchy: { pair: [keys[1], keys[0]] } }, omarchyDevices: [first, second]
     })
     var seat = findChild(item, "omarchySeat")
-    compare(seat.occupant.address, second.address)
-    compare(seat.occupantTwo.address, first.address)
+    compare(seat.occupant.address, first.address)
+    compare(seat.occupantTwo.address, second.address)
   }
 
-  function test_aLateSavedOrderReplacesOnlyAGuessedPairOrder() {
+  function test_aSavedOrderNeverMovesTheJoinOrderedPair() {
     var first = { address: "02:00:00:00:00:01", label: "Laptop A", onAcl: true }
     var second = { address: "02:00:00:00:00:02", label: "Laptop B", onAcl: true }
     var keys = [Model.normalizeAddress(first.address), Model.normalizeAddress(second.address)]
     var item = createTemporaryObject(view, this, { omarchyDevices: [first, second] })
     var seat = findChild(item, "omarchySeat")
     item.savedOrders = { omarchy: { pair: [keys[1], keys[0]] } }
-    compare(seat.occupant.address, second.address)
+    compare(seat.occupant.address, first.address, "a saved order does not move the Omarchy pair")
 
-    // An arrival decides the order; a saved order cannot override it.
+    // The newcomer arrives last in the daemon's order and takes the right slot.
     var arrived = createTemporaryObject(view, this, { omarchyDevices: [first] })
     seat = findChild(arrived, "omarchySeat")
     orderDrawn.target = arrived; orderDrawn.clear()
     arrived.omarchyDevices = [first, second]
-    compare(seat.occupant.address, second.address, "the newcomer takes the left slot")
+    compare(seat.occupant.address, first.address)
+    compare(seat.occupantTwo.address, second.address, "the newcomer takes the right slot")
     compare(orderDrawn.count, 1)
     compare(orderDrawn.signalArguments[0][0], "omarchy")
     compare(orderDrawn.signalArguments[0][1], "pair")
-    compare(orderDrawn.signalArguments[0][2], [keys[1], keys[0]])
-    arrived.savedOrders = { omarchy: { pair: [keys[0], keys[1]] } }
-    compare(seat.occupant.address, second.address)
+    compare(orderDrawn.signalArguments[0][2], [keys[0], keys[1]])
+    arrived.savedOrders = { omarchy: { pair: [keys[1], keys[0]] } }
+    compare(seat.occupant.address, first.address)
   }
 
   function test_restartKeepsARisenPairOnItsSeatSides() {
@@ -397,7 +396,7 @@ TestCase {
     verify(Math.abs(aOutline.color.r * 255 - 0x9f) < 1.5
       && Math.abs(aOutline.color.g * 255 - 0x9f) < 1.5
       && Math.abs(aOutline.color.b * 255 - 0xa0) < 1.5, "mid tier tint, got " + aOutline.color)
-    verify(Qt.colorEqual(findChild(b, "outline").color, "#e6e6e6"))
+    verify(Qt.colorEqual(findChild(b, "outline").color, b.litColor))
     item.activeDeviceAddress = first.address
     verify(a.selected)
     verify(!b.selected)
@@ -825,7 +824,7 @@ TestCase {
     verify(item.availableOmarchy.some(function (d) { return d.address === gram }))
   }
 
-  function test_seatedGramSlidesToPairSlotWhenXpsJoins() {
+  function test_seatedGramSlidesLeftWhenXpsJoins() {
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
     var item = createTemporaryObject(view, this, {
@@ -837,21 +836,24 @@ TestCase {
     var solo = soloIcon.mapToItem(item, soloIcon.width / 2, soloIcon.height / 2)
     item.omarchyDevices = [gram, xps]
     wait(120)
-    var xpsIcon = findChild(item, "deviceOmarchy0")
-    var gramIcon = findChild(item, "deviceOmarchy1")
-    verify(xpsIcon !== gramIcon)
-    verify(xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2).x < solo.x,
-      "the XPS descends into the left slot")
-    verify(gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2).x > solo.x + 2,
-      "the Gram slides right to its pair slot")
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupantLabel, "lg-gram")
+    compare(seat.occupantTwoLabel, "omarchy-xps")
+    var gramIcon = findChild(item, "deviceOmarchy0")
+    var xpsIcon = findChild(item, "deviceOmarchy1")
+    verify(gramIcon !== xpsIcon)
+    verify(gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2).x < solo.x - 2,
+      "the Gram slides left to its pair slot")
+    verify(xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2).x > solo.x,
+      "the XPS descends into the right slot")
     wait(800)
     verify(gramIcon.mapToItem(item, gramIcon.width / 2, 0).x
-      > xpsIcon.mapToItem(item, xpsIcon.width / 2, 0).x, "XPS holds the left slot, Gram the right")
+      < xpsIcon.mapToItem(item, xpsIcon.width / 2, 0).x, "Gram holds the left slot, XPS the right")
   }
 
-  // The seated Gram starts sliding right as soon as the XPS begins taking
-  // the seat, before the XPS has landed.
-  function test_seatedGramSlidesRightAsSoonAsXpsTakesOver() {
+  // The seated Gram starts sliding left as soon as the XPS begins taking
+  // the seat, before the XPS has landed on the right.
+  function test_seatedGramSlidesLeftAsSoonAsXpsTakesOver() {
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps" }
     var item = createTemporaryObject(view, this, {
@@ -864,12 +866,12 @@ TestCase {
     item.attemptKind = "switching"
     wait(200)
     var moved = findChild(item, "deviceOmarchy0")
-    verify(moved.mapToItem(item, moved.width / 2, moved.height / 2).x > solo.x + 5,
-      "the Gram slides right at once, before the XPS lands")
+    verify(moved.mapToItem(item, moved.width / 2, moved.height / 2).x < solo.x - 5,
+      "the Gram slides left at once, before the XPS lands")
     verify(findChild(item, "waitingOmarchy0"), "the XPS is still in the tray")
   }
 
-  function test_joiningGramTakesLeftSeatAndXpsSlidesRight() {
+  function test_joiningGramTakesRightSeatAndXpsSlidesLeft() {
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram" }
     var item = createTemporaryObject(view, this, {
@@ -882,18 +884,21 @@ TestCase {
     item.omarchyDevices = [xps, Object.assign({}, gram, { onAcl: true })]
     item.availableOmarchy = []
     wait(120)
-    var gramIcon = findChild(item, "deviceOmarchy0")
-    var xpsIcon = findChild(item, "deviceOmarchy1")
+    var seat = findChild(item, "omarchySeat")
+    compare(seat.occupantLabel, "omarchy-xps")
+    compare(seat.occupantTwoLabel, "lg-gram")
+    var xpsIcon = findChild(item, "deviceOmarchy0")
+    var gramIcon = findChild(item, "deviceOmarchy1")
     verify(gramIcon !== xpsIcon)
     var gramMid = gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2)
     var xpsMid = xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2)
-    verify(gramMid.x < solo.x, "Gram descends into the left slot")
-    verify(xpsMid.x > solo.x + 2, "XPS is sliding right: solo=" + solo.x + " mid=" + xpsMid.x)
+    verify(gramMid.x > solo.x, "Gram descends into the right slot")
+    verify(xpsMid.x < solo.x - 2, "XPS is sliding left: solo=" + solo.x + " mid=" + xpsMid.x)
     fuzzyCompare(xpsMid.y, solo.y, 1)
     wait(800)
     var gramSettled = gramIcon.mapToItem(item, gramIcon.width / 2, gramIcon.height / 2)
     var xpsSettled = xpsIcon.mapToItem(item, xpsIcon.width / 2, xpsIcon.height / 2)
-    verify(gramSettled.x < xpsSettled.x, "Gram holds the left slot, XPS the right")
+    verify(xpsSettled.x < gramSettled.x, "XPS holds the left slot, Gram the right")
     fuzzyCompare(gramSettled.y, solo.y, 1)
     fuzzyCompare(xpsSettled.y, solo.y, 1)
   }
@@ -930,11 +935,11 @@ TestCase {
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var item = createTemporaryObject(view, this, {
-      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [],
+      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
       localAddress: xps.address
     })
     wait(700)
-    item.omarchyDevices = [xps, gram]
+    item.omarchyDevices = [gram, xps]
     wait(800)
     item.reconnectBusy = true
     item.omarchyDevices = []
@@ -968,11 +973,11 @@ TestCase {
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
     var item = createTemporaryObject(view, this, {
-      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
+      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [],
       localAddress: xps.address
     })
     wait(700)
-    item.omarchyDevices = [gram, xps]
+    item.omarchyDevices = [xps, gram]
     wait(800)
     var seat = findChild(item, "omarchySeat")
     compare(seat.occupantLabel, "omarchy-xps")
@@ -1003,11 +1008,11 @@ TestCase {
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
     var item = createTemporaryObject(view, this, {
-      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
+      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [],
       localAddress: xps.address
     })
     wait(700)
-    item.omarchyDevices = [gram, xps]
+    item.omarchyDevices = [xps, gram]
     wait(800)
     item.reconnectBusy = true
     item.omarchyDevices = [xps]
@@ -1039,11 +1044,11 @@ TestCase {
     var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
     var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
     var item = createTemporaryObject(view, this, {
-      connectedToOmarchy: true, omarchyDevices: [xps], availableOmarchy: [],
+      connectedToOmarchy: true, omarchyDevices: [gram], availableOmarchy: [],
       localAddress: xps.address
     })
     wait(700)
-    item.omarchyDevices = [xps, gram]
+    item.omarchyDevices = [gram, xps]
     wait(800)
     item.reconnectBusy = true
     item.omarchyDevices = []
@@ -1615,23 +1620,30 @@ TestCase {
     tryCompare(seated, "glideX", 0, 1500)
   }
 
-  function test_omarchySeatOrderIgnoresWhichMachineIsLocal() {
+  function test_omarchySeatDrawsTheDaemonOrderOnEveryLaptop() {
     function labelAt(item, index) {
       var kids = findChild(item, "deviceOmarchy" + index).parent.parent.children
       for (var i = 0; i < kids.length; ++i)
         if (kids[i].text !== undefined) return kids[i].text
       return ""
     }
-    // Each machine lists itself last, so the two laptops pass opposite orders.
-    var item = createTemporaryObject(view, this, {
-      connectedToOmarchy: true,
-      omarchyDevices: [
-        { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true },
-        { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
-      ]
-    })
-    compare(labelAt(item, 0), "lg-gram")
-    compare(labelAt(item, 1), "omarchy-xps")
+    var xps = { address: "02:00:00:00:00:02", label: "omarchy-xps", onAcl: true }
+    var gram = { address: "02:00:00:00:00:01", label: "lg-gram", onAcl: true }
+    // Both daemons list the pods in join order, so both panels get the same
+    // list and must draw it the same way, whichever laptop is local.
+    var locals = [xps, gram]
+    for (var at = 0; at < locals.length; ++at) {
+      var local = locals[at]
+      var item = createTemporaryObject(view, this, {
+        connectedToOmarchy: true, localAddress: local.address, omarchyDevices: [xps, gram]
+      })
+      compare(labelAt(item, 0), "omarchy-xps", local.label)
+      compare(labelAt(item, 1), "lg-gram", local.label)
+      // A restarted daemon adopting the other laptop's order moves the pair.
+      item.omarchyDevices = [gram, xps]
+      compare(labelAt(item, 0), "lg-gram", local.label)
+      compare(labelAt(item, 1), "omarchy-xps", local.label)
+    }
   }
 
   function test_pairedIconsMirrorEllipseCenter() {

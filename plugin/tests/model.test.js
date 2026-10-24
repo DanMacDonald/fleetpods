@@ -1766,10 +1766,11 @@ check('the tray stays hidden for a waiting Mac while the seated phone is playing
   Model.appleTrayAvailable([PHONE], [SEATED_LAPTOP], false, [MAC], true, true), false)
 
 const omarchy = Model.omarchySeat([{ address: 'B', label: 'xps' }, { address: 'A', label: 'gram' }], [], '', true, false, false)
-check('without a known local laptop the pair falls back to label order', omarchy.devices.map(d => d.label), ['gram', 'xps'])
-check('the local laptop takes the left slot of the pair',
-  Model.omarchySeat([{ address: 'B', label: 'xps' }, { address: 'A', label: 'gram' }], [], '', true, false, false, 'B').devices.map(d => d.label),
-  ['xps', 'gram'])
+check('the pair keeps the daemon\'s join order, newest on the right', omarchy.devices.map(d => d.label), ['xps', 'gram'])
+check('every laptop draws the same order, wherever the panel runs',
+  ['A', 'B'].map(local => Model.omarchySeat([{ address: 'B', label: 'xps' }, { address: 'A', label: 'gram' }], [], '', true, false, false, local)
+    .devices.map(d => d.label)),
+  [['xps', 'gram'], ['xps', 'gram']])
 check('a held Omarchy seat shows its tray once ownership is known',
   [Model.omarchySeat([], [], '', true, true, false).showWaiting, Model.omarchySeat([], [], '', true, true, true).showWaiting], [true, false])
 check('the Omarchy link follows this laptop or a seated peer',
