@@ -208,6 +208,11 @@ pub struct Daemon {
     /// An Apple device took the slot this laptop had been sitting in.
     /// A failed route, a closed case, and an idle link do not set this.
     displaced: bool,
+    /// The pods reset this laptop's link mid-playback with no fleet laptop
+    /// taking over: an Apple device reconnecting as the buds go back in.
+    /// The players stay paused until this laptop is back alongside it.
+    rejoin: Option<Rejoin>,
+    rejoined_at: Option<MonoMs>,
     pub(crate) background_requested: bool,
     /// A play pressed without evidence the pods can play. The
     /// claim waits until they are available or connect, so the speakers are not
@@ -242,6 +247,13 @@ pub struct Daemon {
     route_block: Option<&'static str>,
     /// The connection packet. A retry sends these same bytes.
     route_connection: Option<Vec<u8>>,
+}
+
+struct Rejoin {
+    /// When to open the link; once opened, when to stop waiting for it.
+    at: MonoMs,
+    players: Vec<String>,
+    opened: bool,
 }
 
 struct PendingAdmission {
@@ -308,6 +320,14 @@ const ROSTER_PROBE_INTERVAL_MS: u64 = 15_000;
 /// How long the non-owner of a dropped laptop pair holds its automatic
 /// reconnect so the owner can land first, before it may attach anyway.
 const REOPEN_HOLD_MS: u64 = 15_000;
+
+/// An Apple device reconnecting as the buds go back in can reset this
+/// laptop's link while it plays (XPS, 2026-10-24 10:03). The pods then hold
+/// both, so let that connection settle and rejoin alongside it.
+const REJOIN_DELAY_MS: u64 = 2_000;
+/// One automatic rejoin per window. A second reset means the other device
+/// insists, and the next play is the user's call.
+const REJOIN_WINDOW_MS: u64 = 20_000;
 
 /// An incoming invitation held aside across a fleet reset (see
 /// [`Daemon::take_invitation`]).
@@ -412,6 +432,8 @@ impl Daemon {
             roster_probe: None,
             roster_probe_after: None,
             displaced: false,
+            rejoin: None,
+            rejoined_at: None,
             background_requested: false,
             deferred_playback_claim: None,
             case_opened_at: None,
@@ -603,6 +625,7 @@ impl Daemon {
                 Response::line("error: discovery control is not available")
             }
             Command::Disconnect => {
+                self.rejoin = None;
                 self.effects.drop_link = true;
                 self.interrupt("disconnect", now);
                 Response::line("ok")
@@ -795,6 +818,105 @@ impl Daemon {
         }
         self.slot_hold_until = None;
         self.reopen_blocked(now)
+    }
+
+    /// The ready link is about to drop. Read before the drop clears the pods'
+    /// list: a fleet laptop in it is a handoff, and a playing phone or Mac
+    /// keeps what it took.
+    pub(crate) fn evicted_while_playing(&self, now: Clock) -> bool {
+        let fleet_laptop = self
+            .pod_peers
+            .iter()
+            .any(|peer| Some(*peer) != self.local_address && self.membership.contains(*peer));
+        self.output.wants_output()
+            && self.audio.local_playing()
+            && !fleet_laptop
+            && !self.routing.phase().busy()
+            && !self.connection.apple_reconnect()
+            && !self.radio_quiet()
+            && self.connection.reason() != "disconnect"
+            && self.preferred_connection_allowed()
+            && !self.outside_device_playing(now)
+            && self.rejoined_at.is_none_or(|at| now.mono.saturating_since(at) >= REJOIN_WINDOW_MS)
+    }
+
+    /// Keep the players this drop paused and rejoin once the newcomer settles.
+    pub(crate) fn plan_rejoin(&mut self, players: Vec<String>, now: MonoMs) {
+        eprintln!("fleetpodsd: the pods dropped this laptop mid-playback; rejoining in {REJOIN_DELAY_MS} ms");
+        self.rejoined_at = Some(now);
+        self.rejoin =
+            Some(Rejoin { at: now.saturating_add(REJOIN_DELAY_MS), players, opened: false });
+    }
+
+    /// Open the link alongside the device that took this laptop's place.
+    /// The claim and the resume wait for control readiness.
+    pub(crate) fn advance_rejoin(&mut self, now: Clock) {
+        let Some(rejoin) = &self.rejoin else {
+            return;
+        };
+        if now.mono.0 < rejoin.at.0 {
+            return;
+        }
+        if rejoin.opened {
+            eprintln!("fleetpodsd: rejoin gave up; the AirPods link did not come back");
+            self.rejoin = None;
+            return;
+        }
+        let cancel = if self.output.wants_output() {
+            Some("a newer play took over")
+        } else if self.routing.phase().busy() || self.connection.apple_reconnect() {
+            Some("routing in progress")
+        } else if self.radio_quiet() || self.connection.reason() == "disconnect" {
+            Some("link unavailable")
+        } else if !self.preferred_connection_allowed() {
+            Some("another laptop is preferred")
+        } else if self.outside_device_playing(now) {
+            Some("a device outside the fleet is playing")
+        } else if self.accessory.stowed() || self.accessory.both_docked() {
+            Some("the buds are docked")
+        } else {
+            None
+        };
+        if let Some(reason) = cancel {
+            eprintln!("fleetpodsd: rejoin cancelled: {reason}");
+            self.rejoin = None;
+            return;
+        }
+        if let Some(rejoin) = &mut self.rejoin {
+            rejoin.opened = true;
+            rejoin.at = now.mono.saturating_add(REJOIN_WINDOW_MS);
+        }
+        if self.connection.stage() == Stage::Ready {
+            self.claim_rejoin(now);
+        } else if !self.connection.stage().is_opening() {
+            eprintln!("fleetpodsd: rejoining the AirPods alongside the device that took this link");
+            self.displaced = false;
+            self.slot_hold_until = None;
+            self.routing.claim_audio();
+            self.open_connection(now.mono);
+        }
+    }
+
+    /// The rejoined link is ready: the players this laptop paused are its claim.
+    pub(crate) fn claim_rejoin(&mut self, now: Clock) {
+        if !self.rejoin.as_ref().is_some_and(|rejoin| rejoin.opened) {
+            return;
+        }
+        let Some(Rejoin { players, .. }) = self.rejoin.take() else {
+            return;
+        };
+        if self.outside_device_playing(now) {
+            eprintln!("fleetpodsd: rejoin cancelled: a device outside the fleet is playing");
+            return;
+        }
+        eprintln!("fleetpodsd: rejoined the AirPods; resuming {players:?}");
+        self.claim_seat(now);
+        for player in players {
+            if !self.resume_players.contains(&player) {
+                self.resume_players.push(player);
+            }
+        }
+        self.replan(now);
     }
 
     pub fn mark_control_ready(&mut self, generation: Generation) -> bool {
@@ -3496,6 +3618,7 @@ impl Daemon {
         // Mute before the pause and before streams follow the default back
         // to the speakers: a player keeps playing for a moment after Pause.
         self.output.handoff(self.config.accessory, self.last_graph.as_ref(), now.mono);
+        self.rejoin = None;
         self.background_requested = false;
         self.deferred_playback_claim = None;
         self.resume_output_on_grant = false;
@@ -6915,25 +7038,30 @@ mod tests {
         daemon.select_accessory(Some(addr(3)));
         daemon.step(Input::Command(Command::Connect), now);
         let generation = daemon.connection().generation();
-        daemon.step(Input::ControlSocket { up: true, generation }, now);
-        daemon
-            .step(Input::Accessory { generation, packet: vec![0x01, 0x00, 0x04, 0x00, 0x01] }, now);
-        daemon.step(
-            Input::Accessory { generation, packet: vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01] },
-            now,
-        );
+        set_up_link(daemon, generation, now);
+    }
+
+    /// The pods answer a control socket through to readiness.
+    fn set_up_link(
+        daemon: &mut Daemon,
+        generation: Generation,
+        now: Clock,
+    ) -> Vec<crate::step::Effect> {
+        use crate::step::Input;
         let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
         battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
         battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
         battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
-        daemon.step(Input::Accessory { generation, packet: battery }, now);
-        daemon.step(
-            Input::Accessory {
-                generation,
-                packet: vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02],
-            },
-            now,
-        );
+        let mut effects = daemon.step(Input::ControlSocket { up: true, generation }, now).effects;
+        for packet in [
+            vec![0x01, 0x00, 0x04, 0x00, 0x01],
+            vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01],
+            battery,
+            vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02],
+        ] {
+            effects.extend(daemon.step(Input::Accessory { generation, packet }, now).effects);
+        }
+        effects
     }
 
     #[test]
@@ -8068,6 +8196,126 @@ mod tests {
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], true);
         assert_eq!(daemon.handle(Command::Connect, now).body.as_deref(), Some("accepted\n"));
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], false);
+    }
+
+    /// Drop a playing laptop's ready link the way the pods reset it, then
+    /// tick past the rejoin delay. Returns every effect along the way.
+    fn evict_and_wait(daemon: &mut Daemon, from: Clock, ms: u64) -> Vec<crate::step::Effect> {
+        use crate::step::Input;
+        let generation = daemon.connection().generation();
+        let mut effects = daemon.step(Input::ControlSocket { up: false, generation }, from).effects;
+        effects.extend(daemon.step(Input::Bluez(false), from).effects);
+        for elapsed in (100..=ms).step_by(100) {
+            let at = Clock::new(from.mono.0 + elapsed, from.unix.0 + elapsed);
+            effects.extend(daemon.step(Input::Tick, at).effects);
+        }
+        effects
+    }
+
+    #[test]
+    fn the_pods_dropping_this_laptop_mid_playback_rejoin_alongside_the_phone() {
+        use crate::step::{Effect, Input};
+        // XPS, 2026-10-24 10:03: the pods listed only this laptop, the buds
+        // went back in, Brave resumed, and the pods reset the link as the
+        // phone reconnected. Afterwards they held both.
+        let brave = "org.mpris.MediaPlayer2.brave";
+        let opens =
+            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::OpenLink { .. }));
+        let mut daemon = Daemon::new("omarchy-xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let local = addr(2);
+        let phone = Address::parse("28:02:2E:BF:7F:7D").unwrap();
+        ready_link(&mut daemon, now);
+        daemon.set_local_address(Some(local));
+        daemon.audio.startup_players(&[]);
+        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
+        assert!(daemon.output.wants_output());
+        daemon.note_pod_peers(vec![local], now.unix);
+
+        let waiting = evict_and_wait(&mut daemon, at(100), REJOIN_DELAY_MS - 100);
+        assert!(waiting.iter().any(
+            |e| matches!(e, Effect::PausePlayers(players) if players == &[brave.to_string()])
+        ));
+        assert!(!opens(&waiting), "the newcomer settles first: {waiting:?}");
+        assert!(!daemon.output.wants_output(), "playback stays paused until the link is back");
+
+        let mut rejoin = Vec::new();
+        for elapsed in [REJOIN_DELAY_MS + 100, REJOIN_DELAY_MS + 200, REJOIN_DELAY_MS + 300] {
+            rejoin.extend(daemon.step(Input::Tick, at(elapsed)).effects);
+        }
+        assert!(opens(&rejoin), "{rejoin:?}");
+        assert!(!rejoin.iter().any(|e| matches!(e, Effect::ResumePlayers(_))));
+
+        let ready = at(REJOIN_DELAY_MS + 1_500);
+        daemon.step(Input::Bluez(true), ready);
+        let generation = daemon.connection().generation();
+        let setup = set_up_link(&mut daemon, generation, ready);
+        assert!(daemon.output.wants_output());
+        assert!(setup.iter().any(|e| matches!(e,
+            Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true)
+        )));
+        assert!(
+            setup.iter().any(
+                |e| matches!(e, Effect::ResumePlayers(players) if players == &[brave.to_string()])
+            ),
+            "{setup:?}"
+        );
+        // Our own resume is the claim already made, not a new play.
+        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, ready);
+
+        assert!(daemon.audio.local_playing());
+        // A second reset inside the window is the phone insisting.
+        daemon.note_pod_peers(vec![local, phone], ready.unix);
+        let again = evict_and_wait(&mut daemon, at(REJOIN_DELAY_MS + 5_000), 6_000);
+        assert!(again.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+        assert!(!opens(&again), "{again:?}");
+        assert!(!daemon.output.wants_output());
+    }
+
+    #[test]
+    fn no_rejoin_for_a_fleet_handoff_a_paused_player_or_a_disconnect() {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::step::{Effect, Input};
+        let brave = "org.mpris.MediaPlayer2.brave";
+        for case in ["alone", "gram_listed", "paused", "disconnect"] {
+            let mut daemon = Daemon::new("omarchy-xps");
+            let now = clock();
+            let local = addr(2);
+            let gram = addr(4);
+            ready_link(&mut daemon, now);
+            daemon.set_local_address(Some(local));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "omarchy-xps".into() },
+                    Member { address: gram, label: "lg-gram".into() },
+                ],
+            });
+            daemon.audio.startup_players(&[]);
+            daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
+            assert!(daemon.output.wants_output(), "{case}");
+            if case == "paused" {
+                daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, now);
+            }
+            daemon.note_pod_peers(
+                if case == "gram_listed" { vec![local, gram] } else { vec![local] },
+                now.unix,
+            );
+            let generation = daemon.connection().generation();
+            let mut effects =
+                daemon.step(Input::ControlSocket { up: false, generation }, now).effects;
+            if case == "disconnect" {
+                effects.extend(daemon.step(Input::Command(Command::Disconnect), now).effects);
+            }
+            for elapsed in (100..=REJOIN_DELAY_MS + 1_000).step_by(100) {
+                let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
+                effects.extend(daemon.step(Input::Tick, at).effects);
+            }
+            let opened = effects.iter().any(|e| matches!(e, Effect::OpenLink { .. }));
+            assert_eq!(opened, case == "alone", "{case}: {effects:?}");
+        }
     }
 
     #[test]

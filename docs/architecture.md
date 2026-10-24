@@ -163,6 +163,20 @@ it is not a guarantee of subsecond delivery over BLE. Both hosts need the new
 version to share telemetry; older hosts continue with direct BLE observations.
 
 
+## Rejoin after an eviction
+
+Putting the buds back in can make an Apple device reconnect, and the pods
+then reset this laptop's ready link even though they afterwards hold both.
+When the reset hits a laptop that was playing, with no fleet laptop in the
+pods' last list, no route or Apple reconnect transaction, no outside device
+playing, and this laptop still the preferred connector, the daemon steps back
+as usual (mute, pause) and remembers the players it paused. Two seconds later
+it reopens the link alongside the newcomer, ignoring the passive slot hold.
+At control readiness it claims the seat and resumes those players. A newer
+play, a disconnect, docking the buds, a preference change, or outside
+playback cancels the rejoin. One rejoin runs per 20 s; a second reset in that
+window waits for the user's next play.
+
 ## Audio before control readiness
 
 AACP control setup and A2DP audio are separate connections. A playback claim can

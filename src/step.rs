@@ -416,6 +416,7 @@ impl Daemon {
                     return None;
                 }
                 let was_ready = self.connection.stage() == Stage::Ready;
+                let evicted = !up && was_ready && self.evicted_while_playing(now);
                 self.note_socket(up, generation, now.mono);
                 if up {
                     self.begin_setup(generation, now);
@@ -426,6 +427,10 @@ impl Daemon {
                         && !self.connection.apple_reconnect()
                     {
                         self.step_back(now);
+                        if evicted {
+                            let players = self.effects.pause_players.clone();
+                            self.plan_rejoin(players, now.mono);
+                        }
                     }
                 }
                 None
@@ -636,6 +641,7 @@ impl Daemon {
             self.note_alongside(peer, now.unix);
         }
         self.link_ready_at = Some(now.mono);
+        self.claim_rejoin(now);
         // A play waiting for this link asked before anything the pods
         // reported during setup, so those reports cannot override it.
         if self.output.wants_output() {
@@ -874,6 +880,7 @@ impl Daemon {
     }
 
     fn harvest(&mut self, now: Clock) -> Vec<Effect> {
+        self.advance_rejoin(now);
         self.reconnect_preferred(now);
         // A remote report that arrived just after our claim and was never
         // answered by a grant ends the claim now.
