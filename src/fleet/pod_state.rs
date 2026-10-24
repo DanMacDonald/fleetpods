@@ -64,38 +64,56 @@ impl State {
             && value(self.lid) == value(other.lid)
     }
 
-    /// A live control session keeps its own bud readings. Disconnected hosts
-    /// prefer the owner's bud reports. Lid/case are compared by observation
+    /// Disconnected hosts prefer the owner's bud reports. A live control
+    /// session keeps its own unless the owner observed them later: a link
+    /// can go silent for its 20 s supervision timeout when the buds swap
+    /// roles (gram, 2026-10-24 11:19). Lid/case are compared by observation
     /// time, since a follower may have heard a newer case advertisement.
     fn apply(&self, direct: &mut Accessory, linked: bool, now: Clock) -> Vec<&'static str> {
         let mut used = Vec::new();
-        if !linked {
-            for (right, battery, placement, label) in [
-                (false, self.left, self.left_place, "left"),
-                (true, self.right, self.right_place, "right"),
-            ] {
-                let slot = if right { &mut direct.right } else { &mut direct.left };
-                if let Some(r) = battery {
-                    *slot = Evidence::fresh(
-                        Pod {
-                            battery: r.value,
-                            in_ear: placement.and_then(|p| p.value.in_ear),
-                            in_case: placement.and_then(|p| p.value.in_case),
-                        },
-                        mono_at(now, r.observed),
-                    );
-                }
-                if let Some(r) = placement {
-                    direct.note_placement(
-                        right,
-                        r.value.in_ear,
-                        r.value.in_case,
-                        mono_at(now, r.observed),
-                    );
-                }
-                if battery.is_some() || placement.is_some() {
-                    used.push(label);
-                }
+        let later = |observed: UnixMs, prior: Option<MonoMs>| {
+            !linked || prior.is_none_or(|at| observed > now.unix_at(at))
+        };
+        for (right, battery, placement, label) in [
+            (false, self.left, self.left_place, "left"),
+            (true, self.right, self.right_place, "right"),
+        ] {
+            let (pod_at, place_at) = if right {
+                (direct.right.at(), direct.right_placement.at())
+            } else {
+                (direct.left.at(), direct.left_placement.at())
+            };
+            let battery = battery.filter(|r| later(r.observed, pod_at));
+            let placement = placement.filter(|r| later(r.observed, place_at));
+            let slot = if right { &mut direct.right } else { &mut direct.left };
+            // A linked host keeps its own placement flags unless the owner's are newer.
+            let held = slot.known().copied().filter(|_| linked);
+            if let Some(r) = battery {
+                *slot = Evidence::fresh(
+                    Pod {
+                        battery: r.value,
+                        in_ear: placement.map_or(held.and_then(|p| p.in_ear), |p| p.value.in_ear),
+                        in_case: placement
+                            .map_or(held.and_then(|p| p.in_case), |p| p.value.in_case),
+                    },
+                    mono_at(now, r.observed),
+                );
+            } else if let (Some(p), Some(pod), Some(at)) = (placement, held, pod_at) {
+                *slot = Evidence::fresh(
+                    Pod { in_ear: p.value.in_ear, in_case: p.value.in_case, ..pod },
+                    at,
+                );
+            }
+            if let Some(r) = placement {
+                direct.note_placement(
+                    right,
+                    r.value.in_ear,
+                    r.value.in_case,
+                    mono_at(now, r.observed),
+                );
+            }
+            if battery.is_some() || placement.is_some() {
+                used.push(label);
             }
         }
         let newer = |observed: UnixMs, prior: Option<MonoMs>| {
@@ -475,6 +493,45 @@ mod tests {
         let (linked, used) = Sharing::project(&p, &follower, true, now);
         assert_eq!(linked.left_placement, follower.left_placement);
         assert!(used.is_empty());
+    }
+
+    #[test]
+    fn a_linked_host_takes_the_owners_newer_bud_readings() {
+        // gram, 2026-10-24 11:19: a pod went into the case, the buds swapped
+        // roles, and the gram's still "ready" link said nothing for 20 s
+        // while the owner reported the change.
+        let mut follower = direct(clock(1000));
+        let mut owner = direct(clock(1000));
+        owner.note_pod(
+            false,
+            Pod {
+                battery: Battery::new(66, true).unwrap(),
+                in_ear: Some(false),
+                in_case: Some(true),
+            },
+            clock(1500).mono,
+        );
+        let now = clock(2000);
+        let p = Packet {
+            identity: identity(),
+            sequence: 2,
+            sent: now.unix,
+            state: State::capture(&owner, now),
+        };
+        let (resolved, used) = Sharing::project(&p, &follower, true, now);
+        assert_eq!(used, vec!["left"]);
+        let place = resolved.left_placement.known().unwrap();
+        assert_eq!((place.in_ear, place.in_case), (Some(false), Some(true)));
+        let pod = resolved.left.known().unwrap();
+        assert_eq!((pod.battery.level(), pod.in_ear), (66, Some(false)));
+
+        // A newer local observation still wins on a live link.
+        follower.note_placement(false, Some(true), Some(false), clock(1800).mono);
+        let (resolved, used) = Sharing::project(&p, &follower, true, now);
+        assert_eq!(resolved.left_placement.known().unwrap().in_ear, Some(true));
+        assert_eq!(resolved.left.known().unwrap().battery.level(), 66);
+        assert_eq!(resolved.left.known().unwrap().in_ear, Some(true));
+        assert_eq!(used, vec!["left"]);
     }
 
     #[test]

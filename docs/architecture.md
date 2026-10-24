@@ -144,9 +144,11 @@ cannot nominate its own reporter. A roster withdrawal, fleet reset, accessory
 change, or loss of membership prevents selection immediately.
 
 Direct observations remain in `pods::reports::Accessory`. Status resolves a
-separate view: a ready local control link keeps its own bud readings; disconnected
-hosts prefer the fresh owner's bud readings. Lid and case battery only replace
-older local observations and never outlive their observation freshness window.
+separate view: disconnected hosts prefer the fresh owner's bud readings, and a
+ready local control link keeps its own unless the owner observed them later. A
+link can sit silent for its 20 s supervision timeout after the buds swap roles.
+Lid and case battery only replace older local observations and never outlive
+their observation freshness window.
 Missing remote readings leave the local source available. Expired or unavailable
 fleet reports fall back to local BLE evidence. The diagnostic `fleet_pod_state`
 field identifies the report and which fields were used. This projection updates
