@@ -70,10 +70,11 @@ fn a30_roster_and_route_run_both_directions() {
             sent: heard_at.unix,
             accessory: pods,
             peers: vec![host(helper_byte), phone],
+            // A playing phone keeps the pods from desktop activity; an idle one does not.
             audio_source: Some(phone),
             last_use: UnixMs(heard_at.unix.0 - 1),
             pending: false,
-            audio_idle: false,
+            audio_idle: true,
         };
         requester
             .step(Input::Advertisement(roster_air::advertise(&roster, &keys).unwrap()), heard_at);
@@ -186,10 +187,13 @@ fn advertised_route(effects: &[fleetpods::step::Effect]) -> &[u8] {
 
 #[test]
 fn a31_disagreement_keeps_provenance_and_one_snapshot() {
+    // The gram's play takes the pods; the phone playing afterwards is the
+    // newer report, and the gram's own claim does not mask it.
     let mut world = World::pair();
     world.open_case();
-    world.remote_playing("iphone");
     world.play("gram");
+    world.settle();
+    world.remote_playing("iphone");
     world.settle();
     let status = world.status("gram");
     assert_eq!(status["reported_ownership"], 0, "direct report stays remote");
