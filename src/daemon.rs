@@ -136,6 +136,10 @@ pub struct Daemon {
     codec_asked: Option<String>,
     transport_asked: bool,
     transport_asked_early: bool,
+    /// When BlueZ first refused or ignored this claim's audio profile
+    /// request, and when the request may go out again.
+    transport_first_refused: Option<MonoMs>,
+    transport_retry_at: Option<MonoMs>,
     pub(crate) staged_controls: Vec<Vec<u8>>,
     pub(crate) peers_seated: Vec<Address>,
     pub(crate) output: crate::audio::route::Router,
@@ -337,6 +341,12 @@ const REJOIN_DELAY_MS: u64 = 2_000;
 /// insists, and the next play is the user's call.
 const REJOIN_WINDOW_MS: u64 = 20_000;
 
+/// BlueZ can answer the audio profile `InProgress` for most of a minute after
+/// a connect collides with the pods (XPS, 2026-10-27 10:56). Ask again at this
+/// pace while playback still wants the pods, for at most the window.
+const TRANSPORT_RETRY_MS: u64 = 2_000;
+const TRANSPORT_RETRY_WINDOW_MS: u64 = 30_000;
+
 /// A first device list this soon after the Bluetooth link came up shows
 /// who was on the pods before this laptop joined.
 const JOIN_WITNESS_MS: u64 = 30_000;
@@ -396,6 +406,8 @@ impl Daemon {
             codec_asked: None,
             transport_asked: false,
             transport_asked_early: false,
+            transport_first_refused: None,
+            transport_retry_at: None,
             staged_controls: Vec::new(),
             peers_seated: Vec::new(),
             output: crate::audio::route::Router::new(),
@@ -3673,8 +3685,7 @@ impl Daemon {
     fn apply_claim(&mut self) {
         self.routing.claim_audio();
         self.output.claim();
-        self.transport_asked = false;
-        self.transport_asked_early = false;
+        self.forget_transport_ask();
         self.audio.clear_yield();
     }
 
@@ -3702,8 +3713,7 @@ impl Daemon {
         self.resume_output_on_grant = false;
         self.seat.step_back(now);
         self.routing.release_audio();
-        self.transport_asked = false;
-        self.transport_asked_early = false;
+        self.forget_transport_ask();
         let players = self.audio.yield_playback();
         if !players.is_empty() {
             self.effects.pause_players = players;
@@ -3740,8 +3750,7 @@ impl Daemon {
                 self.reconnect_retries = 0;
                 self.seat.begin_reconnect(now);
                 self.output.handoff(self.config.accessory, self.last_graph.as_ref(), now.mono);
-                self.transport_asked = false;
-                self.transport_asked_early = false;
+                self.forget_transport_ask();
                 let players = self.audio.yield_playback();
                 if !players.is_empty() {
                     self.effects.pause_players = players;
@@ -3925,7 +3934,11 @@ impl Daemon {
         // The existing link lifecycle authorizes opening (including fleet
         // admission and the preferred connector). Audio shares that decision,
         // but need not wait for the separate control handshake to finish.
+        // Early audio also waits for the Bluetooth link: a profile connect
+        // that pages the pods alongside the control socket can collide with
+        // it and leave BlueZ busy for most of a minute (XPS, 2026-10-27).
         let opening = self.connection.stage().is_opening()
+            && self.connection.bluez() == Some(true)
             && self.link_asked == Some(self.connection.generation())
             && self.preferred_connection_allowed();
         if !self.output.wants_output() || (!ready && !opening) {
@@ -3956,7 +3969,11 @@ impl Daemon {
         // Local playback opens A2DP in parallel with an authorized control attempt.
         // A control-only link has no audio card until ConnectProfile succeeds;
         // waiting for a grant here can leave playback on the speakers forever.
-        if !transport_up && !self.transport_asked {
+        if transport_up {
+            self.transport_first_refused = None;
+            self.transport_retry_at = None;
+        }
+        if !transport_up && !self.transport_asked && self.transport_retry_at.is_none() {
             self.transport_asked = true;
             self.transport_asked_early = !ready;
             self.resume_output_on_grant = false;
@@ -3984,6 +4001,44 @@ impl Daemon {
             });
         }
         effects
+    }
+
+    fn forget_transport_ask(&mut self) {
+        self.transport_asked = false;
+        self.transport_asked_early = false;
+        self.transport_first_refused = None;
+        self.transport_retry_at = None;
+    }
+
+    /// A refused or unanswered audio profile request is asked again shortly,
+    /// within one window per claim, rather than waiting for the next play.
+    pub(crate) fn note_transport_reply(&mut self, reply: crate::step::TransportReply, now: MonoMs) {
+        if reply == crate::step::TransportReply::Connected {
+            self.transport_first_refused = None;
+            return;
+        }
+        if !self.transport_asked || !self.output.wants_output() {
+            return;
+        }
+        let first = *self.transport_first_refused.get_or_insert(now);
+        if now.saturating_since(first) >= TRANSPORT_RETRY_WINDOW_MS {
+            eprintln!(
+                "fleetpodsd: AirPods audio profile still unavailable ({reply:?}); not retrying"
+            );
+            return;
+        }
+        eprintln!(
+            "fleetpodsd: AirPods audio profile {reply:?}; asking again in {TRANSPORT_RETRY_MS} ms"
+        );
+        self.transport_retry_at = Some(now.saturating_add(TRANSPORT_RETRY_MS));
+    }
+
+    pub(crate) fn advance_transport_retry(&mut self, now: MonoMs) {
+        if self.transport_retry_at.is_some_and(|at| now >= at) {
+            self.transport_retry_at = None;
+            self.transport_asked = false;
+            self.transport_asked_early = false;
+        }
     }
 
     pub(crate) fn note_profile(&mut self, ok: bool, now: Clock) {
@@ -12182,7 +12237,10 @@ mod tests {
         assert!(daemon.pace_audio().is_empty());
         let start = daemon.step(Input::Tick, now);
         assert!(start.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-        assert!(start.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        // Audio waits for the link: paging the pods twice at once collides.
+        assert!(!start.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        let linked = daemon.step(Input::Bluez(true), now);
+        assert!(linked.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
         let generation = daemon.connection.generation();
         daemon.note_socket(true, generation, now.mono);
         for stage in [OpenStep::Handshake, OpenStep::Features, OpenStep::Notifications] {
@@ -12228,6 +12286,7 @@ mod tests {
         daemon.select_accessory(Some(addr(3)));
         daemon.claim_playback(now);
         daemon.step(Input::Tick, now);
+        daemon.step(Input::Bluez(true), now);
         assert!(daemon.transport_asked_early);
         daemon.last_graph = Some(Graph {
             default_sink: "pods".into(),
@@ -12248,5 +12307,40 @@ mod tests {
         assert_eq!(daemon.status_value(now)["audio_transport_active"], true);
         daemon.step(Input::Transport { active: false }, now);
         assert_eq!(daemon.status_value(now)["audio_transport_active"], false);
+    }
+    #[test]
+    fn a_busy_audio_profile_is_asked_again_until_the_window_closes() {
+        use crate::step::{Effect, Input, TransportReply};
+        let asks = |effects: &[Effect]| {
+            effects.iter().filter(|e| matches!(e, Effect::ConnectTransport { .. })).count()
+        };
+        let later = |now: Clock, ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let mut now = clock();
+        let mut daemon = Daemon::new("xps");
+        daemon.select_accessory(Some(addr(3)));
+        daemon.claim_playback(now);
+        daemon.step(Input::Tick, now);
+        assert_eq!(asks(&daemon.step(Input::Bluez(true), now).effects), 1);
+        let generation = daemon.connection.generation();
+        set_up_link(&mut daemon, generation, now);
+        assert_eq!(daemon.connection.stage(), Stage::Ready);
+        // A busy answer waits a beat, then asks once more.
+        daemon.step(Input::TransportReply(TransportReply::Busy), now);
+        assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 0);
+        now = later(now, TRANSPORT_RETRY_MS);
+        assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 1);
+        assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 0);
+        // So does a request that went unanswered.
+        daemon.step(Input::TransportReply(TransportReply::TimedOut), now);
+        now = later(now, TRANSPORT_RETRY_MS);
+        assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 1);
+        // Past the window the claim stops asking.
+        now = later(now, TRANSPORT_RETRY_WINDOW_MS);
+        daemon.step(Input::TransportReply(TransportReply::Busy), now);
+        now = later(now, TRANSPORT_RETRY_MS);
+        assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 0);
+        // A new play is a new claim with its own window.
+        daemon.claim_playback(now);
+        assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 1);
     }
 }

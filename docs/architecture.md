@@ -196,13 +196,22 @@ panel draws the Omarchy seat oldest left, newest right on every laptop.
 AACP control setup and A2DP audio are separate connections. A playback claim can
 open the missing audio profile alongside a control attempt that the existing
 link lifecycle has already authorized. `pace_audio` uses the current generation's
-`link_asked` marker, an opening stage, and the preferred-connector gate. Merely
-waiting for admission, background control setup without a playback claim, and
-canceled attempts cannot initiate early audio. Codec selection and disruptive
-output recovery still require a ready control link. If an early profile request
-fails, the existing one-shot request at control readiness remains available;
-there is no additional timer or retry loop. An already present audio profile is
-not reopened just because control setup completes.
+`link_asked` marker, an opening stage, the preferred-connector gate, and a
+connected Bluetooth link. It waits for the link because a profile connect that
+pages the pods alongside the control socket can collide with it: both fail as
+"Host is down", the profile call goes unanswered, and BlueZ then answers every
+later request "br-connection-busy" for most of a minute. Merely waiting for
+admission, background control setup without a playback claim, and canceled
+attempts cannot initiate early audio. Codec selection and disruptive output
+recovery still require a ready control link. If an early profile request fails,
+the request at control readiness remains available. An already present audio
+profile is not reopened just because control setup completes.
+
+The Linux edge reports each `ConnectProfile` answer, and a call that expires
+unanswered, as `TransportReply`. A busy, failed or unanswered request is asked
+again every two seconds while playback still wants the pods. The window opens
+at the first refusal and lasts 30 seconds; after that, the next play starts a
+new claim and a new window.
 
 When both buds are docked, Play returns the default and media streams to the
 laptop speakers immediately, including when the daemon has no active audio

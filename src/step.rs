@@ -149,6 +149,8 @@ pub enum Input {
     ProfileResult {
         ok: bool,
     },
+    /// How BlueZ answered the A2DP `ConnectProfile` a `ConnectTransport` sent.
+    TransportReply(TransportReply),
     Streams(Vec<StreamSnap>),
     /// The startup picture of MPRIS players. This does not claim.
     Players(Vec<PlayerSeen>),
@@ -162,6 +164,16 @@ pub enum Input {
 }
 
 /// Which pod a battery report belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportReply {
+    Connected,
+    /// `InProgress`: BlueZ is still busy with another connection.
+    Busy,
+    Failed,
+    /// No answer before the call expired.
+    TimedOut,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PodSlot {
     Left,
@@ -563,6 +575,10 @@ impl Daemon {
                 self.note_profile(ok, now);
                 None
             }
+            Input::TransportReply(reply) => {
+                self.note_transport_reply(reply, now.mono);
+                None
+            }
             Input::Streams(streams) => {
                 self.output.hold_streams(&streams);
                 None
@@ -882,6 +898,7 @@ impl Daemon {
 
     fn harvest(&mut self, now: Clock) -> Vec<Effect> {
         self.advance_rejoin(now);
+        self.advance_transport_retry(now.mono);
         self.reconnect_preferred(now);
         // A remote report that arrived just after our claim and was never
         // answered by a grant ends the claim now.

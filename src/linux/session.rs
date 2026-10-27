@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::panel::ipc::Command;
-use crate::step::{Effect, Input};
+use crate::step::{Effect, Input, TransportReply};
 use crate::types::{Address, Clock, Generation};
 use crate::Daemon;
 
@@ -1187,6 +1187,10 @@ fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
             eprintln!("fleetpodsd: Bluetooth discovery start timed out; retrying");
             live.air.scan_result(false, Instant::now());
         }
+        if matches!(call.kind, CallKind::Profile) {
+            eprintln!("fleetpodsd: AirPods audio profile request went unanswered");
+            let _ = reports.send(Input::TransportReply(TransportReply::TimedOut));
+        }
         if let CallKind::RestartDisconnect { id, .. } | CallKind::RestartConnect { id } = call.kind
         {
             let _ = reports.send(Input::OutputRestarted { id, ok: false });
@@ -1480,9 +1484,17 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                     CallResult::Failed { name, message } => format!("{name}: {message}"),
                 }
             );
-            if let Some(err) = failed {
+            if let Some(err) = &failed {
                 eprintln!("fleetpodsd: bluetooth call failed: {err}");
             }
+            let reply = match &result {
+                CallResult::Failed { name, .. } if name.ends_with("InProgress") => {
+                    TransportReply::Busy
+                }
+                _ if failed.is_some() => TransportReply::Failed,
+                _ => TransportReply::Connected,
+            };
+            let _ = reports.send(Input::TransportReply(reply));
         }
         CallKind::Remove => {
             if let Some(err) = failed {
