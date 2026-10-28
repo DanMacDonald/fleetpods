@@ -3674,12 +3674,14 @@ impl Daemon {
     fn claim_seat(&mut self, now: Clock) {
         self.seat.claim(now);
         self.apply_claim();
+        self.output.extend_takeover(now.mono);
     }
 
     /// Take the seat for an explicit user switch.
     fn claim_seat_user(&mut self, now: Clock) {
         self.seat.claim_user(now);
         self.apply_claim();
+        self.output.extend_takeover(now.mono);
     }
 
     fn apply_claim(&mut self) {
@@ -4015,6 +4017,7 @@ impl Daemon {
     pub(crate) fn note_transport_reply(&mut self, reply: crate::step::TransportReply, now: MonoMs) {
         if reply == crate::step::TransportReply::Connected {
             self.transport_first_refused = None;
+            self.output.extend_takeover(now);
             return;
         }
         if !self.transport_asked || !self.output.wants_output() {

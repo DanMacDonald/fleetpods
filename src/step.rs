@@ -658,6 +658,7 @@ impl Daemon {
             self.note_alongside(peer, now.unix);
         }
         self.link_ready_at = Some(now.mono);
+        self.output.extend_takeover(now.mono);
         self.claim_rejoin(now);
         // A play waiting for this link asked before anything the pods
         // reported during setup, so those reports cannot override it.

@@ -1653,6 +1653,15 @@ check('joining keeps the same remembered phone in its seat and caption',
 check('joining keeps the switch on the seat while retaining the audio caption',
   [combinedJoin.switching, combinedJoin.audioSubtitle], [true, 'Apple fleet · Phone · Playing'])
 check('fleet handoff between laptops says switching', combinedJoin.omarchyTransitionLabel, 'Switching…')
+// 2026-10-27 17:15: lg-gram connected on its own while the pods held the iPhone and the XPS. The pods kept the XPS,
+// but the seat showed "Switching…" and dropped the XPS until the gram's own roster arrived.
+{
+  const direct = { ...joiningFromFleet, fleet: { routing: { phase: 'idle', busy: false, peer: '', retain: '' } } }
+  const joining = Model.connectionPresentation(direct, sharedHistory, 2000)
+  check('a direct connect keeps the seated laptop while it joins', joining.snapshot?.seats.omarchy.map(p => p.label), ['laptop-a'])
+  const seat = Model.seatPresentation({ ...direct, daemonReachable: true, connectionPresentation: joining }, false, false)
+  check('a direct connect beside one laptop says connecting', seat.omarchyTransitionLabel, 'Connecting…')
+}
 const directAppleJoin = Model.seatPresentation({ ...Model.defaultStatus(), daemonReachable: true,
   localAddress: '02:00:00:00:00:03', localName: 'omarchy-xps',
   devices: { '02:00:00:00:00:01': { label: 'Mac', kind: 'apple' },

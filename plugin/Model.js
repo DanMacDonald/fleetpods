@@ -1131,8 +1131,10 @@ function connectionPresentation(status, previous, nowMs) {
         var address = normalizeAddress(device.address)
         return kept ? address === kept : address !== helper
       }
+      // A direct connect has no helper to leave: this laptop joins, and the pods' own list says who it displaced.
       provisional.seats = { apple: kept ? remembered.seats.apple.filter(stays) : remembered.seats.apple,
-        omarchy: helper || kept ? remembered.seats.omarchy.filter(stays) : [] }
+        omarchy: helper || kept ? remembered.seats.omarchy.filter(stays)
+          : directJoin(status) ? remembered.seats.omarchy : [] }
       provisional.localWaiting = true
     }
     return { waiting: !!provisional, startedMs: remembered.seenMs, remainingMs: provisional ? remaining : 0,
@@ -1255,6 +1257,12 @@ function bluetoothSetupPending(status) {
   return status.bluezConnected === true && (!control || !control.stage || controlOpening(control))
 }
 
+// This laptop connects on its own, with no fleet laptop admitting it or handing over its slot.
+function directJoin(status) {
+  var routing = status.fleet && status.fleet.routing
+  return !!routing && !routing.busy && routing.phase === "idle"
+}
+
 function fleetSeatView(status) {
   return status.connected || bluetoothSetupPending(status) || joinReleased(status) ? null : fleetRosterView(status)
 }
@@ -1348,10 +1356,11 @@ function seatPresentation(status, takingOmarchySeat, heldOmarchySeat) {
     || !!(previous && (previous.handover || previous.unconfirmed))
     || (!takingOmarchySeat && backgroundJoin(status)))
   var replacingOmarchy = givingSeat || !!(previous && previous.handover)
+    // A direct connect joins the Omarchy seat; it replaces a laptop there only when two already fill it.
     || !!(previous && previous.unconfirmed && connection.lastKnown
-      && connection.lastKnown.seats && connection.lastKnown.seats.omarchy.some(function (device) {
+      && connection.lastKnown.seats && connection.lastKnown.seats.omarchy.filter(function (device) {
         return normalizeAddress(device.address) !== normalizeAddress(status.localAddress)
-      }))
+      }).length >= (directJoin(status) ? 2 : 1))
     || !!(fleet && fleet.pending && fleet.seats.omarchy.length)
   // Another laptop gives up the seat, or this one asks a seated laptop for it. Either is drawn the same way, whichever
   // laptop is taking the seat: "Switching…" and no connector trace.

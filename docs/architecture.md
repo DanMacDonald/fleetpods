@@ -213,6 +213,12 @@ again every two seconds while playback still wants the pods. The window opens
 at the first refusal and lasts 30 seconds; after that, the next play starts a
 new claim and a new window.
 
+While a play waits for the pods, its speaker streams stay muted for up to 12
+seconds before they are given back to the speakers. Each step toward the pods
+restarts that hold: a new claim, a ready control link, a connected audio
+profile. A first connect that fails as "Host is down" therefore no longer runs
+out the hold just before the AirPods output appears.
+
 When both buds are docked, Play returns the default and media streams to the
 laptop speakers immediately, including when the daemon has no active audio
 claim. Activity may still open a background control connection. The deferred

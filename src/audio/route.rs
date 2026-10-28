@@ -355,6 +355,12 @@ impl Router {
     pub fn holding_takeover(&self) -> bool {
         self.state.holding_takeover()
     }
+    /// The pods are getting closer: restart a running takeover hold from now.
+    pub fn extend_takeover(&mut self, now: MonoMs) {
+        if let Some(started) = self.state.takeover_started.as_mut() {
+            *started = now;
+        }
+    }
     pub fn needs_graph(&self) -> bool {
         self.state.want
             || self.state.returning
@@ -560,6 +566,9 @@ const HANDOFF_MUTE_MS: u64 = 1_000;
 const RETRY_MS: u64 = 1_000;
 /// How long speaker playback stays muted waiting for the pods. A play that
 /// first needs fleet admission and a new link took 6-8 s on 2026-10-19.
+/// Each step toward the pods restarts it: a new claim, a ready control link,
+/// a connected audio profile. On 2026-10-27 the gram's first connect failed,
+/// and the sink arrived 60 ms after a hold counted from the first play.
 const TAKEOVER_HOLD_MS: u64 = 12_000;
 
 /// Hold speaker playback while ownership or the AirPods output is still pending.
@@ -1237,6 +1246,32 @@ mod tests {
             let again = plan(released.state, Some(pods), &picture, MonoMs(TAKEOVER_HOLD_MS + 100));
             assert!(again.quiet.is_empty());
         }
+    }
+
+    #[test]
+    fn a_step_toward_the_pods_restarts_the_takeover_hold() {
+        let pods = address();
+        let mut picture = graph(
+            "speakers",
+            vec![sink("speakers", None, None)],
+            vec![stream(1, 8, "speakers", "", false)],
+        );
+        let mut router = Router::new();
+        router.claim();
+        router.on_graph(Some(pods), &picture, false, MonoMs(0));
+        picture.streams[0].mute = true;
+        // The control link came up 8 s in; the sink lands 60 ms past the first deadline.
+        router.extend_takeover(MonoMs(8_000));
+        let waiting = router.on_graph(Some(pods), &picture, false, MonoMs(TAKEOVER_HOLD_MS + 60));
+        assert!(waiting.failure.is_none());
+        assert!(router.wants_output());
+        assert!(router.holding_takeover());
+        let timed_out =
+            router.on_graph(Some(pods), &picture, false, MonoMs(8_000 + TAKEOVER_HOLD_MS));
+        assert_eq!(timed_out.failure, Some("audio takeover timed out"));
+        // Nothing to restart once the hold has ended.
+        router.extend_takeover(MonoMs(30_000));
+        assert!(!router.holding_takeover());
     }
 
     #[test]
