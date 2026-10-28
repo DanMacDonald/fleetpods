@@ -815,10 +815,10 @@ struct Live {
     adapter_path: Option<String>,
     /// A service interruption is in progress. Do not open the control socket until the daemon asks.
     defer_attach: bool,
-    /// bluetoothd itself is gone (it crashed or is restarting), so the
-    /// device list is empty because the inventory vanished, not because
-    /// any pairing was removed.
-    bluez_lost: bool,
+    /// bluetoothd lost its inventory. Its bus name can return before the
+    /// selected device, so absence is not unpairing until that device has
+    /// been reported again (or explicitly removed).
+    restoring_bluez: bool,
     // Link state is split on purpose across the thread seam: this
     // watcher owns the D-Bus connection and the socket fds, while the
     // daemon owns link stage and policy. The generation originates in
@@ -847,7 +847,7 @@ impl Default for Live {
             calls: Vec::new(),
             adapter_path: None,
             defer_attach: false,
-            bluez_lost: false,
+            restoring_bluez: false,
             air: Air::default(),
         }
     }
@@ -1213,8 +1213,7 @@ fn on_notice(
     match notice {
         Notice::Reply { serial, result } => on_reply(bus, reports, live, serial, result),
         Notice::Removed(path) => {
-            live.devices.retain(|device| device.path != path);
-            sync(reports, configured, live);
+            device_removed(reports, configured, live, &path);
         }
         Notice::Upsert { mut device, fleet, apple } => {
             observe_pairing(bus, live, apple.as_deref());
@@ -1246,7 +1245,7 @@ fn on_notice(
         }
         Notice::Name { present: false } => {
             // These registrations belong to the old bluetoothd instance.
-            live.bluez_lost = true;
+            live.restoring_bluez = true;
             live.air.scan_result(false, Instant::now());
             live.air.registered = false;
             live.air.scan_transport = None;
@@ -1265,12 +1264,7 @@ fn on_notice(
             note_connected(live, reports, false);
         }
         Notice::Name { present: true } => {
-            live.bluez_lost = false;
-            if let Ok(inventory) = bus.inventory() {
-                remember_inventory(reports, configured, live, inventory);
-                sync(reports, configured, live);
-            }
-            let _ = reports.send(Input::BluezBack);
+            bluez_returned(reports, configured, live, bus.inventory().ok());
         }
         Notice::Sleep(sleeping) => report_sleep(reports, live, sleeping),
         Notice::AdapterPower { path, up } => {
@@ -1524,6 +1518,35 @@ fn on_socket(reports: &Sender<Input>, live: &mut Live) {
     let _ = read_socket(live, reports);
 }
 
+fn bluez_returned(
+    reports: &Sender<Input>,
+    configured: Option<Address>,
+    live: &mut Live,
+    inventory: Option<bluez::Inventory>,
+) {
+    // Do not end restoration merely because GetManagedObjects succeeds.
+    // BlueZ may still be loading the saved adapter and device objects.
+    if let Some(inventory) = inventory {
+        remember_inventory(reports, configured, live, inventory);
+        sync(reports, configured, live);
+    }
+    let _ = reports.send(Input::BluezBack);
+}
+
+fn device_removed(
+    reports: &Sender<Input>,
+    configured: Option<Address>,
+    live: &mut Live,
+    path: &str,
+) {
+    if live.accessory.and_then(|address| live.paths.get(&address)).map(String::as_str) == Some(path)
+    {
+        live.restoring_bluez = false;
+    }
+    live.devices.retain(|device| device.path != path);
+    sync(reports, configured, live);
+}
+
 fn remember_inventory(
     reports: &Sender<Input>,
     configured: Option<Address>,
@@ -1556,11 +1579,16 @@ fn remember_inventory(
 }
 
 fn sync(reports: &Sender<Input>, configured: Option<Address>, live: &mut Live) {
+    if live.accessory.is_some_and(|address| live.devices.iter().any(|d| d.address == address)) {
+        // The device is known again. Its Paired/Bonded values, including an
+        // explicit loss of both, are authoritative even during restoration.
+        live.restoring_bluez = false;
+    }
     let Some(device) = bluez::select(&live.devices, configured).cloned() else {
-        // While bluetoothd is down its whole inventory is gone; an absent
-        // accessory then says nothing about pairing. Keep the selection
-        // and let the fresh inventory on its return judge instead.
-        if live.bluez_lost {
+        // Preserve pairing through the outage and the partial inventories
+        // emitted during startup. Unrelated adapter/device notices cannot
+        // decide whether this accessory is still paired.
+        if live.restoring_bluez {
             note_connected(live, reports, false);
             return;
         }
@@ -1575,6 +1603,7 @@ fn sync(reports: &Sender<Input>, configured: Option<Address>, live: &mut Live) {
         note_connected(live, reports, false);
         return;
     };
+    live.restoring_bluez = false;
     if let Some(adapter) = device.adapter {
         note_device(live, reports, adapter, &device);
     } else {
@@ -2670,7 +2699,7 @@ mod advertisement_tests {
         assert_eq!(live.accessory, Some(address));
         let _ = rx.try_iter().count();
         // bluetoothd goes away and takes its inventory with it.
-        live.bluez_lost = true;
+        live.restoring_bluez = true;
         live.devices.clear();
         sync(&tx, Some(address), &mut live);
         sync(&tx, Some(address), &mut live);
@@ -2679,16 +2708,161 @@ mod advertisement_tests {
             "an outage must not read as a removed pairing"
         );
         assert_eq!(live.accessory, Some(address), "the selection survives the outage");
-        // It returns without the accessory: now the absence is real.
-        live.bluez_lost = false;
-        sync(&tx, Some(address), &mut live);
-        assert_eq!(
-            rx.try_iter()
-                .filter(|input| matches!(input, Input::Unpaired { address: a } if *a == address))
-                .count(),
-            1
+        // Owning the bus name again is not the end of startup: BlueZ may
+        // publish an empty inventory, then the adapter, then its devices.
+        bluez_returned(
+            &tx,
+            Some(address),
+            &mut live,
+            Some(bluez::Inventory {
+                adapters: HashMap::new(),
+                devices: Vec::new(),
+                transports: HashMap::new(),
+            }),
         );
+        sync(&tx, Some(address), &mut live);
+        assert!(
+            !rx.try_iter().any(|input| matches!(input, Input::Unpaired { .. })),
+            "an incomplete startup inventory is not an unpair"
+        );
+        assert_eq!(live.accessory, Some(address));
+        // An explicit removal still wins while startup is incomplete.
+        device_removed(&tx, Some(address), &mut live, "/org/bluez/hci0/dev_CC_22_FE_54_DF_C7");
+        assert!(rx
+            .try_iter()
+            .any(|input| matches!(input, Input::Unpaired { address: a } if a == address)));
         assert!(live.accessory.is_none());
+    }
+
+    // 2026-10-28 07:36:16: BlueZ crashed five seconds into Brave playback
+    // on the XPS speakers. Its empty startup inventory caused an Unpaired
+    // event, and the daemon paused Brave even though the pods were in the case.
+    #[test]
+    fn bluetooth_restart_preserves_speaker_playback_while_the_pods_are_unreachable() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+
+        for closed_case_reported in [false, true] {
+            let address = Address::parse("CC:22:FE:54:DF:C7").unwrap();
+            let adapter = Address::parse("A8:72:4D:0C:7C:EE").unwrap();
+            let device = Device {
+                path: "/org/bluez/hci0/dev_CC_22_FE_54_DF_C7".into(),
+                adapter_path: "/org/bluez/hci0".into(),
+                adapter: Some(adapter),
+                address,
+                name: "AirPods".into(),
+                rssi: None,
+                paired: true,
+                bonded: true,
+                connected: false,
+                control: true,
+            };
+            let mut live = Live::default();
+            live.devices.push(device.clone());
+            let (tx, rx) = mpsc::channel();
+            let mut daemon = Daemon::new("xps");
+            let mut now = Clock::new(1_000, 1_000);
+            let mut deliver = |input| {
+                now.mono.0 += 1;
+                now.unix.0 += 1;
+                let outcome = daemon.step(input, now);
+                assert!(
+                    !outcome.effects.iter().any(|effect| matches!(
+                        effect,
+                        Effect::PausePlayers(_)
+                            | Effect::ResumePlayers(_)
+                            | Effect::MuteStreams(_)
+                            | Effect::MoveStreams(_)
+                            | Effect::SetDefaultSink { .. }
+                    )),
+                    "Bluetooth recovery must leave speaker playback alone: {:?}",
+                    outcome.effects
+                );
+            };
+            sync(&tx, Some(address), &mut live);
+            for input in rx.try_iter() {
+                deliver(input);
+            }
+            if closed_case_reported {
+                deliver(Input::Lid { open: false });
+            }
+            deliver(Input::Players(vec![PlayerSeen {
+                service: "org.mpris.MediaPlayer2.brave".into(),
+                playing: false,
+            }]));
+            deliver(Input::Audio(Graph {
+                default_sink: "speakers".into(),
+                sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 1,
+                    sink: "speakers".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            }));
+            deliver(Input::Player {
+                service: "org.mpris.MediaPlayer2.brave".into(),
+                playing: Some(true),
+            });
+            live.restoring_bluez = true;
+            live.devices.clear();
+            deliver(Input::BluezLost);
+            sync(&tx, Some(address), &mut live);
+            for input in rx.try_iter() {
+                deliver(input);
+            }
+            // A failed inventory read, an empty snapshot, and an adapter-only
+            // snapshot can all precede the saved device's InterfacesAdded.
+            for inventory in [
+                None,
+                Some(bluez::Inventory {
+                    adapters: HashMap::new(),
+                    devices: Vec::new(),
+                    transports: HashMap::new(),
+                }),
+                Some(bluez::Inventory {
+                    adapters: HashMap::from([("/org/bluez/hci0".into(), adapter)]),
+                    devices: Vec::new(),
+                    transports: HashMap::new(),
+                }),
+            ] {
+                bluez_returned(&tx, Some(address), &mut live, inventory);
+                sync(&tx, Some(address), &mut live);
+                for input in rx.try_iter() {
+                    deliver(input);
+                }
+                deliver(Input::Tick);
+                assert_eq!(live.accessory, Some(address));
+            }
+            device_removed(&tx, Some(address), &mut live, "/org/bluez/hci0/dev_00_00_00_00_00_01");
+            for input in rx.try_iter() {
+                deliver(input);
+            }
+            assert!(live.restoring_bluez, "an unrelated removal cannot end restoration");
+            // Restoration ends on a real device report; no second Play is needed.
+            live.devices.push(device);
+            sync(&tx, Some(address), &mut live);
+            for input in rx.try_iter() {
+                deliver(input);
+            }
+            deliver(Input::Tick);
+            assert!(!live.restoring_bluez);
+            assert_eq!(daemon.status_value(now)["bluetooth_paired"], true);
+            assert_eq!(daemon.status_value(now)["native_handoff"]["playing"], true);
+
+            // Losing the bond after restoration is still a real unpair.
+            live.devices[0].paired = false;
+            live.devices[0].bonded = false;
+            sync(&tx, Some(address), &mut live);
+            assert!(rx
+                .try_iter()
+                .any(|input| matches!(input, Input::Unpaired { address: a } if a == address)));
+        }
     }
 
     #[test]
