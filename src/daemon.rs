@@ -3363,9 +3363,7 @@ impl Daemon {
     /// The remembered host alone reacts to availability. A sleeping owner is
     /// never timed out in favor of a less recently used laptop.
     pub(crate) fn reconnect_preferred(&mut self, now: Clock) {
-        let available = !self.accessory.stowed()
-            && (self.accessory.lid.latest.as_fresh() == Some(&LidState::Open)
-                || self.accessory.playback_available(now.mono));
+        let available = self.pods_available(now.mono);
         self.activity_preference.observe_availability(available, now.mono);
         if self.connection.stage() != Stage::Ready
             && !self.preferred_connection_allowed()
@@ -3386,7 +3384,8 @@ impl Daemon {
             if self.output.wants_output() {
                 // A superseded pending connection must not leave speaker
                 // playback muted while waiting for a link it cannot open.
-                self.seat.step_back(now);
+                // Release restores the route and does not pause players.
+                let _ = self.yield_seat(now);
                 self.routing.release_audio();
                 self.resume_output_on_grant = false;
                 self.output.release();
@@ -3409,10 +3408,28 @@ impl Daemon {
         let (Some(record), Some(local)) = (self.preferred_connector(), self.local_address) else {
             return;
         };
-        if self.activity_preference.take_wake(record, local, now.mono) {
+        // Commit the one wake only when this same evidence will open.
+        // A fresh Pod placement can make the pods available while the
+        // battery slots are still empty; that open has to proceed.
+        if self.wake_can_open(now) && self.activity_preference.take_wake(record, local, now.mono) {
             self.connection.prepare();
-            self.open_background_connection(now);
+            self.background_requested = true;
+            self.begin_background_open(now);
         }
+    }
+
+    fn pods_available(&self, now: MonoMs) -> bool {
+        !self.accessory.stowed()
+            && (self.accessory.lid.latest.as_fresh() == Some(&LidState::Open)
+                || self.accessory.playback_available(now))
+    }
+
+    fn wake_can_open(&mut self, now: Clock) -> bool {
+        self.preferred_connection_allowed()
+            && self.config.accessory.is_some()
+            && !self.radio_quiet()
+            && !self.hold_pairing_connection(now.mono)
+            && self.pods_available(now.mono)
     }
 
     fn activity(&mut self, now: Clock) -> Response {
@@ -3516,11 +3533,15 @@ impl Daemon {
                 || out(&self.accessory.left)
                 || out(&self.accessory.right));
         if self.background_requested {
-            self.routing.clear_failure();
-            self.displaced = false;
-            self.open_connection(now.mono);
-            eprintln!("fleetpodsd: activity opening the background control connection");
+            self.begin_background_open(now);
         }
+    }
+
+    fn begin_background_open(&mut self, now: Clock) {
+        self.routing.clear_failure();
+        self.displaced = false;
+        self.open_connection(now.mono);
+        eprintln!("fleetpodsd: activity opening the background control connection");
     }
 
     /// Keep fresh input through the peer's pause debounce, never through a later session.
@@ -3713,14 +3734,21 @@ impl Daemon {
         self.background_requested = false;
         self.deferred_playback_claim = None;
         self.resume_output_on_grant = false;
-        self.seat.step_back(now);
+        let players = self.yield_seat(now);
         self.routing.release_audio();
         self.forget_transport_ask();
-        let players = self.audio.yield_playback();
         if !players.is_empty() {
             self.effects.pause_players = players;
         }
         self.replan(now);
+    }
+
+    /// The seat yield and the audio yield move together.
+    /// A Handoff pauses the returned players. A return to the speakers and a
+    /// preference release do not.
+    fn yield_seat(&mut self, now: Clock) -> Vec<String> {
+        self.seat.step_back(now);
+        self.audio.yield_playback()
     }
 
     pub(crate) fn seat_audio_failure(&mut self, reason: &'static str, now: Clock) {
@@ -4239,7 +4267,7 @@ impl Daemon {
     /// claim still takes the pods back once a bud comes out.
     fn return_to_speakers(&mut self, now: Clock) {
         eprintln!("fleetpodsd: both pods are in the case; playing on the speakers");
-        self.seat.step_back(now);
+        let _ = self.yield_seat(now);
         self.routing.release_audio();
         self.resume_output_on_grant = false;
         self.output.return_to_speakers();
@@ -6263,6 +6291,77 @@ mod tests {
         let generation = daemon.connection().generation();
         daemon.attach_available(generation, now.mono.saturating_add(1_000));
         assert!(!daemon.background_requested, "unknown preference must not cause a race");
+    }
+
+    #[test]
+    fn a_fresh_placement_opens_without_spending_the_wake_on_a_refusal() {
+        use crate::fleet::members::Fleet;
+        use crate::step::Effect;
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        let local = addr(1);
+        let peer = addr(2);
+        daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: local, label: "lg-gram".into() },
+                Member { address: peer, label: "omarchy-xps".into() },
+            ],
+        });
+        daemon.select_accessory(Some(addr(3)));
+        daemon.note_bluez(true);
+        daemon.activity_preference.note_local([3; 16], addr(3), local, now.unix);
+        // Public placement says a bud is out. The battery slots are still empty.
+        daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
+        assert!(daemon.accessory.left.is_unknown());
+        let seen = daemon.step(crate::step::Input::Tick, now);
+        assert!(seen.effects.iter().all(|effect| !matches!(effect, Effect::OpenLink { .. })));
+        let settled = Clock::new(now.mono.0 + 2_000, now.unix.0 + 2_000);
+        let opened = daemon.step(crate::step::Input::Tick, settled);
+        assert!(
+            opened.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })),
+            "availability evidence opens, and the wake commits because the open proceeds"
+        );
+        assert!(daemon.background_requested);
+    }
+
+    #[test]
+    fn preference_loss_yields_the_seat_and_the_audio_together() {
+        use crate::fleet::members::Fleet;
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        let local = addr(1);
+        let peer = addr(2);
+        daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: local, label: "lg-gram".into() },
+                Member { address: peer, label: "omarchy-xps".into() },
+            ],
+        });
+        daemon.select_accessory(Some(addr(3)));
+        daemon.note_bluez(true);
+        daemon.activity_preference.note_local([3; 16], addr(3), peer, now.unix);
+        // A playing player, without the Play input that would make this machine preferred.
+        daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(true));
+        daemon.output.claim();
+        daemon.reconnect_preferred(now);
+        assert!(daemon.seat.yielded());
+        assert!(daemon.audio.yielded());
+        assert!(daemon.effects.pause_players.is_empty(), "a preference release does not pause");
+        assert!(!daemon.output.wants_output());
+
+        let mut speakers = Daemon::new("gram");
+        speakers.output.claim();
+        speakers.return_to_speakers(now);
+        assert!(speakers.seat.yielded());
+        assert!(speakers.audio.yielded());
+        assert!(speakers.effects.pause_players.is_empty());
+        assert!(!speakers.output.wants_output());
     }
 
     #[test]
@@ -11871,8 +11970,10 @@ mod tests {
                     Member { address: addr(2), label: "xps".into() },
                 ],
             });
+            // Both buds in the wells. In-ear placement is already available, so
+            // the preferred host would open while the case is still closed.
             for right in [false, true] {
-                daemon.accessory.note_placement(right, Some(true), Some(false), now.mono);
+                daemon.accessory.note_placement(right, Some(false), Some(true), now.mono);
             }
             daemon.step(Input::Lid { open: false }, now);
             daemon

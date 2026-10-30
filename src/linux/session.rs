@@ -578,13 +578,23 @@ enum SecretJob {
 enum CallKind {
     StartDiscovery,
     StopDiscovery,
-    Disconnect { address: Address, generation: Generation },
+    Disconnect {
+        address: Address,
+        generation: Generation,
+    },
     Profile,
     Advertise,
     Unadvertise,
     Remove,
-    RestartDisconnect { id: u64, address: Address },
-    RestartConnect { id: u64 },
+    RestartDisconnect {
+        id: u64,
+        address: Address,
+    },
+    RestartConnect {
+        id: u64,
+    },
+    /// Our own write of Adapter1 `Powered`. The value is the one we asked for.
+    Power(bool),
 }
 
 struct PendingCall {
@@ -702,15 +712,7 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         sync(&reports, configured, &mut live);
     }
     loop {
-        let retry_scan = live.air.want_scan && !live.air.scanned;
-        let timeout = if !live.calls.is_empty() || retry_scan {
-            1_000
-        } else if live.air.want_scan {
-            // A running scan is rechecked; see verify_scan.
-            SCAN_CHECK.as_millis() as i32
-        } else {
-            -1
-        };
+        let timeout = poll_timeout(&live);
         let polled_socket = live.link.identity();
         let (dbus_ready, socket_ready) = wait(&wake, &bus, &live.link, timeout);
         expire_calls(&bus, &reports, &mut live);
@@ -790,6 +792,7 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         } else if socket_ready {
             eprintln!("fleetpodsd: discarded readiness for a replaced control socket");
         }
+        service_controller_reset(&bus, &reports, &mut live);
         if live.air.want_scan {
             verify_scan(&bus, &mut live);
             ensure_scan(&bus, &mut live);
@@ -819,6 +822,9 @@ struct Live {
     /// selected device, so absence is not unpairing until that device has
     /// been reported again (or explicitly removed).
     restoring_bluez: bool,
+    /// `BluezBack` waits until the post-restart power cycle finishes, so the
+    /// daemon does not reconnect into a controller that is about to go down.
+    bluez_back_pending: bool,
     // Link state is split on purpose across the thread seam: this
     // watcher owns the D-Bus connection and the socket fds, while the
     // daemon owns link stage and policy. The generation originates in
@@ -848,6 +854,7 @@ impl Default for Live {
             adapter_path: None,
             defer_attach: false,
             restoring_bluez: false,
+            bluez_back_pending: false,
             air: Air::default(),
         }
     }
@@ -855,6 +862,24 @@ impl Default for Live {
 
 /// How often a scan believed to be running is confirmed with BlueZ.
 const SCAN_CHECK: Duration = Duration::from_secs(30);
+/// Pause between attempts to power the controller off or back on.
+const RESET_RETRY: Duration = Duration::from_secs(2);
+/// Give up turning the adapter off after this many failed writes. Turning it
+/// back on is not capped: a failed "on" would otherwise leave the radio down.
+const RESET_OFF_LIMIT: u8 = 3;
+
+/// One power cycle after bluetoothd returns. `Discovering` can stay true
+/// across that restart while the controller delivers no AirPods advertisements.
+/// Cycling `Powered` is what makes those advertisements arrive again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ControllerReset {
+    #[default]
+    Idle,
+    /// Ask BlueZ to set `Powered` false, once `at` has passed.
+    Off { at: Instant },
+    /// Ask BlueZ to set `Powered` true. Do not turn it off again.
+    On { at: Instant },
+}
 
 #[derive(Default)]
 struct Air {
@@ -872,6 +897,8 @@ struct Air {
     pairing_until: Option<Instant>,
     pairing_prepare_at: Option<Instant>,
     scan_transport: Option<&'static str>,
+    reset: ControllerReset,
+    reset_off_failures: u8,
 }
 
 impl Air {
@@ -913,6 +940,101 @@ impl Air {
     fn scan_due(&self, now: Instant) -> bool {
         !self.scanned && !self.pairing_paused(now) && self.scan_retry_at.is_none_or(|at| now >= at)
     }
+
+    /// bluetoothd has a new owner. A cycle already in flight is the one for
+    /// this return; a second signal must not start another.
+    fn arm_controller_reset(&mut self, now: Instant) {
+        if self.reset_blocks_scan() {
+            return;
+        }
+        self.reset = ControllerReset::Off { at: now };
+        self.reset_off_failures = 0;
+    }
+
+    fn cancel_controller_reset(&mut self) {
+        self.reset = ControllerReset::Idle;
+        self.reset_off_failures = 0;
+    }
+
+    fn reset_blocks_scan(&self) -> bool {
+        !matches!(self.reset, ControllerReset::Idle)
+    }
+
+    fn reset_deadline(&self) -> Option<Instant> {
+        match self.reset {
+            ControllerReset::Off { at } | ControllerReset::On { at } => Some(at),
+            ControllerReset::Idle => None,
+        }
+    }
+
+    fn delay_reset(&mut self, at: Instant) {
+        self.reset = match self.reset {
+            ControllerReset::Off { .. } => ControllerReset::Off { at },
+            ControllerReset::On { .. } => ControllerReset::On { at },
+            ControllerReset::Idle => ControllerReset::Idle,
+        };
+    }
+
+    /// The next `Powered` value to write, when its wait has elapsed.
+    fn power_request(&self, now: Instant) -> Option<bool> {
+        match self.reset {
+            ControllerReset::Off { at } if now >= at => Some(false),
+            ControllerReset::On { at } if now >= at => Some(true),
+            _ => None,
+        }
+    }
+
+    /// `up` is the value just requested. The adapter's own Powered signal does
+    /// not come through here: that signal is how the cycle looks from outside,
+    /// and treating it as a new return would cycle forever.
+    fn note_power_reply(&mut self, up: bool, ok: bool, now: Instant) {
+        if ok && !up {
+            self.reset_off_failures = 0;
+            self.reset = ControllerReset::On { at: now };
+            return;
+        }
+        if ok && up {
+            self.reset = ControllerReset::Idle;
+            self.reset_off_failures = 0;
+            // The power-down signal scheduled a scan retry. Discovery should
+            // start now, on the controller that just came back.
+            if self.want_scan {
+                self.scanned = false;
+                self.scan_retry_at = None;
+            }
+            return;
+        }
+        if up {
+            self.reset = ControllerReset::On { at: now + RESET_RETRY };
+            return;
+        }
+        self.reset_off_failures = self.reset_off_failures.saturating_add(1);
+        if self.reset_off_failures >= RESET_OFF_LIMIT {
+            self.reset = ControllerReset::Idle;
+            self.reset_off_failures = 0;
+            return;
+        }
+        self.reset = ControllerReset::Off { at: now + RESET_RETRY };
+    }
+}
+
+fn poll_timeout(live: &Live) -> i32 {
+    let now = Instant::now();
+    let mut timeout = (!live.calls.is_empty()).then_some(1_000);
+    if live.air.want_scan && !live.air.reset_blocks_scan() {
+        // A running scan is rechecked; see verify_scan. A scan that needs
+        // a new session is retried on the one-second poll.
+        let scan = if live.air.scanned { SCAN_CHECK.as_millis() as i32 } else { 1_000 };
+        timeout = Some(timeout.map_or(scan, |current| current.min(scan)));
+    }
+    let power_in_flight = live.calls.iter().any(|call| matches!(call.kind, CallKind::Power(_)));
+    if !power_in_flight {
+        if let Some(at) = live.air.reset_deadline() {
+            let wait = at.saturating_duration_since(now).as_millis().min(60_000) as i32;
+            timeout = Some(timeout.map_or(wait, |current| current.min(wait)));
+        }
+    }
+    timeout.unwrap_or(-1)
 }
 
 fn wait(wake: &Wake, bus: &Bus, link: &ControlLink, timeout_ms: i32) -> (bool, bool) {
@@ -1187,6 +1309,10 @@ fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
             eprintln!("fleetpodsd: Bluetooth discovery start timed out; retrying");
             live.air.scan_result(false, Instant::now());
         }
+        if let CallKind::Power(up) = call.kind {
+            eprintln!("fleetpodsd: adapter power set timed out");
+            settle_controller_reset(reports, live, up, false);
+        }
         if matches!(call.kind, CallKind::Profile) {
             eprintln!("fleetpodsd: AirPods audio profile request went unanswered");
             let _ = reports.send(Input::TransportReply(TransportReply::TimedOut));
@@ -1243,41 +1369,18 @@ fn on_notice(
             }
             sync(reports, configured, live);
         }
-        Notice::Name { present: false } => {
-            // These registrations belong to the old bluetoothd instance.
-            live.restoring_bluez = true;
-            live.air.scan_result(false, Instant::now());
-            live.air.registered = false;
-            live.air.scan_transport = None;
-            live.calls.retain(|call| {
-                !matches!(
-                    call.kind,
-                    CallKind::StartDiscovery
-                        | CallKind::StopDiscovery
-                        | CallKind::Advertise
-                        | CallKind::Unadvertise
-                )
-            });
-            live.defer_attach = true;
-            live.devices.clear();
-            let _ = reports.send(Input::BluezLost);
-            note_connected(live, reports, false);
-        }
+        Notice::Name { present: false } => note_bluez_left(reports, live),
         Notice::Name { present: true } => {
+            // A direct owner replacement does not deliver a separate "gone"
+            // signal. One cycle covers that return; a cycle already in
+            // flight is that same return.
+            if !live.air.reset_blocks_scan() {
+                begin_controller_cycle(live);
+            }
             bluez_returned(reports, configured, live, bus.inventory().ok());
         }
         Notice::Sleep(sleeping) => report_sleep(reports, live, sleeping),
-        Notice::AdapterPower { path, up } => {
-            let ours = live.adapter_path.as_deref() == Some(path.as_str());
-            if ours {
-                if !up {
-                    live.air.scan_result(false, Instant::now());
-                    live.defer_attach = true;
-                    close_control(live, reports);
-                }
-                let _ = reports.send(Input::AdapterPower(up));
-            }
-        }
+        Notice::AdapterPower { path, up } => report_adapter_power(reports, live, &path, up),
         Notice::DiscoveryStopped(path) => {
             if live.adapter_path.as_deref() == Some(path.as_str()) {
                 if live.air.want_scan {
@@ -1495,6 +1598,13 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 eprintln!("fleetpodsd: bluetooth call failed: {err}");
             }
         }
+        CallKind::Power(up) => {
+            let ok = matches!(result, CallResult::Done);
+            if let CallResult::Failed { name, message } = &result {
+                eprintln!("fleetpodsd: adapter power set failed: {name}: {message}");
+            }
+            settle_controller_reset(reports, live, up, ok);
+        }
     }
 }
 
@@ -1518,6 +1628,49 @@ fn on_socket(reports: &Sender<Input>, live: &mut Live) {
     let _ = read_socket(live, reports);
 }
 
+fn note_bluez_left(reports: &Sender<Input>, live: &mut Live) {
+    // These registrations belong to the old bluetoothd instance.
+    live.restoring_bluez = true;
+    live.bluez_back_pending = false;
+    live.air.cancel_controller_reset();
+    live.air.scan_result(false, Instant::now());
+    live.air.registered = false;
+    live.air.scan_transport = None;
+    drop_restarted_calls(live);
+    live.defer_attach = true;
+    live.devices.clear();
+    let _ = reports.send(Input::BluezLost);
+    note_connected(live, reports, false);
+}
+
+fn begin_controller_cycle(live: &mut Live) {
+    drop_restarted_calls(live);
+    live.air.registered = false;
+    live.air.scan_transport = None;
+    live.air.scan_result(false, Instant::now());
+    live.air.arm_controller_reset(Instant::now());
+    live.bluez_back_pending = true;
+    eprintln!("fleetpodsd: bluetoothd returned; power-cycling the adapter");
+}
+
+/// A Powered change on our controller. While a cycle is in progress the
+/// signal is that cycle, so the daemon stays in the bluetoothd-lost
+/// interrupt until [`settle_controller_reset`] sends one `BluezBack`.
+fn report_adapter_power(reports: &Sender<Input>, live: &mut Live, path: &str, up: bool) {
+    if live.adapter_path.as_deref() != Some(path) {
+        return;
+    }
+    if !up {
+        live.air.scan_result(false, Instant::now());
+        live.defer_attach = true;
+        close_control(live, reports);
+    }
+    if live.air.reset_blocks_scan() {
+        return;
+    }
+    let _ = reports.send(Input::AdapterPower(up));
+}
+
 fn bluez_returned(
     reports: &Sender<Input>,
     configured: Option<Address>,
@@ -1530,7 +1683,89 @@ fn bluez_returned(
         remember_inventory(reports, configured, live, inventory);
         sync(reports, configured, live);
     }
+    if live.bluez_back_pending {
+        return;
+    }
     let _ = reports.send(Input::BluezBack);
+}
+
+fn drop_restarted_calls(live: &mut Live) {
+    live.calls.retain(|call| {
+        !matches!(
+            call.kind,
+            CallKind::StartDiscovery
+                | CallKind::StopDiscovery
+                | CallKind::Advertise
+                | CallKind::Unadvertise
+                | CallKind::Power(_)
+        )
+    });
+}
+
+fn settle_controller_reset(reports: &Sender<Input>, live: &mut Live, up: bool, ok: bool) {
+    live.air.note_power_reply(up, ok, Instant::now());
+    if ok && up {
+        eprintln!("fleetpodsd: adapter power cycle finished");
+    } else if !ok && !live.air.reset_blocks_scan() {
+        eprintln!("fleetpodsd: adapter power cycle failed; leaving the controller as it is");
+    } else if !ok {
+        eprintln!("fleetpodsd: adapter power change failed; retrying");
+    }
+    if live.bluez_back_pending && !live.air.reset_blocks_scan() {
+        live.bluez_back_pending = false;
+        let _ = reports.send(Input::BluezBack);
+    }
+}
+
+fn service_controller_reset(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
+    let now = Instant::now();
+    let Some(up) = live.air.power_request(now) else {
+        return;
+    };
+    if live.calls.iter().any(|call| matches!(call.kind, CallKind::Power(_))) {
+        return;
+    }
+    // bluetoothd can publish its bus name before the adapter object exists.
+    // Waiting must not use up the failed-write budget.
+    if live.adapter_path.is_none() {
+        live.air.delay_reset(now + RESET_RETRY);
+        return;
+    }
+    if !set_powered(bus, live, up) {
+        settle_controller_reset(reports, live, up, false);
+    }
+}
+
+fn set_powered(bus: &Bus, live: &mut Live, up: bool) -> bool {
+    let Some(path) = live.adapter_path.clone() else {
+        return false;
+    };
+    if live.calls.iter().any(|call| matches!(call.kind, CallKind::Power(_))) {
+        return false;
+    }
+    let Ok(message) = dbus::Message::new_method_call(
+        "org.bluez",
+        &path,
+        "org.freedesktop.DBus.Properties",
+        "Set",
+    ) else {
+        return false;
+    };
+    let message = message.append3("org.bluez.Adapter1", "Powered", dbus::arg::Variant(up));
+    match bus.submit(message) {
+        Ok(serial) => {
+            live.calls.push(PendingCall {
+                serial,
+                kind: CallKind::Power(up),
+                sent: Instant::now(),
+            });
+            true
+        }
+        Err(err) => {
+            eprintln!("fleetpodsd: adapter power request failed: {err}");
+            false
+        }
+    }
 }
 
 fn device_removed(
@@ -1876,6 +2111,9 @@ fn set_scan_filter(bus: &Bus, live: &Live, transport: Option<&str>) {
 /// the daemon deaf to case and ear reports. Release the session and start
 /// a new one instead.
 fn verify_scan(bus: &Bus, live: &mut Live) {
+    if live.air.reset_blocks_scan() {
+        return;
+    }
     let now = Instant::now();
     if !live.air.scan_check_due(now)
         || live.air.pairing_paused(now)
@@ -1901,6 +2139,9 @@ fn verify_scan(bus: &Bus, live: &mut Live) {
 }
 
 fn ensure_scan(bus: &Bus, live: &mut Live) {
+    if live.air.reset_blocks_scan() {
+        return;
+    }
     let now = Instant::now();
     if live.air.pairing_paused(now) {
         if live.air.scanned {
@@ -2522,6 +2763,127 @@ mod advertisement_tests {
         air.scan_result(false, now + Duration::from_secs(10));
         assert!(air.want_scan);
         assert!(air.scan_due(now + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn bluetoothd_returning_power_cycles_the_adapter_once() {
+        let now = Instant::now();
+        let mut air = Air { want_scan: true, ..Air::default() };
+        air.scan_result(true, now);
+        air.arm_controller_reset(now);
+        assert_eq!(air.power_request(now), Some(false));
+        assert!(air.reset_blocks_scan());
+        // The return signal and the Powered signals the cycle causes must not
+        // start a second cycle. Powered is not a reply, so it does not advance
+        // this one either: only the Set call's reply does.
+        air.arm_controller_reset(now + Duration::from_millis(1));
+        assert_eq!(air.power_request(now + Duration::from_millis(1)), Some(false));
+        air.note_power_reply(false, true, now);
+        assert_eq!(air.power_request(now), Some(true));
+        air.arm_controller_reset(now + Duration::from_millis(2));
+        assert_eq!(air.power_request(now + Duration::from_millis(2)), Some(true));
+        air.note_power_reply(true, true, now);
+        assert_eq!(air.power_request(now), None);
+        assert!(!air.reset_blocks_scan());
+        assert!(air.scan_due(now));
+        // The next time bluetoothd returns, one new cycle starts.
+        air.arm_controller_reset(now + Duration::from_secs(1));
+        assert_eq!(air.power_request(now + Duration::from_secs(1)), Some(false));
+    }
+
+    #[test]
+    fn a_failed_power_off_retries_then_leaves_the_controller_alone() {
+        let now = Instant::now();
+        let mut air = Air::default();
+        air.arm_controller_reset(now);
+        air.note_power_reply(false, false, now);
+        assert_eq!(air.power_request(now), None);
+        assert_eq!(air.power_request(now + RESET_RETRY), Some(false));
+        air.note_power_reply(false, false, now + RESET_RETRY);
+        air.note_power_reply(false, false, now + RESET_RETRY * 2);
+        assert!(!air.reset_blocks_scan());
+        assert_eq!(air.power_request(now + RESET_RETRY * 3), None);
+    }
+
+    #[test]
+    fn power_on_keeps_retrying_without_turning_the_adapter_off_again() {
+        let now = Instant::now();
+        let mut air = Air::default();
+        air.arm_controller_reset(now);
+        air.note_power_reply(false, true, now);
+        air.note_power_reply(true, false, now);
+        assert_eq!(air.power_request(now), None);
+        assert_eq!(air.power_request(now + RESET_RETRY), Some(true));
+        air.note_power_reply(true, false, now + RESET_RETRY);
+        assert_eq!(air.power_request(now + RESET_RETRY * 2), Some(true));
+        air.note_power_reply(true, true, now + RESET_RETRY * 2);
+        assert!(!air.reset_blocks_scan());
+    }
+
+    #[test]
+    fn bluetoothd_leaving_cancels_the_power_cycle() {
+        let now = Instant::now();
+        let mut air = Air::default();
+        air.arm_controller_reset(now);
+        air.note_power_reply(false, true, now);
+        air.cancel_controller_reset();
+        assert!(!air.reset_blocks_scan());
+        assert_eq!(air.power_request(now), None);
+        air.arm_controller_reset(now);
+        assert_eq!(air.power_request(now), Some(false));
+    }
+
+    #[test]
+    fn bluez_back_waits_until_the_power_cycle_finishes() {
+        let (tx, rx) = mpsc::channel();
+        let mut live = Live { bluez_back_pending: true, ..Default::default() };
+        live.air.arm_controller_reset(Instant::now());
+        settle_controller_reset(&tx, &mut live, false, true);
+        assert!(rx.try_recv().is_err());
+        assert!(live.bluez_back_pending);
+        settle_controller_reset(&tx, &mut live, true, true);
+        assert!(matches!(rx.try_recv(), Ok(Input::BluezBack)));
+        assert!(!live.bluez_back_pending);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_power_cycle_keeps_its_powered_signals_until_one_return() {
+        let (tx, rx) = mpsc::channel();
+        let mut live = Live { adapter_path: Some("/org/bluez/hci0".into()), ..Default::default() };
+        begin_controller_cycle(&mut live);
+        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", false);
+        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", true);
+        assert!(rx.try_recv().is_err(), "this cycle's Powered stays inside the thread");
+        settle_controller_reset(&tx, &mut live, false, true);
+        assert!(rx.try_recv().is_err());
+        settle_controller_reset(&tx, &mut live, true, true);
+        assert!(matches!(rx.try_recv(), Ok(Input::BluezBack)));
+        assert!(rx.try_recv().is_err());
+        // The cycle is idle. A later toggle is the radio, and the daemon hears it.
+        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", false);
+        assert!(matches!(rx.try_recv(), Ok(Input::AdapterPower(false))));
+    }
+
+    #[test]
+    fn bluetoothd_leaving_during_a_cycle_does_not_report_the_return() {
+        let (tx, rx) = mpsc::channel();
+        let mut live = Live { adapter_path: Some("/org/bluez/hci0".into()), ..Default::default() };
+        begin_controller_cycle(&mut live);
+        note_bluez_left(&tx, &mut live);
+        let mut saw_lost = false;
+        while let Ok(input) = rx.try_recv() {
+            match input {
+                Input::BluezLost => saw_lost = true,
+                Input::BluezBack | Input::AdapterPower(_) => {
+                    panic!("leaving cancels the cycle without a return")
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_lost);
+        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", true);
+        assert!(matches!(rx.try_recv(), Ok(Input::AdapterPower(true))));
     }
 
     #[test]
