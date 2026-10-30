@@ -4293,10 +4293,16 @@ impl Daemon {
             && !self.accessory.playback_available(now.mono)
         {
             // A historical sighting or an open case is not evidence that the
-            // buds can play. Probe the link without muting speaker playback;
-            // claim only when a bud is out, independently of control readiness.
+            // buds can play. Stay on the speakers without probing the link:
+            // absent pods only fail Host is down and cycle the adapter.
+            // Advertisements alone make a bud available, and tick then
+            // claims independently of control readiness. No seat yield:
+            // playback stays local so the deferred claim can still fire.
             self.deferred_playback_claim = Some(now.mono);
-            self.open_connection(now.mono);
+            self.routing.release_audio();
+            self.resume_output_on_grant = false;
+            self.output.return_to_speakers();
+            self.replan(now);
             return;
         }
         self.deferred_playback_claim = None;
@@ -7949,6 +7955,29 @@ mod tests {
         assert!(!daemon.output.wants_output());
         daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
         daemon.step(crate::step::Input::Tick, now);
+        assert!(daemon.output.wants_output());
+        assert!(daemon.deferred_playback_claim.is_none());
+    }
+
+    #[test]
+    fn playback_with_no_sign_of_the_pods_does_not_open_a_link() {
+        use crate::step::{Effect, Input};
+
+        let mut daemon = Daemon::new("omarchy-xps");
+        let now = clock();
+        daemon.select_accessory(Some(addr(9)));
+        daemon.connection.note_bluez(false);
+        assert!(!daemon.accessory.playback_available(now.mono));
+        let played = daemon.step(Input::Command(play("unseen")), now);
+        // No sign of the pods: speakers keep playing and no link is probed.
+        // Probing absent pods only fails Host is down and cycles the adapter.
+        assert!(!played.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+        assert!(!daemon.output.wants_output());
+        assert!(daemon.deferred_playback_claim.is_some());
+        // A bud appearing while playback continues still claims the seat.
+        daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
+        let appeared = daemon.step(Input::Tick, now);
+        assert!(appeared.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
         assert!(daemon.output.wants_output());
         assert!(daemon.deferred_playback_claim.is_none());
     }
