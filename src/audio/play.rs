@@ -192,18 +192,21 @@ impl Audio {
 
     /// Stop treating current playback as a claim. Returns the MPRIS players that are playing.
     pub fn yield_playback(&mut self) -> Vec<String> {
-        let playing = self
-            .known_players
-            .iter()
-            .filter(|(_, on)| **on)
-            .map(|(service, _)| service.clone())
-            .collect();
+        let playing = self.playing_players();
         self.yielded = true;
         self.socket_playing = false;
         // Another device has the pods now; putting a bud back must not resume here.
         self.forget_ear_pause();
         self.recompute_local();
         playing
+    }
+
+    pub fn playing_players(&self) -> Vec<String> {
+        self.known_players
+            .iter()
+            .filter(|(_, on)| **on)
+            .map(|(service, _)| service.clone())
+            .collect()
     }
 
     /// A new claim may treat players as playing again. It does not invent a play edge.

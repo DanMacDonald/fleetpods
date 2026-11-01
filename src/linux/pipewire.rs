@@ -29,7 +29,10 @@ use crate::step::Input;
 use crate::types::Address;
 
 pub enum Op {
-    StartOutput(String),
+    StartOutput {
+        id: u64,
+        name: String,
+    },
     RearmOutput {
         id: u64,
         index: u32,
@@ -601,7 +604,7 @@ fn apply(
     let mut intro = context.introspect();
     for op in ops {
         match op {
-            Op::StartOutput(name) => start_output_node(name.clone()),
+            Op::StartOutput { id, name } => start_output_node(*id, name.clone(), reports.clone()),
             Op::RearmOutput { id, index, name } => {
                 rearm_output(*id, *index, name.clone(), reports.clone())
             }
@@ -856,9 +859,10 @@ fn generation_ok(cached: &HashMap<u32, StreamChannels>, stream: &StreamTarget) -
 /// Pulse can resume a sink while its PipeWire node still waits for an error
 /// retry. Send the node command directly, as OmniPods does after relinking.
 /// Keep the bounded subprocess off both event loops; no shell interprets names.
-fn start_output_node(name: String) {
+fn start_output_node(id: u64, name: String, reports: Sender<Input>) {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    let failed = reports.clone();
     let result =
         std::thread::Builder::new().name("fleetpods-output-start".into()).spawn(move || {
             let child = Command::new("pw-cli")
@@ -869,6 +873,7 @@ fn start_output_node(name: String) {
                 .spawn();
             let Ok(mut child) = child else {
                 eprintln!("fleetpodsd: could not start PipeWire output command for {name}");
+                let _ = reports.send(Input::OutputStarted { id, ok: false });
                 return;
             };
             let deadline = Instant::now() + Duration::from_secs(1);
@@ -879,6 +884,7 @@ fn start_output_node(name: String) {
                             "fleetpodsd: PipeWire output Start completed (ok={})",
                             status.success()
                         );
+                        let _ = reports.send(Input::OutputStarted { id, ok: status.success() });
                         return;
                     }
                     Ok(None) if Instant::now() < deadline => {
@@ -888,6 +894,7 @@ fn start_output_node(name: String) {
                         let _ = child.kill();
                         let _ = child.wait();
                         eprintln!("fleetpodsd: PipeWire output Start failed or timed out");
+                        let _ = reports.send(Input::OutputStarted { id, ok: false });
                         return;
                     }
                 }
@@ -895,6 +902,7 @@ fn start_output_node(name: String) {
         });
     if result.is_err() {
         eprintln!("fleetpodsd: could not launch PipeWire output worker");
+        let _ = failed.send(Input::OutputStarted { id, ok: false });
     }
 }
 

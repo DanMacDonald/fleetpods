@@ -213,6 +213,18 @@ again every two seconds while playback still wants the pods. The window opens
 at the first refusal and lasts 30 seconds; after that, the next play starts a
 new claim and a new window.
 
+Taking playback back can require rebuilding an output damaged by the previous
+handoff. The daemon pauses playing MPRIS players while retaining its playback
+claim. Recovery includes the profile reset, stream relinking and mute restoration,
+the existing 250 ms settling interval, and completion of the PipeWire node Start
+command. Only then are the held players resumed. A profile-reset reply alone
+does not release them. A browser that closes its stream while paused can resume
+onto the prepared default sink. Failed starts, cancellation, audio-server loss
+and the five-second recovery deadline retire pending resumes; stale Start replies
+cannot release a later recovery. Command completion does not prove audible or
+synchronized playback, so the transport watchdog still verifies streaming after
+the player resumes.
+
 While a play waits for the pods, its speaker streams stay muted for up to 12
 seconds before they are given back to the speakers. Each step toward the pods
 restarts that hold: a new claim, a ready control link, a connected audio

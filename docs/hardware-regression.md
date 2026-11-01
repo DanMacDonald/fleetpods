@@ -120,3 +120,26 @@ binary, both services stayed active and answered status requests, and Gram
 re-established control while reporting XPS as the playing owner. The build passed
 380 unit tests, 33 acceptance scenarios and Clippy. This was not a repeated
 case-open timing test.
+
+## Player resume after taking playback back
+
+On 2026-11-01 the user reported YouTube losing sync when XPS took playback back
+from Gram. XPS logged a Bluetooth audio transport error at 09:07:32, then a
+rebuild at 09:07:38. The profile-reset reply arrived at 09:07:38.730; FleetPods
+resumed Brave at 09:07:38.760, while its stream was still on the muted speaker
+output. The stream returned to the pods at 09:07:39.734 and the PipeWire Start
+command completed at 09:07:40.007. This establishes an early-resume race, not a
+measurement of the perceived lip-sync offset.
+
+Recovery now pauses playing MPRIS players and holds their resumes through relink
+and the Start reply. Regression coverage includes closed browser streams, failed
+starts, stale and duplicate replies, cancellation, audio-server loss, and timeout.
+For hardware validation, play on Gram and then press Play on XPS. Confirm the
+XPS player pauses during any rebuild, its Play command follows the successful
+output Start completion, and the video and sound stay synchronized. Repeat in
+both directions and confirm normal Play on an already active output does not
+introduce an extra pause. Perceived synchronization still needs listener validation.
+
+The corrected build passed 381 unit tests, 33 acceptance scenarios and Clippy.
+It was deployed to XPS and Gram; both services ran the matching binary and
+answered status requests. This deployment check did not measure lip sync.

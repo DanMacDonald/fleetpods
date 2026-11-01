@@ -73,6 +73,8 @@ struct RouteState {
     missing_since: BTreeMap<(u32, u64), MonoMs>,
     recovery: Option<Recovery>,
     start_after_relink: Option<Restart>,
+    starting: Option<u64>,
+    recovery_deadline: Option<MonoMs>,
     relinked_at: Option<MonoMs>,
     /// Released with the pods still connected: move streams off them too.
     returning: bool,
@@ -110,9 +112,9 @@ impl RouteState {
         self.restore_sent.retain(|key| self.held.iter().any(|s| (s.id, s.generation) == *key));
     }
 
-    /// Streams are parked while the accessory output is rebuilt.
+    /// Rebuilding includes relinking streams and awaiting the node Start reply.
     pub fn recovering(&self) -> bool {
-        self.recovery.is_some()
+        self.recovery.is_some() || self.start_after_relink.is_some() || self.starting.is_some()
     }
 
     pub fn holding_takeover(&self) -> bool {
@@ -123,6 +125,8 @@ impl RouteState {
     pub fn forget_server(&mut self) {
         self.recovery = None;
         self.start_after_relink = None;
+        self.starting = None;
+        self.recovery_deadline = None;
         self.relinked_at = None;
         self.held.clear();
         self.missing_since.clear();
@@ -151,6 +155,8 @@ impl RouteState {
             missing_since: BTreeMap::new(),
             recovery: None,
             start_after_relink: None,
+            starting: None,
+            recovery_deadline: None,
             relinked_at: None,
             returning: false,
             asked_return: None,
@@ -166,7 +172,7 @@ impl RouteState {
         graph: &Graph,
         now: MonoMs,
     ) -> bool {
-        if self.recovery.is_some() || !self.want {
+        if self.recovering() || !self.want {
             return false;
         }
         let Some(sink) = sink_for(graph, accessory) else {
@@ -210,6 +216,8 @@ impl RouteState {
         self.asked_restore = None;
         self.restore_sent.clear();
         self.start_after_relink = None;
+        self.starting = None;
+        self.recovery_deadline = Some(now.saturating_add(5_000));
         self.relinked_at = None;
         self.recovery = Some(Recovery {
             id,
@@ -239,6 +247,19 @@ impl RouteState {
         self.start_after_relink = ok.then_some(Restart { id, name: recovery.sink });
         self.relinked_at = None;
         self.asked_move = None;
+        if !ok {
+            self.want = false;
+            self.recovery_deadline = None;
+        }
+        true
+    }
+
+    pub fn finish_start(&mut self, id: u64, ok: bool) -> bool {
+        if self.starting != Some(id) {
+            return false;
+        }
+        self.starting = None;
+        self.recovery_deadline = None;
         if !ok {
             self.want = false;
         }
@@ -412,6 +433,10 @@ impl Router {
 
     pub fn finish_recovery(&mut self, id: u64, ok: bool) -> bool {
         self.state.finish_recovery(id, ok)
+    }
+
+    pub fn finish_start(&mut self, id: u64, ok: bool) -> bool {
+        self.state.finish_start(id, ok)
     }
 
     /// Yield audio without leaking a player's queued tail onto the speakers.
@@ -634,6 +659,11 @@ fn plan(
     if !state.want {
         return release(state, accessory_sink, graph, now);
     }
+    if state.recovery_deadline.is_some_and(|until| now >= until) {
+        let mut action = release(state, accessory_sink, graph, now);
+        action.failure = Some("audio relink/start timed out");
+        return action;
+    }
     if let Some(recovery) = state.recovery.clone() {
         if now.saturating_since(recovery.started) >= 1_500 {
             let mut action = release(state, accessory_sink, graph, now);
@@ -750,6 +780,7 @@ fn plan(
         let relinked = *state.relinked_at.get_or_insert(now);
         if now.saturating_since(relinked) >= 250 {
             start_output = state.start_after_relink.take();
+            state.starting = start_output.as_ref().map(|start| start.id);
             state.relinked_at = None;
         }
     } else {
@@ -769,8 +800,9 @@ fn plan(
 }
 
 fn moving_is_complete(state: &RouteState, graph: &Graph, sink: &str) -> bool {
+    // A paused browser may close its stream. The default and output can still
+    // be prepared before resuming it; a fresh stream will use this sink.
     streams_to_move(state, graph, sink).is_empty()
-        && graph.streams.iter().any(|stream| stream.sink == sink && managed(stream))
 }
 
 fn release(
@@ -781,6 +813,8 @@ fn release(
 ) -> RouteAction {
     state.recovery = None;
     state.start_after_relink = None;
+    state.starting = None;
+    state.recovery_deadline = None;
     state.relinked_at = None;
     let restore = std::mem::take(&mut state.held);
     state.quieted.clear();
@@ -1502,6 +1536,11 @@ mod tests {
         assert_eq!(started.start_output, Some(Restart { id: 7, name: "pods".into() }));
         let repeat = plan(started.state, Some(pods), &picture, MonoMs(900));
         assert!(repeat.start_output.is_none(), "one Start per recovery");
+        let mut state = repeat.state;
+        assert!(state.recovering(), "Start must complete before the player resumes");
+        assert!(!state.finish_start(6, true));
+        assert!(state.finish_start(7, true));
+        assert!(!state.recovering());
     }
 
     #[test]
@@ -1582,25 +1621,29 @@ mod tests {
         // Repeated handoffs reuse this stream. A graph during the move can omit
         // it while its sink is temporarily unavailable.
         for id in 1..=3 {
-            assert!(state.begin_recovery(id, pods, &picture, MonoMs(id * 100)));
-            let muted = plan(state, Some(pods), &picture, MonoMs(id * 100));
+            assert!(state.begin_recovery(id, pods, &picture, MonoMs(id * 1_000)));
+            let muted = plan(state, Some(pods), &picture, MonoMs(id * 1_000));
             picture.streams[0].mute = true;
-            let detached = plan(muted.state, Some(pods), &picture, MonoMs(id * 100 + 10));
+            let detached = plan(muted.state, Some(pods), &picture, MonoMs(id * 1_000 + 10));
             picture.streams[0].sink = "speakers".into();
-            let reset = plan(detached.state, Some(pods), &picture, MonoMs(id * 100 + 20));
+            let reset = plan(detached.state, Some(pods), &picture, MonoMs(id * 1_000 + 20));
             state = reset.state;
             assert!(state.finish_recovery(id, true));
-            let relink = plan(state, Some(pods), &picture, MonoMs(id * 100 + 30));
+            let relink = plan(state, Some(pods), &picture, MonoMs(id * 1_000 + 30));
             let mut missing = picture.clone();
             missing.streams.clear();
-            let gap = plan(relink.state, Some(pods), &missing, MonoMs(id * 100 + 40));
+            let gap = plan(relink.state, Some(pods), &missing, MonoMs(id * 1_000 + 40));
             picture.streams[0].sink = "pods".into();
-            let arrived = plan(gap.state, Some(pods), &picture, MonoMs(id * 100 + 50));
+            let arrived = plan(gap.state, Some(pods), &picture, MonoMs(id * 1_000 + 50));
             assert_eq!(arrived.restore.len(), 1, "switch {id} must restore after the graph gap");
             assert!(!arrived.restore[0].mute);
             picture.streams[0].mute = false;
-            state = plan(arrived.state, Some(pods), &picture, MonoMs(id * 100 + 60)).state;
+            state = plan(arrived.state, Some(pods), &picture, MonoMs(id * 1_000 + 60)).state;
             assert!(state.held.is_empty());
+            let started = plan(state, Some(pods), &picture, MonoMs(id * 1_000 + 310));
+            assert!(started.start_output.is_some());
+            state = started.state;
+            assert!(state.finish_start(id, true));
         }
     }
 

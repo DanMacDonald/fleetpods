@@ -9069,6 +9069,125 @@ mod tests {
     }
 
     #[test]
+    fn taking_audio_back_keeps_the_player_paused_until_the_relinked_output_starts() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let brave = "org.mpris.MediaPlayer2.brave";
+        let resumed =
+            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::ResumePlayers(_)));
+        for ending in ["success", "closed_stream", "failed", "canceled", "timeout", "audio_lost"] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            ready_link(&mut daemon, now);
+            let mut graph = Graph {
+                default_sink: "pods".into(),
+                sinks: vec![
+                    Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    },
+                    Sink { name: "speakers".into(), address: None, profile: None },
+                ],
+                cards: vec![],
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "pods".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            daemon.step(Input::Audio(graph.clone()), now);
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            daemon.step(
+                Input::Players(vec![PlayerSeen { service: brave.into(), playing: true }]),
+                now,
+            );
+            daemon.output.claim();
+            let grant = daemon.step(Input::Observation(Observation::Ownership(true)), at(10));
+            assert!(grant
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PausePlayers(names) if names == &[brave])));
+            assert!(matches!(grant.effects.first(), Some(Effect::MuteStreams(_))));
+            assert!(!resumed(&grant.effects));
+            let id = daemon.output_restart_serial;
+            let paused =
+                daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, at(20));
+            assert!(!resumed(&paused.effects));
+            graph.streams[0].mute = true;
+            graph.streams[0].corked = true;
+            graph.streams[0].sink = "speakers".into();
+            let reset = daemon.step(Input::Audio(graph.clone()), at(30));
+            assert!(reset.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })));
+            let reset_done = daemon.step(Input::OutputRestarted { id, ok: true }, at(40));
+            assert!(!resumed(&reset_done.effects), "profile completion is too early");
+            // A pause notification caused by the reset also cannot release the hold.
+            assert!(!resumed(
+                &daemon
+                    .step(Input::Player { service: brave.into(), playing: Some(false) }, at(50))
+                    .effects
+            ));
+            if ending == "closed_stream" {
+                graph.streams.clear();
+                daemon.step(Input::Audio(graph.clone()), at(60));
+            } else {
+                graph.streams[0].sink = "pods".into();
+                let linked = daemon.step(Input::Audio(graph.clone()), at(60));
+                assert!(!resumed(&linked.effects));
+                graph.streams[0].mute = false;
+            }
+            let unmuted = daemon.step(Input::Audio(graph.clone()), at(1_100));
+            assert!(!resumed(&unmuted.effects));
+            let start = daemon.step(Input::Tick, at(1_350));
+            assert!(start
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::StartOutput { id: started, .. } if *started == id)));
+            assert!(!resumed(&start.effects), "sending Start is not its completion");
+            assert!(!resumed(
+                &daemon.step(Input::OutputStarted { id: id + 1, ok: true }, at(1_360)).effects
+            ));
+            let before = match ending {
+                "canceled" => Some(Input::Command(Command::HandoffRelease)),
+                "audio_lost" => Some(Input::AudioLost),
+                "timeout" => Some(Input::Tick),
+                _ => None,
+            };
+            let completed_at = if before.is_some() { 5_200 } else { 1_400 };
+            if let Some(input) = before {
+                let stopped = daemon.step(input, at(5_100));
+                assert!(!resumed(&stopped.effects));
+            }
+            let finished =
+                daemon.step(Input::OutputStarted { id, ok: ending != "failed" }, at(completed_at));
+            let success = matches!(ending, "success" | "closed_stream");
+            assert_eq!(resumed(&finished.effects), success, "ending={ending}");
+            assert!(!resumed(
+                &daemon.step(Input::OutputStarted { id, ok: true }, at(completed_at + 10)).effects
+            ));
+            if success {
+                daemon.step(
+                    Input::Player { service: brave.into(), playing: Some(true) },
+                    at(completed_at + 20),
+                );
+                assert_eq!(
+                    daemon.output_restart_serial, id,
+                    "resume must not start another recovery"
+                );
+                assert!(daemon.resumed_players.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn a_player_that_pauses_itself_as_the_output_is_rebuilt_is_played_again() {
         use crate::audio::play::PlayerSeen;
         use crate::step::{Effect, Input};
@@ -9155,7 +9274,7 @@ mod tests {
             let mut serial = daemon.output_restart_serial;
             let mut rebuilds = 0;
             for round in 0..4u64 {
-                let base = round * 3_000;
+                let base = round * 4_000;
                 if round == 0 {
                     daemon.step(Input::Observation(Observation::Ownership(true)), at(base));
                 } else {
@@ -9171,6 +9290,10 @@ mod tests {
                 daemon.step(Input::OutputRestarted { id: serial, ok: true }, at(base + 20));
                 daemon.step(Input::Audio(playing.clone()), at(base + 30));
                 daemon.step(Input::Transport { active: streamed }, at(base + 40));
+                daemon.step(Input::Tick, at(base + 300));
+                let start = daemon.step(Input::Tick, at(base + 600));
+                assert!(start.effects.iter().any(|e| matches!(e, Effect::StartOutput { .. })));
+                daemon.step(Input::OutputStarted { id: serial, ok: true }, at(base + 610));
                 // Before the check is due nothing happens.
                 daemon.step(Input::Tick, at(base + 1_000));
                 assert_eq!(daemon.output_restart_serial, serial);

@@ -343,7 +343,9 @@ impl Session {
                     ops.extend(streams.iter().copied().map(Op::Mute));
                 }
                 Effect::SetDefaultSink { name } => ops.push(Op::Default(name.clone())),
-                Effect::StartOutput { name } => ops.push(Op::StartOutput(name.clone())),
+                Effect::StartOutput { id, name } => {
+                    ops.push(Op::StartOutput { id: *id, name: name.clone() })
+                }
                 Effect::RearmOutput { id, index, name } => {
                     ops.push(Op::RearmOutput { id: *id, index: *index, name: name.clone() })
                 }

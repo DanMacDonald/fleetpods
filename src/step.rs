@@ -45,6 +45,10 @@ pub enum Input {
         id: u64,
         ok: bool,
     },
+    OutputStarted {
+        id: u64,
+        ok: bool,
+    },
     /// The accessory's A2DP transport started (`active`) or stopped streaming.
     Transport {
         active: bool,
@@ -234,6 +238,7 @@ pub enum Effect {
     },
     /// Start the relinked PipeWire node once, after recovery has restored streams.
     StartOutput {
+        id: u64,
         name: String,
     },
     /// Briefly suspend/resume only this Pulse sink. No Bluetooth unpairing.
@@ -349,10 +354,20 @@ impl Daemon {
                     if !ok {
                         self.seat_audio_failure("audio sink restart failed", now);
                     } else {
-                        // A rebuilt node can fail to start if the pods were not
-                        // ready yet; check that audio actually flows.
-                        self.rearm_verify_at = Some(now.mono.saturating_add(REARM_VERIFY_MS));
+                        // The profile reply precedes stream relinking and Start.
                         self.rebuild_pause_until = Some(now.mono.saturating_add(REBUILD_PAUSE_MS));
+                    }
+                    self.replan(now);
+                }
+                None
+            }
+            Input::OutputStarted { id, ok } => {
+                if self.output.finish_start(id, ok) {
+                    if ok {
+                        // Command success is not proof of audible playback.
+                        self.rearm_verify_at = Some(now.mono.saturating_add(REARM_VERIFY_MS));
+                    } else {
+                        self.seat_audio_failure("audio output start failed", now);
                     }
                     self.replan(now);
                 }
@@ -567,6 +582,10 @@ impl Daemon {
             Input::AudioLost => {
                 self.last_graph = None;
                 self.output.forget_server();
+                self.resume_players.clear();
+                self.resumed_players.clear();
+                self.rebuild_pause_until = None;
+                self.rearm_verify_at = None;
                 self.output_health.forget_server();
                 self.audio.set_routed(false);
                 None
@@ -596,7 +615,7 @@ impl Daemon {
                         || self.rebuild_pause_until.is_some_and(|until| now.mono.0 < until.0))
                     && !self.resume_players.contains(&service)
                 {
-                    eprintln!("fleetpodsd: player {service:?} paused during the AirPods rebuild; resuming it");
+                    eprintln!("fleetpodsd: player {service:?} paused during the AirPods rebuild; deferring resume until output start");
                     self.resume_players.push(service.clone());
                 }
                 let after_yield = self.audio.yielded();
@@ -1039,14 +1058,6 @@ impl Daemon {
                 self.release_output_until = None;
             }
         }
-        if !self.output.wants_output() {
-            self.resume_players.clear();
-            self.resumed_players.clear();
-        } else if !self.resume_players.is_empty() && !self.output.recovering() {
-            let players = std::mem::take(&mut self.resume_players);
-            self.resumed_players.clone_from(&players);
-            effects.push(Effect::ResumePlayers(players));
-        }
         if self.effects.drop_link {
             self.effects.drop_link = false;
             if let Some(accessory) = accessory {
@@ -1108,6 +1119,17 @@ impl Daemon {
             {
                 let id = self.output_restart_serial + 1;
                 if self.output.begin_recovery(id, address, graph, now.mono) {
+                    // Stop the media clock while its output is unavailable.
+                    // This pause retains the playback claim, unlike yielding.
+                    let players = self.audio.playing_players();
+                    for player in &players {
+                        if !self.resume_players.contains(player) {
+                            self.resume_players.push(player.clone());
+                        }
+                    }
+                    if !players.is_empty() {
+                        effects.push(Effect::PausePlayers(players));
+                    }
                     self.output_restart_serial = id;
                     self.resume_output_on_grant = false;
                     self.rearm_after_loss = false;
@@ -1156,7 +1178,7 @@ impl Daemon {
                     }
                 }
                 crate::audio::route::Work::Start(start) => {
-                    effects.push(Effect::StartOutput { name: start.name });
+                    effects.push(Effect::StartOutput { id: start.id, name: start.name });
                 }
                 crate::audio::route::Work::SetDefault(name) => {
                     effects.push(Effect::SetDefaultSink { name });
@@ -1165,6 +1187,14 @@ impl Daemon {
                     effects.push(Effect::MoveStreams(moves));
                 }
             }
+        }
+        if !self.output.wants_output() {
+            self.resume_players.clear();
+            self.resumed_players.clear();
+        } else if !self.resume_players.is_empty() && !self.output.recovering() {
+            let players = std::mem::take(&mut self.resume_players);
+            self.resumed_players.clone_from(&players);
+            effects.push(Effect::ResumePlayers(players));
         }
         effects
     }
