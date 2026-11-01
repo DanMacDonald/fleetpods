@@ -301,15 +301,18 @@ impl Daemon {
         StepOutcome { reply, effects: self.harvest(now) }
     }
 
-    /// Request local playback when this machine is playing and no newer remote
-    /// report has arrived. A remote report stored before the claim is older
-    /// intent, even when both timestamps are the same millisecond. A remote
-    /// report that shows up after the claim wins unless the pods grant the
-    /// claim within [`CLAIM_ANSWER_MS`].
+    /// Request local playback when this machine is playing or has a queued
+    /// resume, and no newer remote report has arrived. A remote report stored
+    /// before the claim is older intent, even within the same millisecond.
+    /// A remote report after the claim wins unless the pods grant the claim
+    /// within [`CLAIM_ANSWER_MS`].
     pub(crate) fn wants_local_confirm(&self, now: MonoMs) -> bool {
         self.seat.wants_local_confirm(
             self.output.wants_output(),
-            self.audio.local_playing(),
+            // A player paused by FleetPods still supplies playback intent.
+            // Rejoining must claim before our Play reply arrives, otherwise
+            // an opening owner report immediately cancels the resumed media.
+            self.audio.local_playing() || !self.resume_players.is_empty(),
             self.audio.yielded(),
             &self.accessory.ownership,
             now,

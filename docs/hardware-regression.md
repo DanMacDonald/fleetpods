@@ -164,3 +164,28 @@ Repeat this insertion scenario and inspect the new advertisement-release and
 changed-preference logs alongside connection timing. Even this narrower exception
 does not establish that advertising caused the failed first attempt. A cold
 connection still uses the existing muted-stream hold while output setup proceeds.
+
+## Rejoining after the phone reconnects
+
+The 2026-11-01 XPS capture established two separate delays. On the first
+connection, BlueZ connected at 10:02:21.588 and the audio profile completed at
+10:02:23.200. PipeWire restarted its device-profile timer at 10:02:23.725;
+the timer expired at 10:02:25.725 and the output node appeared at 10:02:25.740.
+This identifies a two-second profile wait in this capture, not the suspected
+three-second codec reconfiguration rate limit. Audio became active at
+10:02:27.120. These observations do not establish the cause of every earlier delay.
+
+Later, the controller reported `Remote Device Terminated due to Low Resources`
+(0x14) at 10:02:53.195. FleetPods paused Brave and rejoined after its existing
+two-second grace. At 10:02:57.716 it resumed Brave without sending an ownership
+claim: Brave had acknowledged the earlier pause, so the confirmation predicate
+no longer saw playback intent. An iPhone-owner report 101 ms later caused
+FleetPods to pause Brave again. The user pressed Play at 10:03:00.787.
+
+Queued resumes now count as playback intent for ownership confirmation. The
+regression test acknowledges the browser pause before setup completes, checks
+that the claim is sent, and delivers the repeated remote-owner report before
+the grant. The existing one-rejoin limit still applies. Repeat the case-to-ear
+sequence with the iPhone reconnecting after XPS and verify that recovery sends
+the claim and playback continues without another manual Play. Passing the
+simulated sequence does not establish a successful hardware retest.

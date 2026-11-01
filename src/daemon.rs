@@ -8588,6 +8588,12 @@ mod tests {
         ));
         assert!(!opens(&waiting), "the newcomer settles first: {waiting:?}");
         assert!(!daemon.output.wants_output(), "playback stays paused until the link is back");
+        // The browser acknowledges our pause before reconnection completes.
+        // Without this report the test incorrectly leaves local_playing true.
+        daemon.step(
+            Input::Player { service: brave.into(), playing: Some(false) },
+            at(REJOIN_DELAY_MS),
+        );
 
         let mut rejoin = Vec::new();
         for elapsed in [REJOIN_DELAY_MS + 100, REJOIN_DELAY_MS + 200, REJOIN_DELAY_MS + 300] {
@@ -8599,6 +8605,7 @@ mod tests {
         let ready = at(REJOIN_DELAY_MS + 1_500);
         daemon.step(Input::Bluez(true), ready);
         let generation = daemon.connection().generation();
+        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(false)), ready);
         let setup = set_up_link(&mut daemon, generation, ready);
         assert!(daemon.output.wants_output());
         assert!(setup.iter().any(|e| matches!(e,
@@ -8614,6 +8621,18 @@ mod tests {
         daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, ready);
 
         assert!(daemon.audio.local_playing());
+        // XPS, 2026-11-01: the opening roster still named the iPhone 101 ms
+        // after our resume. The pending resume must already have sent CLAIM.
+        let stale = daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Ownership(false)),
+            at(REJOIN_DELAY_MS + 1_601),
+        );
+        assert!(!stale.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+        assert!(daemon.output.wants_output());
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Ownership(true)),
+            at(REJOIN_DELAY_MS + 1_700),
+        );
         // A second reset inside the window is the phone insisting.
         daemon.note_pod_peers(vec![local, phone], ready.unix);
         let again = evict_and_wait(&mut daemon, at(REJOIN_DELAY_MS + 5_000), 6_000);
