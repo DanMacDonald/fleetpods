@@ -1002,12 +1002,22 @@ impl Daemon {
                     effects.push(Effect::Advertise(bytes));
                 }
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Activity(bytes)) => {
+                    if connecting {
+                        eprintln!("fleetpodsd: airing changed connector preference while Bluetooth connects");
+                    }
                     effects.push(Effect::Advertise(bytes));
                 }
                 crate::fleet::radio::Duty::Publish(crate::fleet::radio::Item::Route(bytes)) => {
                     effects.push(Effect::Advertise(bytes));
                 }
-                crate::fleet::radio::Duty::Release => effects.push(Effect::ReleaseAir),
+                crate::fleet::radio::Duty::Release => {
+                    if connecting {
+                        eprintln!(
+                            "fleetpodsd: released fleet advertisement while Bluetooth connects"
+                        );
+                    }
+                    effects.push(Effect::ReleaseAir);
+                }
                 crate::fleet::radio::Duty::Hold => {}
             }
         }

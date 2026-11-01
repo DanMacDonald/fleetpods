@@ -168,7 +168,7 @@ pub struct Schedule {
     aired_at: Option<MonoMs>,
     on_air: bool,
     presence: Option<Vec<u8>>,
-    activity: Option<Vec<u8>>,
+    activity: Option<super::activity::Offer>,
     pod_state: Option<Vec<u8>>,
     presence_urgent: bool,
     roster: Option<Vec<u8>>,
@@ -231,8 +231,11 @@ impl Schedule {
     }
 
     /// Activity has a single replaceable slot, refreshed by its owner module.
-    pub fn offer_activity(&mut self, frame: Vec<u8>) {
-        self.activity = Some(frame);
+    pub fn offer_activity(&mut self, mut offer: super::activity::Offer) {
+        // Refresh the encrypted envelope without losing an unsent change's
+        // priority. Once aired, later refreshes are routine again.
+        offer.changed |= self.activity.as_ref().is_some_and(|pending| pending.changed);
+        self.activity = Some(offer);
     }
 
     /// Latest snapshot replaces unsent intermediate changes. Cadence is bounded
@@ -436,9 +439,10 @@ impl Schedule {
         }
         // One activity frame per refresh, after urgent control traffic. It
         // cannot fill a repeat queue or replace legacy discovery/roster data.
-        if let Some(bytes) = self.activity.take() {
+        if self.activity.as_ref().is_some_and(|offer| offer.changed || !self.defer_routine) {
+            let offer = self.activity.take().unwrap();
             self.mark_aired(now);
-            return Some(Item::Activity(bytes));
+            return Some(Item::Activity(offer.frame));
         }
         if self.defer_routine && self.route.is_none() {
             // Preserve the entire seat-change burst and enrollment retries.
@@ -587,7 +591,7 @@ mod tests {
         schedule.offer_pod_state(vec![1]);
         schedule.offer_handoff_presence(vec![2]);
         schedule.offer_roster_change(vec![3]);
-        schedule.offer_activity(vec![4]);
+        schedule.offer_activity(crate::fleet::activity::Offer { frame: vec![4], changed: true });
         assert_eq!(schedule.due(MonoMs(0)), Duty::Publish(Item::Roster(vec![3])));
         assert_eq!(schedule.due(MonoMs(500)), Duty::Publish(Item::Presence(vec![2])));
         assert_eq!(schedule.due(MonoMs(1_000)), Duty::Publish(Item::Activity(vec![4])));
@@ -607,6 +611,28 @@ mod tests {
         assert_eq!(schedule.due(MonoMs(6_000)), Duty::Hold);
         schedule.defer_routine(false);
         assert_eq!(schedule.due(MonoMs(6_000)), Duty::Publish(Item::PodState(vec![1])));
+    }
+
+    #[test]
+    fn connecting_defers_preference_refreshes_but_preserves_unsent_changes() {
+        let offer = |byte, changed| super::super::activity::Offer { frame: vec![byte], changed };
+        let mut schedule = Schedule::new();
+        schedule.defer_routine(true);
+        schedule.offer_activity(offer(1, true));
+        schedule.offer_activity(offer(2, false));
+        assert_eq!(schedule.due(MonoMs(0)), Duty::Publish(Item::Activity(vec![2])));
+        assert_eq!(schedule.due(MonoMs(500)), Duty::Release);
+        schedule.offer_activity(offer(3, false));
+        assert_eq!(schedule.due(MonoMs(3_000)), Duty::Hold);
+        schedule.offer_activity(offer(4, false));
+        assert_eq!(schedule.due(MonoMs(6_000)), Duty::Hold);
+        schedule.offer_activity(offer(5, true));
+        assert_eq!(schedule.due(MonoMs(6_001)), Duty::Publish(Item::Activity(vec![5])));
+        assert_eq!(schedule.due(MonoMs(6_501)), Duty::Release);
+        schedule.offer_activity(offer(6, false));
+        assert_eq!(schedule.due(MonoMs(9_001)), Duty::Hold);
+        schedule.defer_routine(false);
+        assert_eq!(schedule.due(MonoMs(9_002)), Duty::Publish(Item::Activity(vec![6])));
     }
 
     #[test]

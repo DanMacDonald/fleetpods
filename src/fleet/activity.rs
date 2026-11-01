@@ -22,6 +22,13 @@ pub struct Record {
     pub at: UnixMs,
 }
 
+pub struct Offer {
+    pub frame: Vec<u8>,
+    /// A new preference must reach peers even while this host connects.
+    /// Renewing the same record's envelope is routine traffic.
+    pub changed: bool,
+}
+
 #[derive(Default)]
 pub struct Preference {
     record: Option<Record>,
@@ -100,7 +107,7 @@ impl Preference {
         sender: Address,
         now: crate::types::Clock,
         keys: &FleetKeys,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<Offer> {
         if self.offered_at.is_some_and(|at| now.mono.saturating_since(at) < REFRESH_MS) {
             return None;
         }
@@ -112,8 +119,9 @@ impl Preference {
         body.extend(now.unix.0.to_be_bytes());
         let mut frame = vec![VERSION];
         frame.extend(seal_fleet(DOMAIN, &keys.id, &keys.key, &body)?);
+        let changed = self.offered_at.is_none();
         self.offered_at = Some(now.mono);
-        Some(frame)
+        Some(Offer { frame, changed })
     }
 
     /// Authenticate the envelope and validate both its relay and named owner.
@@ -212,7 +220,32 @@ mod tests {
         let mut preference = Preference::default();
         preference.note_local(keys().id, addr(9), addr(owner), UnixMs(at));
         let record = preference.record(keys().id, addr(9)).unwrap();
-        preference.offer(record, addr(1), Clock::new(sent, sent), &keys()).unwrap()
+        preference.offer(record, addr(1), Clock::new(sent, sent), &keys()).unwrap().frame
+    }
+
+    #[test]
+    fn only_new_preferences_are_changes_not_envelope_refreshes() {
+        let mut preference = Preference::default();
+        preference.note_local(keys().id, addr(9), addr(1), UnixMs(1_000));
+        let record = preference.record(keys().id, addr(9)).unwrap();
+        assert!(
+            preference.offer(record, addr(1), Clock::new(1_000, 1_000), &keys()).unwrap().changed
+        );
+        assert!(preference.offer(record, addr(1), Clock::new(3_999, 3_999), &keys()).is_none());
+        assert!(
+            !preference.offer(record, addr(1), Clock::new(4_000, 4_000), &keys()).unwrap().changed
+        );
+        // Even on the same laptop, fresh user input is a new election record.
+        preference.note_local(keys().id, addr(9), addr(1), UnixMs(4_001));
+        let record = preference.record(keys().id, addr(9)).unwrap();
+        assert!(
+            preference.offer(record, addr(1), Clock::new(4_001, 4_001), &keys()).unwrap().changed
+        );
+        assert!(preference.hear(&frame(2, 4_002, 4_002), &keys(), addr(9), UnixMs(4_002), |_| true));
+        let record = preference.record(keys().id, addr(9)).unwrap();
+        assert!(
+            preference.offer(record, addr(1), Clock::new(4_002, 4_002), &keys()).unwrap().changed
+        );
     }
 
     #[test]
@@ -229,7 +262,7 @@ mod tests {
         let now = Clock::new(200_000_000, 200_000_000);
         let relayed = restarted.offer(record, addr(1), now, &keys()).unwrap();
         let mut newcomer = Preference::default();
-        assert!(newcomer.hear(&relayed, &keys(), addr(9), now.unix, |_| true));
+        assert!(newcomer.hear(&relayed.frame, &keys(), addr(9), now.unix, |_| true));
         assert_eq!(newcomer.record(keys().id, addr(9)), Some(record));
         newcomer.observe_availability(true, now.mono);
         assert!(!newcomer.take_wake(record, addr(1), MonoMs(now.mono.0 + 60_000)));

@@ -3272,8 +3272,8 @@ impl Daemon {
         };
         let keys =
             crate::fleet::presence::FleetKeys { id: fleet.id.bytes(), key: *fleet.key.as_bytes() };
-        if let Some(frame) = self.activity_preference.offer(record, local, now, &keys) {
-            self.outbound.offer_activity(frame);
+        if let Some(offer) = self.activity_preference.offer(record, local, now, &keys) {
+            self.outbound.offer_activity(offer);
         }
     }
 
@@ -12153,6 +12153,37 @@ mod tests {
         }
 
         #[test]
+        fn periodic_preference_refreshes_do_not_broadcast_during_a_connection_attempt() {
+            let mut now = clock();
+            let mut daemon = peer(1, now);
+            daemon.step(Input::Command(Command::Activity), now);
+            // Let the initial preference and roster announcements finish.
+            for _ in 0..5 {
+                advance_clock(&mut now, 500);
+                daemon.step(Input::Tick, now);
+            }
+            for right in [false, true] {
+                daemon.accessory.note_placement(right, Some(true), Some(false), now.mono);
+            }
+            daemon.background_requested = true;
+            daemon.connection.claim(now.mono);
+            let opening = daemon.step(Input::Tick, now);
+            assert!(opens(&opening.effects));
+            for _ in 0..14 {
+                advance_clock(&mut now, 500);
+                let tick = daemon.step(Input::Tick, now);
+                assert!(
+                    !tick.effects.iter().any(|e| matches!(e, Effect::Advertise(_))),
+                    "even periodic preference envelopes must defer during paging"
+                );
+                assert!(daemon.listening);
+                assert_eq!(daemon.connection.stage(), Stage::Connecting);
+            }
+            let connected = daemon.step(Input::Bluez(true), now);
+            assert!(connected.effects.iter().any(|e| matches!(e, Effect::Advertise(_))));
+        }
+
+        #[test]
         fn case_activity_is_shared_and_only_the_latest_device_reconnects_after_restart() {
             let mut now = clock();
             let mut a = peer(1, now);
@@ -12293,7 +12324,7 @@ mod tests {
             advance_clock(&mut now, crate::fleet::activity::REFRESH_MS);
             let frame =
                 b.activity_preference.offer(record, addr(2), now, &keys_for_test()).unwrap();
-            let heard = a.step(Input::Advertisement(frame), now);
+            let heard = a.step(Input::Advertisement(frame.frame), now);
             assert!(heard.effects.iter().any(|e| matches!(e, Effect::Disconnect { .. })));
             assert!(!heard.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
             assert!(!a.output.wants_output());

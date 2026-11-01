@@ -143,3 +143,24 @@ introduce an extra pause. Perceived synchronization still needs listener validat
 The corrected build passed 381 unit tests, 33 acceptance scenarios and Clippy.
 It was deployed to XPS and Gram; both services ran the matching binary and
 answered status requests. This deployment check did not measure lip sync.
+
+## Case insertion while speaker playback continues
+
+The 2026-11-01 09:39:48 XPS attempt failed with `Host is down` after 5.1 seconds.
+The next attempt began at 09:39:54.396; Bluetooth connected at 09:39:58.525 and
+audio became active at 09:40:03.440. Speaker playback was muted at 09:39:53.197.
+There was no output rebuild or MPRIS pause from FleetPods in this sequence, so
+the handoff-resume correction was not involved.
+
+Periodic connector-preference envelopes still bypassed advertisement deferral
+every three seconds. They now count as routine traffic; new preference records
+remain coordination traffic. Queued envelopes coalesce without dropping an
+unsent change's priority. Regression coverage checks that repeated refreshes
+produce no advertisements during a simulated connection attempt, genuine
+changes still air, and broadcasts resume after connection. The build passed
+384 unit tests, 33 acceptance scenarios and Clippy.
+
+Repeat this insertion scenario and inspect the new advertisement-release and
+changed-preference logs alongside connection timing. Even this narrower exception
+does not establish that advertising caused the failed first attempt. A cold
+connection still uses the existing muted-stream hold while output setup proceeds.
