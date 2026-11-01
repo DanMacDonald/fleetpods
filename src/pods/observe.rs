@@ -8,8 +8,8 @@
 //! packets and tests both arrive as these observations; nobody
 //! re-parses the packet downstream.
 
-use crate::pods::setup::{Event, FollowUp, Place, Setup};
-use crate::types::{Address, NoiseMode};
+use crate::pods::setup::{FollowUp, Place, Setup};
+use crate::types::{Address, MonoMs, NoiseMode};
 
 /// One fact an accessory packet stated.
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +35,7 @@ pub fn translate(
     setup: &mut Setup,
     packet: &[u8],
     local: Option<Address>,
+    setup_time: Option<MonoMs>,
 ) -> (Option<FollowUp>, Vec<Observation>) {
     let mut observations = Vec::new();
     if let Some(report) = crate::pods::peer::parse(packet) {
@@ -51,25 +52,8 @@ pub fn translate(
     if let Some(peer) = crate::pods::setup::peer_reconnect(packet) {
         observations.push(Observation::PeerReconnect(peer));
     }
-    let (follow, events) = setup.observe(packet);
-    for event in events {
-        observations.push(match event {
-            Event::BudReport { bud, level, charging, place } => {
-                Observation::Bud { bud, level, charging, place }
-            }
-            Event::Case { level, charging } => Observation::CaseBattery { level, charging },
-            Event::Ownership(locally) => Observation::Ownership(locally),
-            Event::Source { address, kind } => {
-                let mine = local == Some(address);
-                Observation::Source { local: mine, kind, remote: (!mine).then_some(address) }
-            }
-            Event::Noise(mode) => Observation::Noise(mode),
-            Event::Identity { name, model } => Observation::Identity { name, model },
-            Event::Keys { irk, encryption } => Observation::Keys { irk, encryption },
-            Event::PodPeers { peers, owner } => Observation::PodPeers { peers, owner },
-            Event::Ready => Observation::Ready,
-        });
-    }
+    let (follow, events) = setup.observe(packet, local, setup_time);
+    observations.extend(events);
     (follow, observations)
 }
 
@@ -82,7 +66,7 @@ mod tests {
     fn an_ownership_packet_becomes_one_observation() {
         let mut setup = Setup::new();
         let packet = [0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x01, 0x00, 0x00, 0x00];
-        let (_, observations) = translate(&mut setup, &packet, None);
+        let (_, observations) = translate(&mut setup, &packet, None, Some(MonoMs(0)));
         assert_eq!(observations, vec![Observation::Ownership(true)]);
     }
 
@@ -90,14 +74,33 @@ mod tests {
     fn a_priority_acknowledgement_is_an_observation() {
         let mut setup = Setup::new();
         let packet = [0x04, 0x00, 0x04, 0x00, 0x40, 0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let (_, observations) = translate(&mut setup, &packet, None);
+        let (_, observations) = translate(&mut setup, &packet, None, Some(MonoMs(0)));
         assert_eq!(observations, vec![Observation::PriorityAcknowledged]);
+    }
+
+    #[test]
+    fn source_reports_normalize_known_local_and_unknown_hosts_once() {
+        let address = Address::parse("11:22:33:44:55:66").unwrap();
+        let other = Address::parse("AA:BB:CC:DD:EE:FF").unwrap();
+        let packet = [4, 0, 4, 0, 0x0e, 0, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 2];
+        for local in [Some(address), Some(other), None] {
+            let (_, reports) = translate(&mut Setup::new(), &packet, local, None);
+            let mine = local == Some(address);
+            assert_eq!(
+                reports,
+                vec![Observation::Source {
+                    local: mine,
+                    kind: 2,
+                    remote: (!mine).then_some(address)
+                }]
+            );
+        }
     }
 
     #[test]
     fn unknown_packets_state_nothing() {
         let mut setup = Setup::new();
-        let (_, observations) = translate(&mut setup, &[0x01, 0x02, 0x03], None);
+        let (_, observations) = translate(&mut setup, &[0x01, 0x02, 0x03], None, Some(MonoMs(0)));
         assert!(observations.is_empty());
     }
 }

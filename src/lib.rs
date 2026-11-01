@@ -12,6 +12,7 @@ mod handshake;
 pub mod linux;
 pub mod panel;
 pub mod pods;
+pub mod retry;
 pub mod step;
 pub mod types;
 

@@ -25,7 +25,6 @@ use crate::panel::status::{self, Snapshot};
 use crate::pods::link::{Connection, FailReason, Stage};
 use crate::pods::prefs::Config;
 use crate::pods::reports::{Accessory, Placement, Pod};
-use crate::pods::setup::Setup;
 use crate::types::{
     code, Address, Clock, Code, FleetId, Generation, HostId, InvitationId, LidState, Model, MonoMs,
     NoiseMode, UnixMs,
@@ -88,7 +87,10 @@ pub(crate) struct PendingEffects {
     pub announce_dirty: bool,
 }
 
+mod session;
+
 pub struct Daemon {
+    session: session::Session,
     pub(crate) local_name: String,
     pub(crate) local_address: Option<Address>,
     pub(crate) config: Config,
@@ -113,17 +115,12 @@ pub struct Daemon {
     /// Also holds off enrollment after a failed startup read, until a retry succeeds.
     pub(crate) keyring_locked: bool,
     pub(crate) roster_seq: u64,
-    pub(crate) link_asked: Option<Generation>,
     pub(crate) effects: PendingEffects,
     pub(crate) commit: crate::fleet::commit::Commit,
-    pub(crate) accessory_setup: Setup,
     priority_until: Option<MonoMs>,
     priority_generation: u64,
     /// The only seat record. Claim and step-back are its writers. Status reads it.
     pub(crate) seat: Seat,
-    reconnect: crate::pods::reconnect::Reconnect,
-    reconnect_retry_at: Option<MonoMs>,
-    reconnect_retries: u8,
     /// Hold passive reconnects after yielding or losing a slot so the
     /// incoming device can finish connecting without being displaced.
     slot_hold_until: Option<MonoMs>,
@@ -133,50 +130,17 @@ pub struct Daemon {
     pair_audio_owner: Option<Address>,
     reopen_wait: bool,
     reopen_hold_until: Option<MonoMs>,
-    codec_asked: Option<String>,
-    transport_asked: bool,
-    transport_asked_early: bool,
-    /// When BlueZ first refused or ignored this claim's audio profile
-    /// request, and when the request may go out again.
-    transport_first_refused: Option<MonoMs>,
-    transport_retry_at: Option<MonoMs>,
+    pub(crate) lifecycle: crate::pods::lifecycle::Lifecycle,
     pub(crate) staged_controls: Vec<Vec<u8>>,
     pub(crate) peers_seated: Vec<Address>,
     pub(crate) output: crate::audio::route::Router,
     pub(crate) last_graph: Option<crate::audio::route::Graph>,
     pub(crate) output_health: crate::audio::health::Health,
     pub(crate) rearm_output: Option<crate::audio::health::Output>,
-    pub(crate) resume_output_on_grant: bool,
-    /// The pods took ownership away since this laptop last relinked its output.
-    pub(crate) rearm_after_loss: bool,
     /// Whether the accessory's A2DP transport is streaming.
     pub(crate) transport_active: bool,
-    /// When to check that a rebuilt output actually started.
-    pub(crate) rearm_verify_at: Option<MonoMs>,
-    pub(crate) rearm_retries: u8,
-    /// Until then, a player pausing itself is a side effect of the rebuild.
-    pub(crate) rebuild_pause_until: Option<MonoMs>,
-    /// Players to play again once the output rebuild is done.
-    pub(crate) resume_players: Vec<String>,
-    /// Players this daemon just played again; their Playing is not a new claim.
-    pub(crate) resumed_players: Vec<String>,
-    /// Until then, release the AirPods output once it goes idle after the
-    /// pods moved to another computer.
-    pub(crate) release_output_until: Option<MonoMs>,
-    /// When a claim was sent as a new link became ready.
-    pub(crate) setup_claim_at: Option<MonoMs>,
-    /// When the control link last became ready.
-    pub(crate) link_ready_at: Option<MonoMs>,
     /// When each pod (left, right) last advertised while sending the frame.
     pub(crate) advertised_self_at: [Option<MonoMs>; 2],
-    /// When this laptop last sent a claim on the control link.
-    pub(crate) claim_sent_at: Option<MonoMs>,
-    /// A remote report arrived just after a claim; it ends the claim unless
-    /// the pods grant it first.
-    pub(crate) yield_pending: bool,
-    /// Rebuild again even though Pulse reports the sink running.
-    pub(crate) force_rearm: bool,
-    pub(crate) output_restart_serial: u64,
     pub(crate) radio_inbox: crate::fleet::radio::Inbox,
     /// Letter frames waiting to be split. The daemon chooses each fragment.
     pub(crate) outbound: crate::fleet::radio::Schedule,
@@ -220,16 +184,6 @@ pub struct Daemon {
     /// An Apple device took the slot this laptop had been sitting in.
     /// A failed route, a closed case, and an idle link do not set this.
     displaced: bool,
-    /// The pods reset this laptop's link mid-playback with no fleet laptop
-    /// taking over: an Apple device reconnecting as the buds go back in.
-    /// The players stay paused until this laptop is back alongside it.
-    rejoin: Option<Rejoin>,
-    rejoined_at: Option<MonoMs>,
-    pub(crate) background_requested: bool,
-    /// A play pressed without evidence the pods can play. The
-    /// claim waits until they are available or connect, so the speakers are not
-    /// soft-muted for a takeover that may never happen.
-    deferred_playback_claim: Option<MonoMs>,
     case_opened_at: Option<MonoMs>,
     apple_labels: std::collections::HashMap<Address, String>,
     apple_labels_dirty: bool,
@@ -259,13 +213,6 @@ pub struct Daemon {
     route_block: Option<&'static str>,
     /// The connection packet. A retry sends these same bytes.
     route_connection: Option<Vec<u8>>,
-}
-
-struct Rejoin {
-    /// When to open the link; once opened, when to stop waiting for it.
-    at: MonoMs,
-    players: Vec<String>,
-    opened: bool,
 }
 
 struct PendingAdmission {
@@ -314,11 +261,6 @@ enum ActivityTarget {
     Several,
 }
 
-/// Delay between automatic retries after a failed Apple reconnect, and how
-/// many to attempt before waiting for activity again.
-const RECONNECT_RETRY_DELAY_MS: u64 = 3_000;
-const RECONNECT_RETRY_LIMIT: u8 = 3;
-
 /// How long a yielded slot stays yielded: long enough for the Apple device
 /// to take it, short enough that the laptop rejoins on its own afterwards.
 const SLOT_HOLD_MS: u64 = 30_000;
@@ -341,11 +283,10 @@ const REJOIN_DELAY_MS: u64 = 2_000;
 /// insists, and the next play is the user's call.
 const REJOIN_WINDOW_MS: u64 = 20_000;
 
-/// BlueZ can answer the audio profile `InProgress` for most of a minute after
-/// a connect collides with the pods (XPS, 2026-10-27 10:56). Ask again at this
-/// pace while playback still wants the pods, for at most the window.
-const TRANSPORT_RETRY_MS: u64 = 2_000;
-const TRANSPORT_RETRY_WINDOW_MS: u64 = 30_000;
+#[cfg(test)]
+use crate::pods::lifecycle::{
+    RETRY_MS as TRANSPORT_RETRY_MS, RETRY_WINDOW_MS as TRANSPORT_RETRY_WINDOW_MS,
+};
 
 /// A first device list this soon after the Bluetooth link came up shows
 /// who was on the pods before this laptop joined.
@@ -366,6 +307,7 @@ impl Daemon {
 
     pub fn new(local_name: impl Into<String>) -> Self {
         Self {
+            session: session::Session::default(),
             local_name: local_name.into(),
             local_address: None,
             config: Config::new(),
@@ -389,47 +331,24 @@ impl Daemon {
             offer: None,
             keyring_locked: false,
             roster_seq: 0,
-            link_asked: None,
             effects: PendingEffects { announce_dirty: true, ..Default::default() },
             commit: crate::fleet::commit::Commit::new(),
-            accessory_setup: Setup::new(),
             priority_until: None,
             priority_generation: 0,
             seat: Seat::new(),
-            reconnect: crate::pods::reconnect::Reconnect::new(),
-            reconnect_retry_at: None,
-            reconnect_retries: 0,
             slot_hold_until: None,
             pair_audio_owner: None,
             reopen_wait: false,
             reopen_hold_until: None,
-            codec_asked: None,
-            transport_asked: false,
-            transport_asked_early: false,
-            transport_first_refused: None,
-            transport_retry_at: None,
+            lifecycle: crate::pods::lifecycle::Lifecycle::default(),
             staged_controls: Vec::new(),
             peers_seated: Vec::new(),
             output: crate::audio::route::Router::new(),
             last_graph: None,
             output_health: crate::audio::health::Health::default(),
             rearm_output: None,
-            resume_output_on_grant: false,
-            rearm_after_loss: false,
             transport_active: false,
-            rearm_verify_at: None,
-            rearm_retries: 0,
-            rebuild_pause_until: None,
-            resume_players: Vec::new(),
-            resumed_players: Vec::new(),
-            release_output_until: None,
-            setup_claim_at: None,
-            link_ready_at: None,
             advertised_self_at: [None, None],
-            claim_sent_at: None,
-            yield_pending: false,
-            force_rearm: false,
-            output_restart_serial: 0,
             radio_inbox: crate::fleet::radio::Inbox::new(),
             outbound: crate::fleet::radio::Schedule::new(),
             presence_air: crate::fleet::airtime::PresenceAir::new(),
@@ -459,10 +378,6 @@ impl Daemon {
             roster_probe: None,
             roster_probe_after: None,
             displaced: false,
-            rejoin: None,
-            rejoined_at: None,
-            background_requested: false,
-            deferred_playback_claim: None,
             case_opened_at: None,
             apple_labels: std::collections::HashMap::new(),
             apple_labels_dirty: false,
@@ -591,6 +506,7 @@ impl Daemon {
                 })
             })
             .unwrap_or(Value::Null);
+        value["connection_lifecycle"] = status::lifecycle(&self.lifecycle.progress());
         value["audio_transport_active"] = serde_json::json!(self.transport_active);
         value["nearby_airpods"] = self.nearby_pods.status(now.mono);
         value["audio_output_health"] = serde_json::json!({
@@ -652,9 +568,7 @@ impl Daemon {
                 Response::line("error: discovery control is not available")
             }
             Command::Disconnect => {
-                self.rejoin = None;
-                self.effects.drop_link = true;
-                self.interrupt("disconnect", now);
+                self.disconnect_session(now);
                 Response::line("ok")
             }
             Command::Forget => self.forget(now),
@@ -668,82 +582,6 @@ impl Daemon {
             Command::Incoming(Err(())) => self.incoming_reply(false, "invalid_json", 0),
             Command::Unknown => Response::none(),
         }
-    }
-
-    pub fn tick(&mut self, now: Clock) {
-        self.expire_roster_probe(now);
-        if self.config.accessory.is_none() && self.nearby_pods.refresh(now.mono) {
-            if let Some(report) = self.nearby_pods.selected_report(now.mono) {
-                self.accessory = report;
-            }
-        }
-        self.accessory.expire(now.mono, self.connection.stage() == Stage::Ready);
-        self.discovery.expire(now.unix);
-        self.enrollment.on_tick(now.mono);
-        if let Some(at) = self.deferred_playback_claim {
-            if now.mono.saturating_since(at) > 30_000 || !self.audio.local_playing() {
-                self.deferred_playback_claim = None;
-            } else if !self.accessory.stowed()
-                && !self.accessory.both_docked()
-                && self.preferred_connection_allowed()
-                // Setup can complete with battery and roster reports alone.
-                // That says nothing about whether a docked bud has come out.
-                && self.accessory.playback_available(now.mono)
-            {
-                self.deferred_playback_claim = None;
-                self.claim_playback(now);
-                // This play predates the link, so its opening reports do too.
-                if self.output.wants_output()
-                    && self.link_ready_at.is_some_and(|ready| {
-                        now.mono.saturating_since(ready) < crate::step::SETUP_CLAIM_SETTLE_MS
-                    })
-                {
-                    self.setup_claim_at = Some(now.mono);
-                }
-            }
-        }
-        if let Some(pending) = &self.pending_admission {
-            let failure = if pending.release.is_none() && self.connection.stage() != Stage::Ready {
-                Some(crate::fleet::route_air::Answer::Unavailable)
-            } else if now.mono.0 >= pending.until.0 {
-                Some(crate::fleet::route_air::Answer::TimedOut)
-            } else {
-                None
-            };
-            if let Some(reason) = failure {
-                self.finish_admission(reason, now);
-            }
-        }
-        let intent_valid = self.background_requested
-            || self.routing.intent() == crate::fleet::route::Intent::Claim
-            || matches!(
-                self.routing.phase(),
-                crate::fleet::route::Phase::Connecting
-                    | crate::fleet::route::Phase::WaitingCompletion
-            );
-        if !self.hold_pairing_connection(now.mono)
-            && !self.hold_stowed_connection()
-            && !self.radio_quiet()
-        {
-            // A previously ready, idle connection may have rejoined at the
-            // Bluetooth layer during wake. Restore its control session after
-            // the grace without requiring a playback claim or peer admission.
-            let resume_existing = self.preferred_connection_allowed()
-                && self.connection.bluez() == Some(true)
-                && self.connection.stage() == Stage::Interrupted
-                && matches!(self.connection.reason(), "suspend" | "bluez" | "adapter");
-            self.connection.on_tick(now.mono, intent_valid || resume_existing);
-        }
-        if self.connection.stage() == Stage::Failed {
-            self.background_requested = false;
-        }
-        self.audio.touch_players(now.unix);
-        if self.priority_until.is_some_and(|at| now.mono.0 >= at.0) {
-            self.priority_until = None;
-        }
-        self.consider_capture_stall(now.mono);
-        self.advance_reconnect(now);
-        self.retry_failed_reconnect(now);
     }
 
     pub fn note_bluez(&mut self, up: bool) {
@@ -813,33 +651,6 @@ impl Daemon {
         self.connection.note_profile_pending(pending);
     }
 
-    pub fn note_socket(&mut self, up: bool, generation: Generation, now: MonoMs) {
-        if generation != self.connection.generation() {
-            return;
-        }
-        if !up {
-            if self.connection.stage() == Stage::Ready
-                && !self.routing.phase().busy()
-                && !self.connection.apple_reconnect()
-            {
-                let until = now.saturating_add(DISPLACEMENT_HOLD_MS);
-                self.slot_hold_until = Some(self.slot_hold_until.map_or(until, |held| {
-                    if held.0 > until.0 {
-                        held
-                    } else {
-                        until
-                    }
-                }));
-            }
-            self.consider_apple_displacement();
-            self.consider_reopen_order();
-        }
-        if self.connection.note_socket(up, generation) {
-            self.background_requested = false;
-            self.drop_reports();
-        }
-    }
-
     /// The other device sharing the pods with this laptop, when the pods
     /// named exactly two and this laptop is one of them.
     fn pod_pair_other(&self) -> Option<Address> {
@@ -906,170 +717,6 @@ impl Daemon {
         self.reopen_blocked(now)
     }
 
-    /// The ready link is about to drop. Read before the drop clears the pods'
-    /// list: a fleet laptop in it is a handoff, and a playing phone or Mac
-    /// keeps what it took.
-    pub(crate) fn evicted_while_playing(&self, now: Clock) -> bool {
-        let fleet_laptop = self
-            .pod_peers
-            .iter()
-            .any(|peer| Some(*peer) != self.local_address && self.membership.contains(*peer));
-        self.output.wants_output()
-            && self.audio.local_playing()
-            && !fleet_laptop
-            && !self.routing.phase().busy()
-            && !self.connection.apple_reconnect()
-            && !self.radio_quiet()
-            && self.connection.reason() != "disconnect"
-            && self.preferred_connection_allowed()
-            && !self.outside_device_playing(now)
-            && self.rejoined_at.is_none_or(|at| now.mono.saturating_since(at) >= REJOIN_WINDOW_MS)
-    }
-
-    /// Keep the players this drop paused and rejoin once the newcomer settles.
-    pub(crate) fn plan_rejoin(&mut self, players: Vec<String>, now: MonoMs) {
-        eprintln!("fleetpodsd: the pods dropped this laptop mid-playback; rejoining in {REJOIN_DELAY_MS} ms");
-        self.rejoined_at = Some(now);
-        self.rejoin =
-            Some(Rejoin { at: now.saturating_add(REJOIN_DELAY_MS), players, opened: false });
-    }
-
-    /// Open the link alongside the device that took this laptop's place.
-    /// The claim and the resume wait for control readiness.
-    pub(crate) fn advance_rejoin(&mut self, now: Clock) {
-        let Some(rejoin) = &self.rejoin else {
-            return;
-        };
-        if now.mono.0 < rejoin.at.0 {
-            return;
-        }
-        if rejoin.opened {
-            eprintln!("fleetpodsd: rejoin gave up; the AirPods link did not come back");
-            self.rejoin = None;
-            return;
-        }
-        let cancel = if self.output.wants_output() {
-            Some("a newer play took over")
-        } else if self.routing.phase().busy() || self.connection.apple_reconnect() {
-            Some("routing in progress")
-        } else if self.radio_quiet() || self.connection.reason() == "disconnect" {
-            Some("link unavailable")
-        } else if !self.preferred_connection_allowed() {
-            Some("another laptop is preferred")
-        } else if self.outside_device_playing(now) {
-            Some("a device outside the fleet is playing")
-        } else if self.accessory.stowed() || self.accessory.both_docked() {
-            Some("the buds are docked")
-        } else {
-            None
-        };
-        if let Some(reason) = cancel {
-            eprintln!("fleetpodsd: rejoin cancelled: {reason}");
-            self.rejoin = None;
-            return;
-        }
-        if let Some(rejoin) = &mut self.rejoin {
-            rejoin.opened = true;
-            rejoin.at = now.mono.saturating_add(REJOIN_WINDOW_MS);
-        }
-        if self.connection.stage() == Stage::Ready {
-            self.claim_rejoin(now);
-        } else if !self.connection.stage().is_opening() {
-            eprintln!("fleetpodsd: rejoining the AirPods alongside the device that took this link");
-            self.displaced = false;
-            self.slot_hold_until = None;
-            self.routing.claim_audio();
-            self.open_connection(now.mono);
-        }
-    }
-
-    /// The rejoined link is ready: the players this laptop paused are its claim.
-    pub(crate) fn claim_rejoin(&mut self, now: Clock) {
-        if !self.rejoin.as_ref().is_some_and(|rejoin| rejoin.opened) {
-            return;
-        }
-        let Some(Rejoin { players, .. }) = self.rejoin.take() else {
-            return;
-        };
-        if self.outside_device_playing(now) {
-            eprintln!("fleetpodsd: rejoin cancelled: a device outside the fleet is playing");
-            return;
-        }
-        eprintln!("fleetpodsd: rejoined the AirPods; resuming {players:?}");
-        self.claim_seat(now);
-        for player in players {
-            if !self.resume_players.contains(&player) {
-                self.resume_players.push(player);
-            }
-        }
-        self.replan(now);
-    }
-
-    pub fn mark_control_ready(&mut self, generation: Generation) -> bool {
-        let ready = self.connection.mark_ready(generation);
-        if ready {
-            self.displaced = false;
-            self.slot_hold_until = None;
-            self.reopen_wait = false;
-            self.reopen_hold_until = None;
-            self.background_requested = false;
-            self.microphone.set_control_ready(true);
-        }
-        ready
-    }
-
-    pub fn note_setup_failed(&mut self, generation: Generation, reason: FailReason, now: MonoMs) {
-        let intent_valid = self.background_requested
-            || self.routing.intent() == crate::fleet::route::Intent::Claim
-            || matches!(
-                self.routing.phase(),
-                crate::fleet::route::Phase::Connecting
-                    | crate::fleet::route::Phase::WaitingCompletion
-            );
-        let stage = self.connection.stage();
-        self.connection.setup_failed(generation, reason, now, intent_valid);
-        eprintln!(
-            "fleetpodsd: setup failure generation={} stage={} reason={} intent={} next={} attempt={}",
-            generation.0, stage.wire(), reason.label(), intent_valid,
-            self.connection.stage().wire(), self.connection.retry().0
-        );
-        if self.connection.stage() == Stage::Failed {
-            self.background_requested = false;
-        }
-    }
-
-    pub fn interrupt(&mut self, reason: &'static str, now: Clock) {
-        self.background_requested = false;
-        self.connection.interrupt(reason);
-        self.drop_reports();
-        if reason == "disconnect" {
-            self.step_back(now);
-        }
-        if matches!(reason, "suspend" | "bluez" | "adapter" | "disconnect") {
-            self.routing.restart();
-            if self.peers.has_air() {
-                self.roster_dirty = true;
-            }
-            self.peers.invalidate();
-        }
-    }
-
-    /// The link report is stale. The playback claim stays until the user releases it.
-    fn drop_reports(&mut self) {
-        self.roster_probe = None;
-        self.roster_probe_after = None;
-        self.resume_output_on_grant = false;
-        self.end_capture();
-        self.microphone.set_control_ready(false);
-        self.accessory.drop_owner();
-        self.peer_playback.clear();
-        self.idle_claimed = None;
-        self.activity_at = None;
-        self.pod_peers.clear();
-        self.pod_peers_known = false;
-        self.pod_peers_at = None;
-    }
-
     /// Start the wake grace when the controller can be used again.
     /// Returns whether a reconnect is waiting. Otherwise the thread may attach now.
     pub(crate) fn wake_link(&mut self, at: MonoMs) -> bool {
@@ -1134,7 +781,7 @@ impl Daemon {
         let (left, right) =
             (ear(&self.accessory.left_placement), ear(&self.accessory.right_placement));
         self.note_ears(left, right, at, at);
-        self.hold_stowed_connection();
+        self.enforce_connection_admission(at);
     }
 
     /// An insertion is a bud going in after both were out for a second. The
@@ -1160,86 +807,10 @@ impl Daemon {
         }
     }
 
-    fn hold_stowed_connection(&mut self) -> bool {
-        if !self.accessory.stowed() {
-            return false;
-        }
-        self.background_requested = false;
-        if self.connection.reason() != "disconnect" && self.connection.wait_for_request() {
-            self.effects.drop_link = true;
-            self.drop_reports();
-        }
-        if self.routing.phase().busy() {
-            self.routing.restart();
-        }
-        true
-    }
-
     pub(crate) fn pairing_elsewhere(&self, now: MonoMs) -> bool {
         self.config.accessory.is_some()
             && self.membership.accessory_keys_ready()
             && self.accessory.pairing_at.is_some_and(|at| now.saturating_since(at) < 3_000)
-    }
-
-    /// An already paired host must leave the accessory available for a new host.
-    /// Retire queued attempts, but do not tear down an established connection.
-    fn hold_pairing_connection(&mut self, now: MonoMs) -> bool {
-        if !self.pairing_elsewhere(now) {
-            return false;
-        }
-        self.background_requested = false;
-        let asked = self.link_asked == Some(self.connection.generation());
-        if self.connection.reason() != "disconnect" && self.connection.wait_for_request() {
-            self.effects.drop_link |= asked;
-            self.drop_reports();
-        }
-        if self.routing.phase().busy() {
-            self.routing.restart();
-        }
-        true
-    }
-
-    fn open_connection(&mut self, now: MonoMs) {
-        // A nearby advertisement is not a local Bluetooth pairing.
-        if self.config.accessory.is_none() || self.hold_pairing_connection(now) {
-            return;
-        }
-        if !self.hold_stowed_connection() {
-            let not_before = self
-                .case_opened_at
-                .map(|at| at.saturating_add(crate::pods::link::CASE_WAKE_GRACE_MS))
-                .unwrap_or(now);
-            self.connection.claim_after(now, not_before);
-        }
-    }
-
-    /// An existing Bluetooth ACL still needs a tracked, retryable control setup.
-    /// Property updates must never reopen an established seat that was lost.
-    pub(crate) fn attach_available(&mut self, generation: Generation, now: MonoMs) {
-        if !self.preferred_connection_allowed() {
-            if generation == self.connection.generation()
-                && self.connection.bluez() == Some(true)
-                && self.connection.stage() != Stage::Ready
-            {
-                self.effects.drop_link = true;
-            }
-            return;
-        }
-        if self.background_reopen_blocked(now) {
-            return;
-        }
-        if generation != self.connection.generation()
-            || !matches!(self.connection.stage(), Stage::Idle | Stage::Waiting)
-            || self.connection.bluez() != Some(true)
-            || self.routing.phase().busy()
-            || self.radio_quiet()
-            || self.hold_pairing_connection(now)
-            || self.hold_stowed_connection()
-        {
-            return;
-        }
-        self.background_requested = true;
-        self.open_connection(now);
     }
 
     pub fn note_noise_report(&mut self, mode: NoiseMode, at: MonoMs) {
@@ -1644,7 +1215,6 @@ impl Daemon {
         // local reports, and hold background reconnects while the peer settles.
         let was_busy = self.routing.phase().busy();
         self.note_socket(false, generation, now.mono);
-        self.accessory_setup = Setup::new();
         if !was_busy {
             self.step_back(now);
         }
@@ -2175,11 +1745,7 @@ impl Daemon {
             }
             (Kind::Admission, other) => {
                 let _ = self.routing.fail(tx, other.text(), now.unix);
-                if other == Answer::Unavailable && self.background_requested {
-                    self.open_background_connection(now);
-                } else {
-                    self.background_requested = false;
-                }
+                self.background_admission_failed(other == Answer::Unavailable, now);
             }
             (Kind::Connection, _) => self.hear_connection(&message, now),
             (Kind::Complete, _) => {
@@ -2822,7 +2388,7 @@ impl Daemon {
             self.case_opened_at = None;
         }
         self.accessory.note_lid(state, now);
-        self.hold_stowed_connection();
+        self.enforce_connection_admission(now);
         if !open && self.displaced {
             let worn = |pod: &crate::types::Evidence<crate::pods::reports::Pod>| {
                 pod.known().is_some_and(|pod| pod.in_ear == Some(true))
@@ -2859,7 +2425,7 @@ impl Daemon {
                     eprintln!("fleetpodsd: known AirPods entered pairing mode; holding reconnects");
                 }
                 self.accessory.pairing_at = Some(now.mono);
-                self.hold_pairing_connection(now.mono);
+                self.enforce_connection_admission(now.mono);
             }
             return;
         }
@@ -3043,11 +2609,7 @@ impl Daemon {
             EarAction::Resume => {
                 let players = self.audio.take_ear_paused();
                 eprintln!("fleetpodsd: the buds are back in; resuming {players:?}");
-                for player in players {
-                    if !self.resume_players.contains(&player) {
-                        self.resume_players.push(player);
-                    }
-                }
+                self.queue_resume(players);
             }
         }
     }
@@ -3360,144 +2922,10 @@ impl Daemon {
         )
     }
 
-    /// The remembered host alone reacts to availability. A sleeping owner is
-    /// never timed out in favor of a less recently used laptop.
-    pub(crate) fn reconnect_preferred(&mut self, now: Clock) {
-        let available = self.pods_available(now.mono);
-        self.activity_preference.observe_availability(available, now.mono);
-        if self.connection.stage() != Stage::Ready
-            && !self.preferred_connection_allowed()
-            && !self.connection.apple_reconnect()
-        {
-            let asked = self.link_asked == Some(self.connection.generation());
-            if self.connection.reason() != "disconnect" && self.connection.wait_for_request() {
-                self.effects.drop_link |= asked;
-            }
-            self.background_requested = false;
-            self.deferred_playback_claim = None;
-            if matches!(
-                self.routing.phase(),
-                Phase::WaitingAdmission | Phase::Connecting | Phase::WaitingCompletion
-            ) {
-                self.routing.restart();
-            }
-            if self.output.wants_output() {
-                // A superseded pending connection must not leave speaker
-                // playback muted while waiting for a link it cannot open.
-                // Release restores the route and does not pause players.
-                let _ = self.yield_seat(now);
-                self.routing.release_audio();
-                self.resume_output_on_grant = false;
-                self.output.release();
-                self.replan(now);
-            }
-            return;
-        }
-        if !available
-            || self.connection.reason() == "disconnect"
-            || self.radio_quiet()
-            || self.keyring_locked
-            || !matches!(self.connection.stage(), Stage::Idle | Stage::Waiting | Stage::Interrupted)
-            || self.routing.phase().busy()
-            || self.connection.apple_reconnect()
-            || self.outside_device_playing(now)
-            || self.background_reopen_blocked(now.mono)
-        {
-            return;
-        }
-        let (Some(record), Some(local)) = (self.preferred_connector(), self.local_address) else {
-            return;
-        };
-        // Commit the one wake only when this same evidence will open.
-        // A fresh Pod placement can make the pods available while the
-        // battery slots are still empty; that open has to proceed.
-        if self.wake_can_open(now) && self.activity_preference.take_wake(record, local, now.mono) {
-            self.connection.prepare();
-            self.background_requested = true;
-            self.begin_background_open(now);
-        }
-    }
-
     fn pods_available(&self, now: MonoMs) -> bool {
         !self.accessory.stowed()
             && (self.accessory.lid.latest.as_fresh() == Some(&LidState::Open)
                 || self.accessory.playback_available(now))
-    }
-
-    fn wake_can_open(&mut self, now: Clock) -> bool {
-        self.preferred_connection_allowed()
-            && self.config.accessory.is_some()
-            && !self.radio_quiet()
-            && !self.hold_pairing_connection(now.mono)
-            && self.pods_available(now.mono)
-    }
-
-    fn activity(&mut self, now: Clock) -> Response {
-        self.remember_activity(now);
-        if self.config.accessory.is_none()
-            || self.radio_quiet()
-            || self.hold_pairing_connection(now.mono)
-            || self.hold_stowed_connection()
-            || self.routing.phase().busy()
-            || self.connection.apple_reconnect()
-            || self.connection.stage().is_opening()
-            || self.connection.stage() == Stage::Retrying
-        {
-            return Response::line("ignored");
-        }
-        if self.connection.stage() == Stage::Ready {
-            self.activity_at = Some(now.mono);
-            return Response::line(if self.claim_idle_on_activity(now) {
-                "accepted"
-            } else {
-                "ignored"
-            });
-        }
-        // Connecting this laptop in the background takes one of the pods' two
-        // connections. Input alone must not cost a playing phone or Mac its
-        // connection (gram, 2026-10-19); a play here still takes over.
-        if self.outside_device_playing(now) {
-            eprintln!("fleetpodsd: activity ignored while a device outside the fleet plays on the AirPods");
-            return Response::line("ignored");
-        }
-        // Input on an established link can claim idle audio immediately. Input
-        // after a slot loss must not evict the device still taking that slot.
-        if self.slot_hold_until.is_some_and(|until| now.mono.0 < until.0) {
-            eprintln!("fleetpodsd: activity ignored while a yielded slot is held");
-            return Response::line("ignored");
-        }
-        self.slot_hold_until = None;
-        // Use a connected helper when present; otherwise open only the control link.
-        let target = self.activity_target(now);
-        // The reopen hold lets the pair's audio owner land first. A connected
-        // fleet helper means it already has, so input asks that helper for a
-        // seat instead of waiting out the hold.
-        if matches!(target, ActivityTarget::One(_)) {
-            self.reopen_wait = false;
-            self.reopen_hold_until = None;
-        } else if self.reopen_blocked(now.mono) {
-            eprintln!("fleetpodsd: activity ignored while the audio owner reconnects first");
-            return Response::line("ignored");
-        }
-        match target {
-            ActivityTarget::Several => Response::line("ignored"),
-            ActivityTarget::One(peer) => {
-                self.connection.prepare();
-                match self.routing.start(peer) {
-                    crate::fleet::route::Start::Sent { .. }
-                    | crate::fleet::route::Start::Duplicate => {
-                        self.background_requested = true;
-                        Response::line("accepted")
-                    }
-                    crate::fleet::route::Start::Busy => Response::line("ignored"),
-                }
-            }
-            ActivityTarget::None => {
-                self.connection.prepare();
-                self.open_background_connection(now);
-                Response::line("accepted")
-            }
-        }
     }
 
     /// A phone or Mac (not a fleet laptop) plays on the pods, by this laptop's
@@ -3517,31 +2945,6 @@ impl Daemon {
                 !report.pending && !report.audio_idle && report.audio_source.is_some_and(outside)
             },
         )
-    }
-
-    fn open_background_connection(&mut self, now: Clock) {
-        if !self.preferred_connection_allowed() {
-            return;
-        }
-        let out = |pod: &crate::types::Evidence<Pod>| {
-            pod.as_fresh().is_some_and(|pod| pod.in_ear == Some(true) || pod.in_case == Some(false))
-        };
-        self.background_requested = self.config.accessory.is_some()
-            && !self.radio_quiet()
-            && !self.accessory.stowed()
-            && (self.accessory.lid.latest.as_fresh() == Some(&LidState::Open)
-                || out(&self.accessory.left)
-                || out(&self.accessory.right));
-        if self.background_requested {
-            self.begin_background_open(now);
-        }
-    }
-
-    fn begin_background_open(&mut self, now: Clock) {
-        self.routing.clear_failure();
-        self.displaced = false;
-        self.open_connection(now.mono);
-        eprintln!("fleetpodsd: activity opening the background control connection");
     }
 
     /// Keep fresh input through the peer's pause debounce, never through a later session.
@@ -3637,191 +3040,8 @@ impl Daemon {
         }
     }
 
-    fn connect(&mut self, now: Clock) -> Response {
-        self.remember_activity(now);
-        if self.hold_pairing_connection(now.mono) {
-            return Response::line("error: AirPods are in pairing mode; finish pairing first");
-        }
-        if self.connection.apple_reconnect() {
-            return Response::line("error: reconnect already in progress");
-        }
-        if self.routing.phase().busy() {
-            if self.routing.phase() == Phase::WaitingCompletion
-                && self.routing.queue_claim_until_route_lands()
-            {
-                return Response::line("accepted");
-            }
-            return Response::line("error: fleet routing in progress");
-        }
-        if self.config.accessory.is_none() {
-            return Response::line("error: no paired AirPods address");
-        }
-        self.displaced = false;
-        self.routing.claim_audio();
-        self.open_connection(now.mono);
-        Response::line("accepted")
-    }
-
-    fn claim_handoff(&mut self, now: Clock) -> Response {
-        self.remember_activity(now);
-        if self.routing.phase().busy() && self.routing.phase() != Phase::WaitingCompletion {
-            return Response::line("fleet_routing_busy");
-        }
-        let linked = self.connection.socket_up() == Some(true);
-        let packet = if linked {
-            if self.priority_until.is_some() {
-                return Response::line("request_pending");
-            }
-            let Some(local) = self.local_address else {
-                return Response::line("control_unavailable");
-            };
-            let Some(packet) = crate::pods::setup::priority(local, None) else {
-                return Response::line("invalid_priority_pair");
-            };
-            Some(packet)
-        } else {
-            None
-        };
-        self.claim_seat_user(now);
-        if let Some(packet) = packet {
-            self.queue_priority(packet, now);
-            return Response::line("written_waiting_for_ack");
-        }
-        self.open_connection(now.mono);
-        Response::line("queued")
-    }
-
-    /// Take the seat. Routing intent, the audio route, and the yield flag move together.
-    fn claim_seat(&mut self, now: Clock) {
-        self.seat.claim(now);
-        self.apply_claim();
-        self.output.extend_takeover(now.mono);
-    }
-
-    /// Take the seat for an explicit user switch.
-    fn claim_seat_user(&mut self, now: Clock) {
-        self.seat.claim_user(now);
-        self.apply_claim();
-        self.output.extend_takeover(now.mono);
-    }
-
-    fn apply_claim(&mut self) {
-        self.routing.claim_audio();
-        self.output.claim();
-        self.forget_transport_ask();
-        self.audio.clear_yield();
-    }
-
-    /// Another laptop asked this one to leave so an Apple device can take the slot.
-    pub(crate) fn free_slot(&mut self, peer: Address, now: Clock) {
-        if self.local_address == Some(peer) || self.connection.apple_reconnect() {
-            return;
-        }
-        let known = self.membership.contains(peer) || self.peers_seated.contains(&peer);
-        if !known {
-            return;
-        }
-        self.step_back(now);
-        self.effects.drop_link = true;
-        self.slot_hold_until = Some(now.mono.saturating_add(SLOT_HOLD_MS));
-    }
-
-    pub(crate) fn step_back(&mut self, now: Clock) {
-        // Mute before the pause and before streams follow the default back
-        // to the speakers: a player keeps playing for a moment after Pause.
-        self.output.handoff(self.config.accessory, self.last_graph.as_ref(), now.mono);
-        self.rejoin = None;
-        self.background_requested = false;
-        self.deferred_playback_claim = None;
-        self.resume_output_on_grant = false;
-        let players = self.yield_seat(now);
-        self.routing.release_audio();
-        self.forget_transport_ask();
-        if !players.is_empty() {
-            self.effects.pause_players = players;
-        }
-        self.replan(now);
-    }
-
-    /// The seat yield and the audio yield move together.
-    /// A Handoff pauses the returned players. A return to the speakers and a
-    /// preference release do not.
-    fn yield_seat(&mut self, now: Clock) -> Vec<String> {
-        self.seat.step_back(now);
-        self.audio.yield_playback()
-    }
-
     pub(crate) fn seat_audio_failure(&mut self, reason: &'static str, now: Clock) {
         self.seat.note_failure(reason, now);
-    }
-
-    fn release(&mut self, now: Clock) -> Response {
-        self.activity_at = None;
-        self.idle_claimed = None;
-        if self.routing.phase().busy() {
-            return Response::line("fleet_routing_busy");
-        }
-        self.step_back(now);
-        Response::line("ok")
-    }
-
-    fn reconnect_peer(&mut self, now: Clock) -> Response {
-        if self.bluetooth_bonded == Some(false) {
-            return Response::line("error: Bluetooth pairing was not saved. Pair the AirPods again before reconnecting.");
-        }
-        if self.routing.phase().busy() {
-            return Response::line("error: fleet routing in progress");
-        }
-        match self.connection.begin_apple_reconnect() {
-            Ok(()) => {
-                self.routing.release_audio();
-                self.background_requested = false;
-                self.reconnect_retry_at = None;
-                self.reconnect_retries = 0;
-                self.seat.begin_reconnect(now);
-                self.output.handoff(self.config.accessory, self.last_graph.as_ref(), now.mono);
-                self.forget_transport_ask();
-                let players = self.audio.yield_playback();
-                if !players.is_empty() {
-                    self.effects.pause_players = players;
-                }
-                self.reconnect.begin(now.mono);
-                Response::line("accepted")
-            }
-            Err(message) => Response::line(message.trim_end()),
-        }
-    }
-
-    fn advance_reconnect(&mut self, now: Clock) {
-        use crate::pods::reconnect::{Advance, Facts};
-        let facts = Facts {
-            quiet: !self.audio.local_playing(),
-            peers_left: self.reconnect_peers().is_empty(),
-            link_down: self.connection.socket_up() != Some(true)
-                || self.connection.bluez() == Some(false),
-            link_ready: self.connection.stage() == Stage::Ready
-                && self.connection.socket_up() == Some(true)
-                && self.connection.bluez() != Some(false),
-            attempting: matches!(
-                self.connection.stage(),
-                Stage::Connecting
-                    | Stage::Handshake
-                    | Stage::Features
-                    | Stage::Notifications
-                    | Stage::Retrying
-            ),
-        };
-        match self.reconnect.advance(now.mono, facts) {
-            Advance::None => {}
-            Advance::SendRequests => self.send_reconnect_requests(),
-            Advance::DropLink => self.effects.drop_link = true,
-            Advance::Rejoin => {
-                self.background_requested = true;
-                self.connection.rejoin_after_apple_reconnect(now.mono);
-            }
-            Advance::Done => self.seat.note_reconnected(now),
-            Advance::Fail(reason) => self.fail_reconnect(reason, now),
-        }
     }
 
     fn reconnect_peers(&self) -> Vec<Address> {
@@ -3844,56 +3064,6 @@ impl Daemon {
                 );
                 self.queue_setting(packet);
             }
-        }
-    }
-
-    fn fail_reconnect(&mut self, reason: &'static str, now: Clock) {
-        self.connection.fail_apple_reconnect(reason);
-        self.background_requested = false;
-        self.reconnect.cancel();
-        self.seat.note_failure(reason, now);
-        // The attempt is over, but sitting disconnected until the next
-        // activity helps nobody: retry the background connection on a
-        // bounded schedule (see retry_failed_reconnect).
-        self.reconnect_retries = 0;
-        self.reconnect_retry_at = Some(now.mono.saturating_add(RECONNECT_RETRY_DELAY_MS));
-    }
-
-    /// Bounded automatic retry after a failed Apple reconnect: reopen the
-    /// background control connection a few times, then go back to waiting
-    /// for activity. Buds back in the case or a quiet radio end it sooner.
-    fn retry_failed_reconnect(&mut self, now: Clock) {
-        if self.connection.stage() == Stage::Ready {
-            self.reconnect_retry_at = None;
-            self.reconnect_retries = 0;
-            return;
-        }
-        let Some(at) = self.reconnect_retry_at else {
-            return;
-        };
-        if now.mono.0 < at.0 {
-            return;
-        }
-        if self.reconnect_retries >= RECONNECT_RETRY_LIMIT
-            || self.accessory.both_docked()
-            || self.radio_quiet()
-            || matches!(
-                self.connection.stage(),
-                Stage::Connecting | Stage::Handshake | Stage::Features | Stage::Notifications
-            )
-        {
-            self.reconnect_retry_at = None;
-            return;
-        }
-        self.reconnect_retries += 1;
-        self.reconnect_retry_at = Some(now.mono.saturating_add(RECONNECT_RETRY_DELAY_MS));
-        eprintln!(
-            "fleetpodsd: automatically retrying the AirPods connection after a failed reconnect (attempt {})",
-            self.reconnect_retries
-        );
-        self.open_background_connection(now);
-        if !self.background_requested {
-            self.reconnect_retry_at = None;
         }
     }
 
@@ -3952,132 +3122,6 @@ impl Daemon {
             index: output.index,
             name: output.name,
         })
-    }
-
-    pub(crate) fn pace_audio(&mut self) -> Vec<crate::step::Effect> {
-        use crate::step::Effect;
-        let mut effects = Vec::new();
-        let Some(address) = self.config.accessory else {
-            return effects;
-        };
-        let ready = self.connection.stage() == Stage::Ready;
-        // The existing link lifecycle authorizes opening (including fleet
-        // admission and the preferred connector). Audio shares that decision,
-        // but need not wait for the separate control handshake to finish.
-        // Early audio also waits for the Bluetooth link: a profile connect
-        // that pages the pods alongside the control socket can collide with
-        // it and leave BlueZ busy for most of a minute (XPS, 2026-10-27).
-        let opening = self.connection.stage().is_opening()
-            && self.connection.bluez() == Some(true)
-            && self.link_asked == Some(self.connection.generation())
-            && self.preferred_connection_allowed();
-        if !self.output.wants_output() || (!ready && !opening) {
-            return effects;
-        }
-        // If the early request failed, retain the established one-shot attempt
-        // at control readiness. Never create another profile retry loop.
-        if ready && self.transport_asked_early {
-            self.transport_asked = false;
-            self.transport_asked_early = false;
-        }
-        let card = self
-            .last_graph
-            .as_ref()
-            .and_then(|graph| graph.cards.iter().find(|card| card.address == Some(address)));
-        let transport_up = card
-            .and_then(|card| card.active.as_deref())
-            .is_some_and(|name| name.contains("a2dp-sink"))
-            || self.last_graph.as_ref().is_some_and(|graph| {
-                graph.sinks.iter().any(|sink| {
-                    sink.address == Some(address)
-                        && sink
-                            .profile
-                            .as_deref()
-                            .is_some_and(|profile| profile.contains("a2dp-sink"))
-                })
-            });
-        // Local playback opens A2DP in parallel with an authorized control attempt.
-        // A control-only link has no audio card until ConnectProfile succeeds;
-        // waiting for a grant here can leave playback on the speakers forever.
-        if transport_up {
-            self.transport_first_refused = None;
-            self.transport_retry_at = None;
-        }
-        if !transport_up && !self.transport_asked && self.transport_retry_at.is_none() {
-            self.transport_asked = true;
-            self.transport_asked_early = !ready;
-            self.resume_output_on_grant = false;
-            eprintln!(
-                "fleetpodsd: requesting AirPods audio profile control_stage={}",
-                self.connection.stage().wire()
-            );
-            effects.push(Effect::ConnectTransport { accessory: address });
-        }
-        // Codec changes still require setup; opening the audio profile does not.
-        if !ready {
-            return effects;
-        }
-        let (Some(profile), Some(card)) = (self.audio.selected(), card) else {
-            return effects;
-        };
-        if card.active.as_deref() != Some(profile)
-            && card.profiles.iter().any(|name| name == profile)
-            && self.codec_asked.as_deref() != Some(profile)
-        {
-            self.codec_asked = Some(profile.to_string());
-            effects.push(Effect::SelectProfile {
-                card: card.name.clone(),
-                profile: profile.to_string(),
-            });
-        }
-        effects
-    }
-
-    fn forget_transport_ask(&mut self) {
-        self.transport_asked = false;
-        self.transport_asked_early = false;
-        self.transport_first_refused = None;
-        self.transport_retry_at = None;
-    }
-
-    /// A refused or unanswered audio profile request is asked again shortly,
-    /// within one window per claim, rather than waiting for the next play.
-    pub(crate) fn note_transport_reply(&mut self, reply: crate::step::TransportReply, now: MonoMs) {
-        if reply == crate::step::TransportReply::Connected {
-            self.transport_first_refused = None;
-            self.output.extend_takeover(now);
-            return;
-        }
-        if !self.transport_asked || !self.output.wants_output() {
-            return;
-        }
-        let first = *self.transport_first_refused.get_or_insert(now);
-        if now.saturating_since(first) >= TRANSPORT_RETRY_WINDOW_MS {
-            eprintln!(
-                "fleetpodsd: AirPods audio profile still unavailable ({reply:?}); not retrying"
-            );
-            return;
-        }
-        eprintln!(
-            "fleetpodsd: AirPods audio profile {reply:?}; asking again in {TRANSPORT_RETRY_MS} ms"
-        );
-        self.transport_retry_at = Some(now.saturating_add(TRANSPORT_RETRY_MS));
-    }
-
-    pub(crate) fn advance_transport_retry(&mut self, now: MonoMs) {
-        if self.transport_retry_at.is_some_and(|at| now >= at) {
-            self.transport_retry_at = None;
-            self.transport_asked = false;
-            self.transport_asked_early = false;
-        }
-    }
-
-    pub(crate) fn note_profile(&mut self, ok: bool, now: Clock) {
-        if ok {
-            return;
-        }
-        self.codec_asked = None;
-        self.seat.note_failure_if_empty("profile was not selected", now);
     }
 
     fn fleet(&mut self, command: FleetCommand, now: Clock) -> Response {
@@ -4174,47 +3218,6 @@ impl Daemon {
         started
     }
 
-    /// Stream-only players can use ownership already confirmed by the pods.
-    pub(crate) fn route_owned_playback(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
-        let Some(accessory) = self.config.accessory else {
-            return;
-        };
-        if self.accessory.both_docked()
-            && crate::audio::route::playback_started(
-                self.last_graph.as_ref(),
-                graph,
-                accessory,
-                self.output.source_sink(),
-            )
-        {
-            self.return_to_speakers(now);
-            return;
-        }
-        if self.output.wants_output()
-            || self.connection.stage() != Stage::Ready
-            || self.audio.yielded()
-            || self.accessory.both_docked()
-        {
-            return;
-        }
-        let resolved = self.resolved(now);
-        if resolved.source != crate::audio::seat::Source::Direct
-            || !matches!(resolved.holder, Holder::Local { .. })
-        {
-            return;
-        }
-        if crate::audio::route::playback_started(
-            self.last_graph.as_ref(),
-            graph,
-            accessory,
-            self.output.source_sink(),
-        ) {
-            self.remember_activity(now);
-            self.claim_seat(now);
-            eprintln!("fleetpodsd: routing new playback through already-owned AirPods");
-        }
-    }
-
     /// Putting the pods in while the speakers play is play intent for that
     /// playback. Wait for the link and an ownership report; never take the
     /// pods from a device playing on them, or from one whose state is unknown.
@@ -4259,79 +3262,6 @@ impl Daemon {
         );
         self.remember_activity(now);
         self.claim_playback(now);
-    }
-
-    /// Docked pods in an open case stay connected for a while (XPS,
-    /// 2026-10-23: 23 s), and a play went to them in the case. Docking alone
-    /// only pauses; a play while docked belongs on the speakers. The deferred
-    /// claim still takes the pods back once a bud comes out.
-    fn return_to_speakers(&mut self, now: Clock) {
-        eprintln!("fleetpodsd: both pods are in the case; playing on the speakers");
-        let _ = self.yield_seat(now);
-        self.routing.release_audio();
-        self.resume_output_on_grant = false;
-        self.output.return_to_speakers();
-    }
-
-    pub(crate) fn claim_playback(&mut self, now: Clock) {
-        self.activity_at = None;
-        if self.hold_pairing_connection(now.mono) {
-            return;
-        }
-        // Pods stowed in a closed case cannot take audio, and no link will
-        // be opened for them. Claiming anyway would soft-mute the speaker
-        // streams for the whole takeover hold while nothing can arrive, so
-        // local playback would sit silent for seconds before falling back.
-        if self.accessory.stowed() || self.accessory.both_docked() {
-            self.deferred_playback_claim = Some(now.mono);
-            self.return_to_speakers(now);
-            self.replan(now);
-            return;
-        }
-        if self.connection.stage() != Stage::Ready
-            && self.connection.bluez() == Some(false)
-            && !self.accessory.playback_available(now.mono)
-        {
-            // A historical sighting or an open case is not evidence that the
-            // buds can play. Stay on the speakers without probing the link:
-            // absent pods only fail Host is down and cycle the adapter.
-            // Advertisements alone make a bud available, and tick then
-            // claims independently of control readiness. No seat yield:
-            // playback stays local so the deferred claim can still fire.
-            self.deferred_playback_claim = Some(now.mono);
-            self.routing.release_audio();
-            self.resume_output_on_grant = false;
-            self.output.return_to_speakers();
-            self.replan(now);
-            return;
-        }
-        self.deferred_playback_claim = None;
-        // Fleet admission only blocks opening a new link. A ready local link
-        // can route a genuine play immediately, even before admission completes.
-        if self.config.accessory.is_none() {
-            return;
-        }
-        if self.routing.phase().busy() && self.connection.stage() != Stage::Ready {
-            // Admission opens the link and the claim goes out once it is
-            // ready. Hold speaker playback for it like any takeover, so the
-            // play does not start on the speakers in the meantime.
-            self.claim_seat(now);
-            self.seat.note_claim(self.accessory.ownership.at());
-            self.replan(now);
-            return;
-        }
-        self.resume_output_on_grant = self.connection.stage() == Stage::Ready
-            && (self.seat.yielded()
-                || self.accessory.ownership.as_fresh() == Some(&false)
-                || self.accessory.source.as_fresh().is_some_and(|source| !source.local));
-        self.claim_seat(now);
-        self.open_connection(now.mono);
-        self.seat.note_claim(self.accessory.ownership.at());
-        self.replan(now);
-        // Reuse the live control link; a new link sends CLAIM once setup is ready.
-        if self.connection.stage() == Stage::Ready {
-            self.request_playback_ownership(now);
-        }
     }
 
     pub(crate) fn playback(&mut self, event: &crate::types::PlaybackEvent, now: Clock) -> Response {
@@ -4389,8 +3319,6 @@ impl Daemon {
         self.connection.wait_for_request();
         self.connection.note_bluez(false);
         self.select_accessory(None);
-        self.reconnect.cancel();
-        self.link_asked = None;
         self.effects.follow_link = false;
         self.effects.drop_link = false;
         self.effects.control_out.clear();
@@ -4624,11 +3552,11 @@ mod tests {
     use crate::panel::ipc::push;
     use crate::types::{Battery, FleetId, UnixMs};
 
-    fn clock() -> Clock {
+    pub(super) fn clock() -> Clock {
         Clock::new(1_000, 1_700_000_000_000)
     }
 
-    fn addr(n: u8) -> Address {
+    pub(super) fn addr(n: u8) -> Address {
         Address::new([n, 2, 3, 4, 5, 6]).unwrap()
     }
 
@@ -5886,156 +4814,6 @@ mod tests {
     }
 
     #[test]
-    fn release_pauses_the_player_and_a_reconnect_writes_the_request() {
-        use crate::audio::play::PlayerSeen;
-        use crate::fleet::members::{GroupKey, Member, Proposal};
-        use crate::step::{Effect, Input};
-        use crate::types::FleetId;
-
-        let mut daemon = Daemon::new("gram");
-        let now = clock();
-        let local = Address::parse("02:00:00:00:00:01").unwrap();
-        let peer = Address::parse("02:00:00:00:00:02").unwrap();
-        daemon.set_local_address(Some(local));
-        ready_link(&mut daemon, now);
-        daemon.set_local_address(Some(local));
-        daemon.audio.startup_players(&[PlayerSeen {
-            service: "org.mpris.MediaPlayer2.spotify".into(),
-            playing: true,
-        }]);
-        daemon.output.claim();
-        let released = daemon.step(Input::Command(Command::HandoffRelease), now);
-        assert_eq!(released.reply.as_deref(), Some("ok\n"));
-        assert!(released.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::PausePlayers(names) if names == &["org.mpris.MediaPlayer2.spotify".to_string()]
-        )));
-        assert!(!daemon.output.wants_output());
-        let still = daemon.step(
-            Input::Player { service: "org.mpris.MediaPlayer2.spotify".into(), playing: Some(true) },
-            now,
-        );
-        assert!(still.effects.iter().all(|effect| !matches!(effect, Effect::OpenLink { .. })));
-        assert!(!daemon.output.wants_output());
-
-        daemon.note_bluez(true);
-        let away = Address::parse("02:00:00:00:00:09").unwrap();
-        daemon
-            .membership
-            .apply(Proposal {
-                id: FleetId::new([7; 16]),
-                key: GroupKey::new([9; 32]),
-                members: vec![
-                    Member { address: local, label: "gram".into() },
-                    Member { address: peer, label: "xps".into() },
-                    Member { address: away, label: "away".into() },
-                ],
-            })
-            .unwrap();
-        // The direct AirPods roster is current; the legacy announcement is stale.
-        daemon.peers_seated.push(away);
-        daemon.note_pod_peers(vec![local, peer], now.unix);
-        let intent = daemon.routing().intent();
-        let started = daemon.step(Input::Command(Command::ReconnectPeer), now);
-        assert_eq!(started.reply.as_deref(), Some("accepted\n"));
-        assert_eq!(daemon.routing().intent(), intent);
-        assert!(started.effects.iter().all(|effect| !matches!(effect, Effect::Disconnect { .. })));
-        assert_eq!(daemon.status_value(now)["native_handoff"]["phase"], "reconnecting");
-        let waiting = daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_999, now.unix.0));
-        assert!(waiting.effects.iter().all(|effect| !matches!(effect, Effect::Disconnect { .. })));
-        daemon.step(
-            Input::Player {
-                service: "org.mpris.MediaPlayer2.spotify".into(),
-                playing: Some(false),
-            },
-            Clock::new(now.mono.0 + 3_000, now.unix.0),
-        );
-        let asked = daemon.step(Input::Tick, Clock::new(now.mono.0 + 3_000, now.unix.0));
-        let request = crate::pods::setup::reconnect_request(peer, local).unwrap();
-        let other = crate::pods::setup::reconnect_request(away, local).unwrap();
-        assert!(asked.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &request
-        )));
-        assert!(asked.effects.iter().all(|effect| !matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &other
-        )));
-        assert!(asked.effects.iter().all(|effect| !matches!(effect, Effect::Disconnect { .. })));
-        let still = daemon.step(Input::Tick, Clock::new(now.mono.0 + 4_000, now.unix.0));
-        assert!(still.effects.iter().all(|effect| !matches!(effect, Effect::Disconnect { .. })));
-        daemon.note_pod_peers(vec![local], now.unix);
-        let dropped = daemon.step(Input::Tick, Clock::new(now.mono.0 + 4_100, now.unix.0));
-        assert!(dropped.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::Disconnect { accessory } if *accessory == addr(3)
-        )));
-        let generation = daemon.connection().generation();
-        daemon.step(
-            Input::ControlSocket { up: false, generation },
-            Clock::new(now.mono.0 + 4_200, now.unix.0),
-        );
-        let disconnected_at = Clock::new(now.mono.0 + 4_300, now.unix.0);
-        let disconnected = daemon.step(Input::Bluez(false), disconnected_at);
-        assert!(disconnected
-            .effects
-            .iter()
-            .all(|effect| !matches!(effect, Effect::RemoveDevice { .. })));
-        assert_eq!(daemon.status_value(disconnected_at)["bluetooth_paired"], true);
-        assert_eq!(daemon.status_value(disconnected_at)["native_handoff"]["phase"], "reconnecting");
-        // The pods sit free for the rejoin delay first (giving a nearby
-        // Apple device its chance to connect), then this laptop rejoins.
-        let soon = daemon.step(Input::Tick, Clock::new(now.mono.0 + 9_200, now.unix.0));
-        assert!(soon.effects.iter().all(|effect| !matches!(effect, Effect::FollowLink)));
-        let back = daemon.step(Input::Tick, Clock::new(now.mono.0 + 14_300, now.unix.0));
-        assert!(back.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
-        assert!(daemon.background_requested);
-        assert_eq!(daemon.routing().intent(), crate::fleet::route::Intent::Release);
-
-        // A reset while rejoining is a failed setup, not the intentional drop.
-        let generation = daemon.connection.generation();
-        let failed_at = Clock::new(now.mono.0 + 14_400, now.unix.0);
-        daemon.step(Input::ControlSocket { up: false, generation }, failed_at);
-        daemon.step(Input::LinkFailed { generation, busy: false }, failed_at);
-        assert_eq!(daemon.connection.stage(), Stage::Retrying);
-        let retried = daemon.step(Input::Tick, Clock::new(now.mono.0 + 15_400, now.unix.0));
-        assert!(retried.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
-        assert_eq!(daemon.connection.retry().0, 2);
-        assert!(daemon.background_requested);
-        assert_eq!(daemon.routing().intent(), crate::fleet::route::Intent::Release);
-
-        // An attempt still in flight is not failed by the reconnect's
-        // return wait, however long the link layer takes with it; when it
-        // lands, the reconnect completes instead of recording a failure.
-        daemon.step(Input::Tick, Clock::new(now.mono.0 + 30_000, now.unix.0));
-        assert_eq!(daemon.connection.stage(), Stage::Connecting);
-        let generation = daemon.connection.generation();
-        let landed = Clock::new(now.mono.0 + 30_100, now.unix.0);
-        daemon.step(Input::ControlSocket { up: true, generation }, landed);
-        daemon.step(
-            Input::Accessory { generation, packet: vec![0x01, 0x00, 0x04, 0x00, 0x01] },
-            landed,
-        );
-        daemon.step(
-            Input::Accessory { generation, packet: vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01] },
-            landed,
-        );
-        let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
-        battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
-        battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
-        battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
-        daemon.step(Input::Accessory { generation, packet: battery }, landed);
-        daemon.step(
-            Input::Accessory {
-                generation,
-                packet: vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02],
-            },
-            landed,
-        );
-        assert_eq!(daemon.connection.stage(), Stage::Ready);
-    }
-
-    #[test]
     fn releasing_or_reconnecting_mutes_playing_streams_before_pausing() {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -6155,32 +4933,6 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_reconnect_retries_the_background_connection_on_its_own() {
-        use crate::step::Input;
-
-        let mut daemon = Daemon::new("xps");
-        let now = clock();
-        ready_link(&mut daemon, now);
-        daemon.note_lid(true, now.mono);
-        let generation = daemon.connection().generation();
-        daemon.note_socket(false, generation, now.mono);
-        daemon.fail_reconnect("link did not return", now);
-        assert!(daemon.reconnect_retry_at.is_some());
-
-        let early = Clock::new(now.mono.0 + 1_000, now.unix.0 + 1_000);
-        daemon.step(Input::Tick, early);
-        assert_eq!(daemon.reconnect_retries, 0, "no retry before the delay");
-
-        let due = Clock::new(
-            now.mono.0 + RECONNECT_RETRY_DELAY_MS + 100,
-            now.unix.0 + RECONNECT_RETRY_DELAY_MS + 100,
-        );
-        daemon.step(Input::Tick, due);
-        assert_eq!(daemon.reconnect_retries, 1, "the retry fires on its own");
-        assert!(daemon.background_requested, "the retry opens the background connection");
-    }
-
-    #[test]
     fn a_relayed_reconnect_drops_this_link() {
         use crate::step::{Effect, Input};
 
@@ -6248,152 +5000,6 @@ mod tests {
     }
 
     #[test]
-    fn the_preferred_connector_never_falls_back_to_the_other_pairs_member() {
-        use crate::fleet::members::Fleet;
-        let setup = |owner_local: Option<bool>| {
-            let mut daemon = Daemon::new("gram");
-            let now = clock();
-            let local = addr(1);
-            let peer = addr(2);
-            daemon.set_local_address(Some(local));
-            daemon.restore_fleet(Fleet {
-                id: FleetId::new([3; 16]),
-                key: GroupKey::new([0x11; 32]),
-                members: vec![
-                    Member { address: local, label: "lg-gram".into() },
-                    Member { address: peer, label: "omarchy-xps".into() },
-                ],
-            });
-            daemon.select_accessory(Some(addr(3)));
-            daemon.note_bluez(true);
-            daemon.note_pod_peers(vec![local, peer], now.unix);
-            if let Some(local_owner) = owner_local {
-                daemon.note_ownership(local_owner, now.mono);
-                daemon.activity_preference.note_local(
-                    [3; 16],
-                    addr(3),
-                    if local_owner { local } else { peer },
-                    now.unix,
-                );
-            }
-            daemon.note_socket(false, daemon.connection().generation(), now.mono);
-            daemon
-        };
-        let now = clock();
-        // The preferred peer keeps its preference even after the old grace window.
-        let mut daemon = setup(Some(false));
-        let generation = daemon.connection().generation();
-        daemon.attach_available(generation, now.mono.saturating_add(1_000));
-        assert!(!daemon.background_requested, "the non-owner does not race the reopen");
-        daemon.attach_available(generation, now.mono.saturating_add(REOPEN_HOLD_MS + 1_000));
-        assert!(!daemon.background_requested, "there is no timeout fallback");
-        // The owner itself reconnects at once.
-        let mut daemon = setup(Some(true));
-        let generation = daemon.connection().generation();
-        daemon.attach_available(generation, now.mono.saturating_add(1_000));
-        assert!(daemon.background_requested, "the owner reconnects first");
-        // With no activity record, an enrolled fleet waits for actual input.
-        let mut daemon = setup(None);
-        let generation = daemon.connection().generation();
-        daemon.attach_available(generation, now.mono.saturating_add(1_000));
-        assert!(!daemon.background_requested, "unknown preference must not cause a race");
-    }
-
-    #[test]
-    fn a_fresh_placement_opens_without_spending_the_wake_on_a_refusal() {
-        use crate::fleet::members::Fleet;
-        use crate::step::Effect;
-        let mut daemon = Daemon::new("gram");
-        let now = clock();
-        let local = addr(1);
-        let peer = addr(2);
-        daemon.set_local_address(Some(local));
-        daemon.restore_fleet(Fleet {
-            id: FleetId::new([3; 16]),
-            key: GroupKey::new([0x11; 32]),
-            members: vec![
-                Member { address: local, label: "lg-gram".into() },
-                Member { address: peer, label: "omarchy-xps".into() },
-            ],
-        });
-        daemon.select_accessory(Some(addr(3)));
-        daemon.note_bluez(true);
-        daemon.activity_preference.note_local([3; 16], addr(3), local, now.unix);
-        // Public placement says a bud is out. The battery slots are still empty.
-        daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
-        assert!(daemon.accessory.left.is_unknown());
-        let seen = daemon.step(crate::step::Input::Tick, now);
-        assert!(seen.effects.iter().all(|effect| !matches!(effect, Effect::OpenLink { .. })));
-        let settled = Clock::new(now.mono.0 + 2_000, now.unix.0 + 2_000);
-        let opened = daemon.step(crate::step::Input::Tick, settled);
-        assert!(
-            opened.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })),
-            "availability evidence opens, and the wake commits because the open proceeds"
-        );
-        assert!(daemon.background_requested);
-    }
-
-    #[test]
-    fn preference_loss_yields_the_seat_and_the_audio_together() {
-        use crate::fleet::members::Fleet;
-        let mut daemon = Daemon::new("gram");
-        let now = clock();
-        let local = addr(1);
-        let peer = addr(2);
-        daemon.set_local_address(Some(local));
-        daemon.restore_fleet(Fleet {
-            id: FleetId::new([3; 16]),
-            key: GroupKey::new([0x11; 32]),
-            members: vec![
-                Member { address: local, label: "lg-gram".into() },
-                Member { address: peer, label: "omarchy-xps".into() },
-            ],
-        });
-        daemon.select_accessory(Some(addr(3)));
-        daemon.note_bluez(true);
-        daemon.activity_preference.note_local([3; 16], addr(3), peer, now.unix);
-        // A playing player, without the Play input that would make this machine preferred.
-        daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(true));
-        daemon.output.claim();
-        daemon.reconnect_preferred(now);
-        assert!(daemon.seat.yielded());
-        assert!(daemon.audio.yielded());
-        assert!(daemon.effects.pause_players.is_empty(), "a preference release does not pause");
-        assert!(!daemon.output.wants_output());
-
-        let mut speakers = Daemon::new("gram");
-        speakers.output.claim();
-        speakers.return_to_speakers(now);
-        assert!(speakers.seat.yielded());
-        assert!(speakers.audio.yielded());
-        assert!(speakers.effects.pause_players.is_empty());
-        assert!(!speakers.output.wants_output());
-    }
-
-    #[test]
-    fn a_yielded_slot_stays_yielded_until_the_hold_passes() {
-        let mut daemon = Daemon::new("gram");
-        let now = clock();
-        let local = Address::parse("02:00:00:00:00:01").unwrap();
-        let peer = Address::parse("02:00:00:00:00:02").unwrap();
-        daemon.set_local_address(Some(local));
-        daemon.select_accessory(Some(addr(3)));
-        daemon.note_bluez(true);
-        daemon.peers_seated.push(peer);
-
-        daemon.free_slot(peer, now);
-        assert!(daemon.effects.drop_link);
-        assert!(daemon.slot_hold_until.is_some());
-
-        let generation = daemon.connection().generation();
-        daemon.attach_available(generation, now.mono.saturating_add(1_000));
-        assert!(!daemon.background_requested, "no auto-attach during the hold");
-
-        daemon.attach_available(generation, now.mono.saturating_add(SLOT_HOLD_MS + 1));
-        assert!(daemon.background_requested, "auto-attach resumes after the hold");
-    }
-
-    #[test]
     fn a_lost_slot_holds_activity_and_acl_attach_without_extending_the_grace() {
         use crate::step::{Effect, Input};
         let mut daemon = Daemon::new("xps");
@@ -6423,33 +5029,6 @@ mod tests {
         let settled = Clock::new(until.0, now.unix.0 + DISPLACEMENT_HOLD_MS);
         let outcome = daemon.step(Input::Command(Command::Activity), settled);
         assert!(outcome.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-    }
-
-    #[test]
-    fn a_yielded_slot_holds_activity_but_explicit_connect_and_play_can_reopen() {
-        use crate::step::{Effect, Input};
-        for explicit_play in [false, true] {
-            let mut daemon = Daemon::new("xps");
-            let now = clock();
-            ready_link(&mut daemon, now);
-            daemon.set_local_address(Some(addr(1)));
-            daemon.peers_seated.push(addr(2));
-            daemon.step(Input::Players(Vec::new()), now);
-            daemon.free_slot(addr(2), now);
-            let generation = daemon.connection.generation();
-            daemon.step(Input::ControlSocket { up: false, generation }, now);
-            assert_eq!(daemon.slot_hold_until, Some(now.mono.saturating_add(SLOT_HOLD_MS)));
-            let activity = daemon.step(Input::Command(Command::Activity), now);
-            assert!(!activity.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-            assert!(!daemon.background_requested);
-            let input = if explicit_play {
-                Input::Player { service: "browser".into(), playing: Some(true) }
-            } else {
-                Input::Command(Command::Connect)
-            };
-            let requested = daemon.step(input, now);
-            assert!(requested.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-        }
     }
 
     #[test]
@@ -6529,7 +5108,7 @@ mod tests {
         use crate::fleet::members::Fleet;
         use crate::fleet::roster_air::Snapshot;
         use crate::fleet::route::{Admit, Start};
-        use crate::pods::link::OpenStep;
+        use crate::pods::link::{reach_stage, Stage};
         let now = clock();
         let local = addr(2);
         let gram = addr(4);
@@ -6599,7 +5178,12 @@ mod tests {
             // The pods' fresh roster is authoritative even if it reports that
             // the helper actually remained or rejoined alongside this laptop.
             daemon.note_pod_peers(vec![gram, local], now.unix);
-            assert!(daemon.connection.advance(OpenStep::Notifications, generation, now.mono));
+            assert!(reach_stage(
+                &mut daemon.connection,
+                Stage::Notifications,
+                generation,
+                now.mono
+            ));
             assert!(daemon.connection.mark_ready(generation));
             assert_eq!(
                 daemon.status_value(now)["connected_peers"],
@@ -6779,7 +5363,7 @@ mod tests {
         assert_eq!(daemon.roster_peers(now), Vec::<Address>::new());
     }
 
-    fn conflicting_roster_setup() -> Daemon {
+    pub(super) fn conflicting_roster_setup() -> Daemon {
         let mut daemon = Daemon::new("xps");
         let now = clock();
         daemon.set_local_address(Some(addr(1)));
@@ -6854,7 +5438,10 @@ mod tests {
         }
     }
 
-    fn conflicting_roster(at: Clock, sequence: u64) -> crate::fleet::roster_air::Snapshot {
+    pub(super) fn conflicting_roster(
+        at: Clock,
+        sequence: u64,
+    ) -> crate::fleet::roster_air::Snapshot {
         crate::fleet::roster_air::Snapshot {
             reporter: addr(2),
             session: [1; 16],
@@ -7158,24 +5745,43 @@ mod tests {
         let chosen = daemon.step(Input::Audio(graph), now);
         assert!(chosen.effects.iter().any(|effect| matches!(
             effect,
-            Effect::SelectProfile { card, profile }
+            Effect::SelectProfile { card, profile, .. }
                 if card == "bluez_card.reported" && profile == "a2dp-sink-sbc_xq"
         )));
         assert!(chosen.effects.iter().any(|effect| matches!(
             effect,
-            Effect::ConnectTransport { accessory } if *accessory == pods
+            Effect::ConnectTransport { accessory, .. } if *accessory == pods
         )));
         let again = daemon.step(Input::Tick, now);
         assert!(again.effects.iter().all(|effect| !matches!(
             effect,
             Effect::SelectProfile { .. } | Effect::ConnectTransport { .. }
         )));
-        let failed = daemon.step(Input::ProfileResult { ok: false }, now);
+        let id = chosen
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::SelectProfile { id, .. } => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        let failed = daemon.step(Input::ProfileResult { id, ok: false }, now);
         assert_eq!(
             daemon.status_value(now)["native_handoff"]["failure"],
             "profile was not selected"
         );
-        assert!(failed.effects.iter().any(|effect| matches!(effect, Effect::SelectProfile { .. })));
+        assert!(!failed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::SelectProfile { .. })));
+        assert_eq!(daemon.status_value(now)["connection_lifecycle"]["codec"], "retry_wait");
+        let early = daemon.step(Input::Tick, Clock::new(now.mono.0 + 999, now.unix.0 + 999));
+        assert!(!early.effects.iter().any(|effect| matches!(effect, Effect::SelectProfile { .. })));
+        let retry = daemon.step(Input::Tick, Clock::new(now.mono.0 + 1_000, now.unix.0 + 1_000));
+        assert!(retry.effects.iter().any(|effect| matches!(effect,
+            Effect::SelectProfile { id: next, card, profile }
+                if *next != id && card == "bluez_card.reported" && profile == "a2dp-sink-sbc_xq"
+        )));
     }
 
     #[test]
@@ -7359,7 +5965,7 @@ mod tests {
         }
     }
 
-    fn ready_link(daemon: &mut Daemon, now: Clock) {
+    pub(super) fn ready_link(daemon: &mut Daemon, now: Clock) {
         use crate::step::Input;
         daemon.select_accessory(Some(addr(3)));
         daemon.step(Input::Command(Command::Connect), now);
@@ -7478,66 +6084,6 @@ mod tests {
                 daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_000, now.unix.0 + 2_000));
             assert!(retry.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
             assert!(!retry.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
-        }
-    }
-
-    #[test]
-    fn activity_asks_the_connected_audio_owner_instead_of_waiting_out_the_reopen_hold() {
-        use crate::fleet::members::{Fleet, Member};
-        use crate::step::Input;
-        for owner_connected in [true, false] {
-            let now = clock();
-            let local = addr(1);
-            let xps = addr(2);
-            let pods = addr(9);
-            let mut daemon = Daemon::new("gram");
-            daemon.set_local_address(Some(local));
-            daemon.select_accessory(Some(pods));
-            daemon.restore_fleet(Fleet {
-                id: FleetId::new([3; 16]),
-                key: GroupKey::new([0x11; 32]),
-                members: vec![
-                    Member { address: local, label: "gram".into() },
-                    Member { address: xps, label: "xps".into() },
-                ],
-            });
-            daemon.observe_nearby(host_id(Some(xps)), xps, "xps", now.unix, true, Some([4; 16]));
-            daemon.note_roster(RosterReport {
-                reporter: host_id(Some(xps)),
-                reporter_address: xps,
-                accessory: pods,
-                session: crate::types::SessionId(0),
-                seq: 1,
-                at: now.mono,
-                sent: now.unix,
-                peers: if owner_connected { vec![xps] } else { Vec::new() },
-                audio_source: owner_connected.then_some(xps),
-                pending: false,
-                audio_idle: false,
-                wire_session: Some([4; 16]),
-                last_use: UnixMs(0),
-            });
-            // This laptop's link dropped while the XPS owned the pair's audio.
-            daemon.reopen_wait = true;
-            daemon.accessory.left = crate::types::Evidence::fresh(
-                Pod {
-                    battery: crate::types::Battery::new(60, false).unwrap(),
-                    in_ear: Some(true),
-                    in_case: Some(false),
-                },
-                now.mono,
-            );
-            daemon.step(Input::Command(Command::Activity), now);
-            if owner_connected {
-                // The owner already landed: ask it for a seat alongside it.
-                assert_eq!(daemon.routing.phase(), Phase::WaitingAdmission);
-                assert!(!daemon.reopen_wait);
-            } else {
-                // The owner is not back yet, so it still gets to land first.
-                assert!(!daemon.routing.phase().busy());
-                assert!(daemon.reopen_wait);
-                assert!(!daemon.background_requested);
-            }
         }
     }
 
@@ -7752,117 +6298,6 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_laptop_does_not_connect_when_the_case_opens_and_a_peer_connects() {
-        use crate::step::{Effect, Input};
-        let mut daemon = conflicting_roster_setup();
-        let now = clock();
-        let generation = daemon.connection.generation();
-        daemon.step(Input::ControlSocket { up: false, generation }, now);
-        daemon.step(Input::Bluez(false), now);
-        for right in [false, true] {
-            daemon.note_pod(
-                right,
-                Pod {
-                    battery: Battery::new(80, true).unwrap(),
-                    in_ear: Some(false),
-                    in_case: Some(true),
-                },
-                now.mono,
-            );
-        }
-        daemon.step(Input::Lid { open: false }, now);
-        assert_eq!(daemon.connection.stage(), Stage::Waiting);
-        // The other laptop and phone take the slots. Repeat open-lid reports
-        // through both the case-wake and former reconnect-order grace periods.
-        for elapsed in [1_000, 3_000, 10_000, 30_000, 60_000] {
-            let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
-            daemon.hear_roster(conflicting_roster(at, elapsed), at);
-            for input in [Input::Lid { open: true }, Input::Tick] {
-                let result = daemon.step(input, at);
-                assert!(!result
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::OpenLink { .. } | Effect::WriteControl { .. })));
-            }
-            assert!(!daemon.background_requested);
-            assert_eq!(daemon.connection.stage(), Stage::Waiting);
-            assert_eq!(daemon.status_value(at)["lid_state"], 0);
-        }
-    }
-
-    #[test]
-    fn activity_after_lid_wake_and_existing_acl_share_bounded_setup_retries() {
-        use crate::step::{Effect, Input};
-        // Activity after opening the lid and attachment to an existing ACL
-        // both need tracked intent for the retry loop.
-        for (existing_acl, released) in [(false, false), (false, true), (true, false), (true, true)]
-        {
-            let mut daemon = Daemon::new("xps");
-            daemon.select_accessory(Some(addr(9)));
-            if released {
-                // Reproduce the original reset after an earlier audio yield.
-                daemon.routing.release_audio();
-            }
-            let mut now = clock();
-            let no_open =
-                |effects: &[Effect]| !effects.iter().any(|e| matches!(e, Effect::OpenLink { .. }));
-            if existing_acl {
-                daemon.step(Input::Bluez(true), now);
-                let generation = daemon.connection.generation();
-                let attach = daemon.step(Input::AttachAvailable { generation }, now);
-                assert!(!no_open(&attach.effects));
-            } else {
-                daemon.connection.prepare();
-                let opening = daemon.step(Input::Lid { open: true }, now);
-                assert!(no_open(&opening.effects));
-                daemon.step(Input::Command(Command::Activity), now);
-                let start = now;
-                // Repeated advertisements neither bypass nor restart the grace.
-                for elapsed in [500, 1_999] {
-                    now = Clock::new(start.mono.0 + elapsed, start.unix.0 + elapsed);
-                    for input in [Input::Lid { open: true }, Input::Tick] {
-                        assert!(no_open(&daemon.step(input, now).effects));
-                    }
-                }
-                now = Clock::new(start.mono.0 + 2_000, start.unix.0 + 2_000);
-                assert!(!no_open(&daemon.step(Input::Tick, now).effects));
-            }
-            assert!(daemon.background_requested);
-            assert!(!daemon.output.wants_output(), "background setup must not claim audio");
-            for attempt in 1..=crate::pods::link::RETRY_LIMIT {
-                let generation = daemon.connection.generation();
-                daemon.step(Input::ControlSocket { up: false, generation }, now);
-                daemon.step(Input::Bluez(false), now);
-                daemon.step(Input::LinkFailed { generation, busy: false }, now);
-                if attempt == crate::pods::link::RETRY_LIMIT {
-                    assert_eq!(daemon.connection.stage(), Stage::Failed);
-                    assert!(!daemon.background_requested);
-                    now = Clock::new(now.mono.0 + 120_000, now.unix.0 + 120_000);
-                    daemon.step(Input::Bluez(true), now);
-                    assert!(no_open(
-                        &daemon.step(Input::AttachAvailable { generation }, now).effects
-                    ));
-                    assert!(no_open(&daemon.step(Input::Tick, now).effects));
-                } else {
-                    assert_eq!(daemon.connection.stage(), Stage::Retrying);
-                    let delay = 1_000 << (attempt - 1);
-                    let early = Clock::new(now.mono.0 + delay - 1, now.unix.0 + delay - 1);
-                    assert!(no_open(&daemon.step(Input::Tick, early).effects));
-                    now = Clock::new(now.mono.0 + delay, now.unix.0 + delay);
-                    let retry = daemon.step(Input::Tick, now);
-                    assert!(!no_open(&retry.effects), "retry needs no second activity event");
-                    assert_eq!(daemon.connection.retry().0, attempt + 1);
-                    let current = daemon.connection.generation();
-                    assert_ne!(current, generation);
-                    daemon.step(Input::LinkFailed { generation, busy: false }, now);
-                    assert_eq!(daemon.connection.generation(), current);
-                    assert_eq!(daemon.connection.stage(), Stage::Connecting);
-                }
-            }
-        }
-    }
-
-    #[test]
     fn closing_or_disconnecting_during_case_wake_cancels_the_deferred_open() {
         use crate::step::{Effect, Input};
         for disconnect in [false, true] {
@@ -7933,53 +6368,6 @@ mod tests {
         // for a sink that cannot appear.
         assert!(!daemon.output.wants_output());
         assert_eq!(daemon.status_value(now)["want_omarchy_seat"], false);
-    }
-
-    #[test]
-    fn playback_with_no_sign_of_the_pods_defers_the_claim_until_they_appear() {
-        let mut daemon = Daemon::new("omarchy-xps");
-        let now = clock();
-        daemon.select_accessory(Some(addr(9)));
-        daemon.connection.note_bluez(false);
-        assert!(!daemon.accessory.playback_available(now.mono));
-        daemon.handle(play("deferred"), now);
-        // Playing, but never seen this session: no claim, no muted speakers.
-        assert!(!daemon.output.wants_output());
-        assert!(daemon.deferred_playback_claim.is_some());
-        // Still nothing seen: a tick does not claim either.
-        daemon.step(crate::step::Input::Tick, now);
-        assert!(!daemon.output.wants_output());
-        // Opening the case alone must not silence the speakers.
-        daemon.note_lid(true, now.mono);
-        daemon.step(crate::step::Input::Tick, now);
-        assert!(!daemon.output.wants_output());
-        daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
-        daemon.step(crate::step::Input::Tick, now);
-        assert!(daemon.output.wants_output());
-        assert!(daemon.deferred_playback_claim.is_none());
-    }
-
-    #[test]
-    fn playback_with_no_sign_of_the_pods_does_not_open_a_link() {
-        use crate::step::{Effect, Input};
-
-        let mut daemon = Daemon::new("omarchy-xps");
-        let now = clock();
-        daemon.select_accessory(Some(addr(9)));
-        daemon.connection.note_bluez(false);
-        assert!(!daemon.accessory.playback_available(now.mono));
-        let played = daemon.step(Input::Command(play("unseen")), now);
-        // No sign of the pods: speakers keep playing and no link is probed.
-        // Probing absent pods only fails Host is down and cycles the adapter.
-        assert!(!played.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-        assert!(!daemon.output.wants_output());
-        assert!(daemon.deferred_playback_claim.is_some());
-        // A bud appearing while playback continues still claims the seat.
-        daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
-        let appeared = daemon.step(Input::Tick, now);
-        assert!(appeared.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
-        assert!(daemon.output.wants_output());
-        assert!(daemon.deferred_playback_claim.is_none());
     }
 
     #[test]
@@ -8296,44 +6684,6 @@ mod tests {
                 || matches!(effect, Effect::MuteStreams(_))
         }));
         assert!(daemon.audio.local_playing());
-    }
-
-    #[test]
-    fn disconnecting_docked_pods_does_not_pause_playback_resumed_on_speakers() {
-        use crate::step::{Effect, Input};
-        let mut daemon = Daemon::new("xps");
-        let now = clock();
-        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
-        let brave = "org.mpris.MediaPlayer2.brave";
-        ready_link(&mut daemon, now);
-        daemon.audio.startup_players(&[]);
-        for right in [false, true] {
-            daemon.note_pod(
-                right,
-                Pod {
-                    battery: Battery::new(80, true).unwrap(),
-                    in_ear: Some(false),
-                    in_case: Some(true),
-                },
-                now.mono,
-            );
-        }
-        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, at(1_000));
-        assert!(daemon.audio.local_playing());
-        assert!(!daemon.output.wants_output());
-        assert!(daemon.deferred_playback_claim.is_some());
-        let generation = daemon.connection.generation();
-        let mut effects =
-            daemon.step(Input::ControlSocket { up: false, generation }, at(7_000)).effects;
-        effects.extend(daemon.step(Input::Bluez(false), at(7_000)).effects);
-        effects.extend(daemon.step(Input::Lid { open: false }, at(7_100)).effects);
-        effects.extend(daemon.step(Input::Tick, at(8_000)).effects);
-        assert!(
-            effects.iter().all(|e| !matches!(e, Effect::PausePlayers(_) | Effect::MuteStreams(_))),
-            "{effects:?}"
-        );
-        assert!(daemon.audio.local_playing());
-        assert!(daemon.deferred_playback_claim.is_some(), "insertion can still claim this play");
     }
 
     #[test]
@@ -9126,378 +7476,6 @@ mod tests {
     }
 
     #[test]
-    fn taking_audio_back_keeps_the_player_paused_until_the_relinked_output_starts() {
-        use crate::audio::play::PlayerSeen;
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::pods::observe::Observation;
-        use crate::step::{Effect, Input};
-        let brave = "org.mpris.MediaPlayer2.brave";
-        let resumed =
-            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::ResumePlayers(_)));
-        for ending in ["success", "closed_stream", "failed", "canceled", "timeout", "audio_lost"] {
-            let mut daemon = Daemon::new("xps");
-            let now = clock();
-            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
-            ready_link(&mut daemon, now);
-            let mut graph = Graph {
-                default_sink: "pods".into(),
-                sinks: vec![
-                    Sink {
-                        name: "pods".into(),
-                        address: Some(addr(3)),
-                        profile: Some("a2dp-sink".into()),
-                    },
-                    Sink { name: "speakers".into(), address: None, profile: None },
-                ],
-                cards: vec![],
-                streams: vec![LiveStream {
-                    id: 1,
-                    generation: 10,
-                    sink: "pods".into(),
-                    role: String::new(),
-                    node: "Brave".into(),
-                    mute: false,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            };
-            daemon.step(Input::Audio(graph.clone()), now);
-            daemon.step(Input::Observation(Observation::Ownership(false)), now);
-            daemon.step(
-                Input::Players(vec![PlayerSeen { service: brave.into(), playing: true }]),
-                now,
-            );
-            daemon.output.claim();
-            let grant = daemon.step(Input::Observation(Observation::Ownership(true)), at(10));
-            assert!(grant
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::PausePlayers(names) if names == &[brave])));
-            assert!(matches!(grant.effects.first(), Some(Effect::MuteStreams(_))));
-            assert!(!resumed(&grant.effects));
-            let id = daemon.output_restart_serial;
-            let paused =
-                daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, at(20));
-            assert!(!resumed(&paused.effects));
-            graph.streams[0].mute = true;
-            graph.streams[0].corked = true;
-            graph.streams[0].sink = "speakers".into();
-            let reset = daemon.step(Input::Audio(graph.clone()), at(30));
-            assert!(reset.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })));
-            let reset_done = daemon.step(Input::OutputRestarted { id, ok: true }, at(40));
-            assert!(!resumed(&reset_done.effects), "profile completion is too early");
-            // A pause notification caused by the reset also cannot release the hold.
-            assert!(!resumed(
-                &daemon
-                    .step(Input::Player { service: brave.into(), playing: Some(false) }, at(50))
-                    .effects
-            ));
-            if ending == "closed_stream" {
-                graph.streams.clear();
-                daemon.step(Input::Audio(graph.clone()), at(60));
-            } else {
-                graph.streams[0].sink = "pods".into();
-                let linked = daemon.step(Input::Audio(graph.clone()), at(60));
-                assert!(!resumed(&linked.effects));
-                graph.streams[0].mute = false;
-            }
-            let unmuted = daemon.step(Input::Audio(graph.clone()), at(1_100));
-            assert!(!resumed(&unmuted.effects));
-            let start = daemon.step(Input::Tick, at(1_350));
-            assert!(start
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::StartOutput { id: started, .. } if *started == id)));
-            assert!(!resumed(&start.effects), "sending Start is not its completion");
-            assert!(!resumed(
-                &daemon.step(Input::OutputStarted { id: id + 1, ok: true }, at(1_360)).effects
-            ));
-            let before = match ending {
-                "canceled" => Some(Input::Command(Command::HandoffRelease)),
-                "audio_lost" => Some(Input::AudioLost),
-                "timeout" => Some(Input::Tick),
-                _ => None,
-            };
-            let completed_at = if before.is_some() { 5_200 } else { 1_400 };
-            if let Some(input) = before {
-                let stopped = daemon.step(input, at(5_100));
-                assert!(!resumed(&stopped.effects));
-            }
-            let finished =
-                daemon.step(Input::OutputStarted { id, ok: ending != "failed" }, at(completed_at));
-            let success = matches!(ending, "success" | "closed_stream");
-            assert_eq!(resumed(&finished.effects), success, "ending={ending}");
-            assert!(!resumed(
-                &daemon.step(Input::OutputStarted { id, ok: true }, at(completed_at + 10)).effects
-            ));
-            if success {
-                daemon.step(
-                    Input::Player { service: brave.into(), playing: Some(true) },
-                    at(completed_at + 20),
-                );
-                assert_eq!(
-                    daemon.output_restart_serial, id,
-                    "resume must not start another recovery"
-                );
-                assert!(daemon.resumed_players.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn a_player_that_pauses_itself_as_the_output_is_rebuilt_is_played_again() {
-        use crate::audio::play::PlayerSeen;
-        use crate::step::{Effect, Input};
-        let brave = "org.mpris.MediaPlayer2.brave";
-        let resumed = |effects: &[Effect]| {
-            effects.iter().any(|e| matches!(e, Effect::ResumePlayers(names) if names == &[brave]))
-        };
-        // Within the window after a rebuild, outside it, and after the
-        // daemon itself gave the seat away.
-        for (after_ms, step_back, expect) in
-            [(100, false, true), (600, false, false), (100, true, false)]
-        {
-            let mut daemon = Daemon::new("xps");
-            let now = clock();
-            ready_link(&mut daemon, now);
-            daemon.audio.startup_players(&[PlayerSeen { service: brave.into(), playing: true }]);
-            daemon.output.claim();
-            daemon.step(Input::OutputRestarted { id: 0, ok: true }, now);
-            daemon.rebuild_pause_until = Some(now.mono.saturating_add(500));
-            if step_back {
-                daemon.step_back(now);
-            }
-            let later = Clock::new(now.mono.0 + after_ms, now.unix.0 + after_ms);
-            let paused =
-                daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, later);
-            assert_eq!(
-                resumed(&paused.effects),
-                expect,
-                "after {after_ms} ms, step_back={step_back}"
-            );
-            if expect {
-                // Our own Play continues the claim; it does not start another.
-                let serial = daemon.output_restart_serial;
-                let resume_output = daemon.resume_output_on_grant;
-                daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, later);
-                assert_eq!(daemon.output_restart_serial, serial);
-                assert_eq!(daemon.resume_output_on_grant, resume_output);
-                assert!(daemon.resumed_players.is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn a_rebuilt_output_that_never_streams_is_rebuilt_again_a_bounded_number_of_times() {
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::pods::observe::Observation;
-        use crate::step::{Effect, Input};
-        for streamed in [false, true] {
-            let mut daemon = Daemon::new("gram");
-            let now = clock();
-            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
-            daemon.set_local_address(Some(addr(2)));
-            ready_link(&mut daemon, now);
-            daemon.step(Input::Players(Vec::new()), now);
-            let playing = Graph {
-                default_sink: "pods".into(),
-                sinks: vec![
-                    Sink {
-                        name: "pods".into(),
-                        address: Some(addr(3)),
-                        profile: Some("a2dp-sink".into()),
-                    },
-                    Sink { name: "speakers".into(), address: None, profile: None },
-                ],
-                cards: Vec::new(),
-                streams: vec![LiveStream {
-                    id: 1,
-                    generation: 10,
-                    sink: "pods".into(),
-                    role: String::new(),
-                    node: "Brave".into(),
-                    mute: false,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            };
-            let mut parked = playing.clone();
-            parked.streams[0].mute = true;
-            parked.streams[0].sink = "speakers".into();
-            daemon.step(Input::Audio(playing.clone()), now);
-            daemon.step(Input::Observation(Observation::Ownership(false)), now);
-            daemon.output.claim();
-            daemon.audio.set_local_playing_for_test(true);
-            let mut serial = daemon.output_restart_serial;
-            let mut rebuilds = 0;
-            for round in 0..4u64 {
-                let base = round * 4_000;
-                if round == 0 {
-                    daemon.step(Input::Observation(Observation::Ownership(true)), at(base));
-                } else {
-                    daemon.step(Input::Tick, at(base));
-                }
-                if daemon.output_restart_serial == serial {
-                    continue;
-                }
-                serial = daemon.output_restart_serial;
-                rebuilds += 1;
-                let reset = daemon.step(Input::Audio(parked.clone()), at(base + 10));
-                assert!(reset.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })));
-                daemon.step(Input::OutputRestarted { id: serial, ok: true }, at(base + 20));
-                daemon.step(Input::Audio(playing.clone()), at(base + 30));
-                daemon.step(Input::Transport { active: streamed }, at(base + 40));
-                daemon.step(Input::Tick, at(base + 300));
-                let start = daemon.step(Input::Tick, at(base + 600));
-                assert!(start.effects.iter().any(|e| matches!(e, Effect::StartOutput { .. })));
-                daemon.step(Input::OutputStarted { id: serial, ok: true }, at(base + 610));
-                // Before the check is due nothing happens.
-                daemon.step(Input::Tick, at(base + 1_000));
-                assert_eq!(daemon.output_restart_serial, serial);
-            }
-            // The grant's rebuild, then at most two more when audio never flows.
-            assert_eq!(rebuilds, if streamed { 1 } else { 3 });
-        }
-    }
-
-    #[test]
-    fn a_grant_after_losing_the_pods_relinks_unless_audio_already_streams() {
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::pods::observe::Observation;
-        use crate::step::{Effect, Input};
-        for (state, flagged) in [(2, false), (0, false), (2, true), (0, true)] {
-            let mut daemon = Daemon::new("gram");
-            let now = clock();
-            daemon.set_local_address(Some(addr(2)));
-            ready_link(&mut daemon, now);
-            daemon.step(Input::Players(Vec::new()), now);
-            let graph = Graph {
-                default_sink: "pods".into(),
-                sinks: vec![
-                    Sink {
-                        name: "pods".into(),
-                        address: Some(addr(3)),
-                        profile: Some("a2dp-sink".into()),
-                    },
-                    Sink { name: "speakers".into(), address: None, profile: None },
-                ],
-                cards: Vec::new(),
-                streams: vec![LiveStream {
-                    id: 1,
-                    generation: 10,
-                    sink: "pods".into(),
-                    role: String::new(),
-                    node: "Brave".into(),
-                    mute: false,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            };
-            daemon.step(Input::Audio(graph.clone()), now);
-            // The other laptop took the pods, which ended this one's A2DP stream.
-            daemon.step(Input::Observation(Observation::Ownership(false)), now);
-            if state == 0 {
-                daemon.step(Input::Transport { active: true }, now);
-            }
-            // With or without the older grant flag, a running sink is kept.
-            daemon.output.claim();
-            daemon.resume_output_on_grant = flagged;
-            let grant = daemon.step(Input::Observation(Observation::Ownership(true)), now);
-            // Recovery parks the muted stream on the speakers before restarting.
-            let mut parked = graph.clone();
-            parked.streams[0].mute = true;
-            parked.streams[0].sink = "speakers".into();
-            let settled = daemon.step(Input::Audio(parked), now);
-            let restarted = [&grant.effects, &settled.effects].iter().any(|effects| {
-                effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. }))
-            });
-            assert_eq!(restarted, state != 0, "sink state {state} flagged {flagged}");
-            assert!(!daemon.rearm_after_loss);
-            assert!(!daemon.resume_output_on_grant);
-        }
-    }
-
-    #[test]
-    fn a_new_audio_output_is_routed_without_restarting_it_for_an_old_ownership_loss() {
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::pods::observe::Observation;
-        use crate::step::{Effect, Input};
-
-        for old_output in [true, false] {
-            let mut daemon = Daemon::new("xps");
-            let now = clock();
-            ready_link(&mut daemon, now);
-            daemon.step(Input::Players(Vec::new()), now);
-            let pods = Sink {
-                name: "pods".into(),
-                address: Some(addr(3)),
-                profile: Some("a2dp-sink".into()),
-            };
-            let mut graph = Graph {
-                default_sink: "speakers".into(),
-                sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
-                cards: vec![],
-                streams: vec![LiveStream {
-                    id: 1,
-                    generation: 10,
-                    sink: "speakers".into(),
-                    role: String::new(),
-                    node: "Brave".into(),
-                    mute: false,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            };
-            if old_output {
-                graph.sinks.push(pods.clone());
-            }
-            daemon.step(Input::Audio(graph.clone()), now);
-            daemon.step(Input::Observation(Observation::Ownership(false)), now);
-            graph.sinks.retain(|s| s.address.is_none());
-            daemon.step(Input::Audio(graph.clone()), now);
-            daemon.step(
-                Input::Player {
-                    service: "org.mpris.MediaPlayer2.brave".into(),
-                    playing: Some(true),
-                },
-                now,
-            );
-            // Opening reports may name the old owner before granting this play.
-            daemon.step(Input::Observation(Observation::Ownership(false)), now);
-            daemon.step(Input::Observation(Observation::Ownership(true)), now);
-            graph.streams[0].mute = true;
-            daemon.step(Input::Audio(graph.clone()), now);
-            graph.sinks.push(pods);
-            let arrived = daemon.step(Input::Audio(graph.clone()), now);
-            assert!(
-                !arrived.effects.iter().any(|e| matches!(
-                    e,
-                    Effect::RestartOutput { .. } | Effect::RearmOutput { .. }
-                )),
-                "old_output={old_output}: {:?}",
-                arrived.effects
-            );
-            assert_eq!(daemon.output_restart_serial, 0);
-            assert!(
-                arrived.effects.iter().any(|e| matches!(e,
-                    Effect::SetDefaultSink { name } if name == "pods"
-                )),
-                "route as soon as the sink arrives: {:?}",
-                arrived.effects
-            );
-            graph.default_sink = "pods".into();
-            let selected = daemon.step(Input::Audio(graph), now);
-            assert!(
-                selected.effects.iter().any(|e| matches!(e,
-                    Effect::MoveStreams(moved) if moved.sink == "pods"
-                )),
-                "move immediately after selection: {:?}",
-                selected.effects
-            );
-        }
-    }
-
-    #[test]
     fn a_rearm_refreshes_the_known_card_instead_of_reconnecting_bluetooth() {
         use crate::audio::route::{Card, Graph, LiveStream, Sink};
         use crate::step::{Effect, Input};
@@ -9559,6 +7537,11 @@ mod tests {
             let expected =
                 card_known.then(|| ("bluez_card.pods".to_string(), "a2dp-sink".to_string()));
             assert_eq!(card, Some(expected));
+            assert_eq!(daemon.status_value(now)["connection_lifecycle"]["state"], "routing");
+            assert_eq!(
+                daemon.status_value(now)["connection_lifecycle"]["waiting_for"],
+                "stream_route"
+            );
         }
     }
 
@@ -9629,71 +7612,6 @@ mod tests {
         let reset = daemon.step(Input::Audio(muted), now);
         assert!(reset.effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. })));
         assert!(!daemon.output.held_streams()[0].mute, "save the speaker stream before muting it");
-    }
-
-    #[test]
-    fn recovery_defers_an_unmute_queued_before_the_ownership_grant() {
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::step::{Effect, Input};
-        let mut daemon = Daemon::new("xps");
-        let now = clock();
-        daemon.set_local_address(Some(addr(2)));
-        ready_link(&mut daemon, now);
-        daemon.output.claim();
-        daemon.output.on_graph(
-            Some(addr(3)),
-            &Graph {
-                default_sink: "speakers".into(),
-                sinks: vec![],
-                streams: vec![],
-                cards: vec![],
-            },
-            true,
-            now.mono,
-        );
-        daemon.output.hold_streams(&[StreamSnap {
-            id: 1,
-            generation: 10,
-            mute: false,
-            volume: 1.0,
-        }]);
-        daemon.resume_output_on_grant = true;
-        daemon.note_ownership(true, now.mono);
-        let action = daemon.step(
-            Input::Audio(Graph {
-                default_sink: "pods".into(),
-                sinks: vec![
-                    Sink {
-                        name: "pods".into(),
-                        address: Some(addr(3)),
-                        profile: Some("a2dp-sink".into()),
-                    },
-                    Sink { name: "speakers".into(), address: None, profile: None },
-                ],
-                cards: Vec::new(),
-                streams: vec![LiveStream {
-                    id: 1,
-                    generation: 10,
-                    sink: "pods".into(),
-                    role: String::new(),
-                    node: "Brave".into(),
-                    mute: true,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            }),
-            now,
-        );
-        assert!(action
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::MoveStreams(m) if m.sink == "speakers")));
-        assert!(
-            !action.effects.iter().any(|e| matches!(e, Effect::Restore(_))),
-            "the pending unmute must wait until recovery moves the stream back to the pods"
-        );
-        assert_eq!(daemon.output.held_streams().len(), 1);
-        assert!(!daemon.output.held_streams()[0].mute);
     }
 
     #[test]
@@ -10076,7 +7994,7 @@ mod tests {
         );
         let elapsed = crate::pods::reports::REPORT_TTL_MS + 1;
         let later = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
-        daemon.tick(later);
+        daemon.step(crate::step::Input::Tick, later);
         // 2026-10-12: the pods send a source report when it changes; on a live link it stands.
         assert!(daemon.accessory.source.as_fresh().is_some());
         let status = daemon.status_value(later);
@@ -10268,7 +8186,7 @@ mod tests {
         assert_eq!(daemon.enrollment().phase(), crate::fleet::enroll::Phase::WaitingOffer);
     }
 
-    fn play(token: &str) -> Command {
+    pub(super) fn play(token: &str) -> Command {
         Command::Playback(Ok(crate::types::PlaybackEvent {
             kind: crate::types::PlayKind::Play,
             application: "Browser".into(),
@@ -10991,7 +8909,7 @@ mod tests {
         use crate::fleet::members::{Fleet, GroupKey, Member};
         use crate::fleet::presence::FleetKeys;
         use crate::fleet::roster_air;
-        use crate::pods::link::{Claim, OpenStep};
+        use crate::pods::link::{reach_stage, Claim, Stage};
         use crate::step::Input;
 
         let now = clock();
@@ -11013,7 +8931,7 @@ mod tests {
             panic!("claim");
         };
         daemon.note_socket(true, generation, now.mono);
-        assert!(daemon.connection.advance(OpenStep::Notifications, generation, now.mono));
+        assert!(reach_stage(&mut daemon.connection, Stage::Notifications, generation, now.mono));
         assert!(daemon.connection.mark_ready(generation));
         daemon.note_source(true, 2, now.mono);
         daemon.note_remote(phone, now.mono);
@@ -11249,30 +9167,6 @@ mod tests {
     }
 
     #[test]
-    fn playback_on_a_control_only_connection_opens_audio_without_waiting_for_ownership() {
-        use crate::step::{Effect, Input};
-        let now = clock();
-        let mut daemon = Daemon::new("xps");
-        daemon.select_accessory(Some(addr(9)));
-        ready(&mut daemon, now.mono);
-        daemon.note_ownership(false, now.mono);
-        let background = daemon.step(Input::Tick, now);
-        assert!(!background.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
-        daemon.claim_playback(now);
-        let playing = daemon.step(Input::Tick, now);
-        assert!(playing
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::ConnectTransport { accessory } if *accessory == addr(9))));
-        assert!(!daemon.resume_output_on_grant, "a new transport needs no old-output recovery");
-        let repeated = daemon.step(Input::Tick, now);
-        assert!(!repeated.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
-        let granted = daemon
-            .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
-        assert!(!granted.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
-    }
-
-    #[test]
     fn a_playing_helper_admits_a_requester_that_older_evidence_still_seats() {
         use crate::fleet::members::{Fleet, GroupKey, Member};
         use crate::fleet::route_air::{Answer, Kind, Message};
@@ -11434,7 +9328,7 @@ mod tests {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::fleet::route::Start;
-        use crate::pods::link::{Claim, OpenStep};
+        use crate::pods::link::{reach_stage, Claim, Stage};
         use crate::pods::observe::Observation;
         use crate::step::{Effect, Input};
         let now = clock();
@@ -11476,7 +9370,7 @@ mod tests {
         // Admission opens the link; the claim goes out when it is ready.
         let Claim::Started(generation) = daemon.connection.claim(now.mono) else { panic!("claim") };
         daemon.note_socket(true, generation, now.mono);
-        assert!(daemon.connection.advance(OpenStep::Notifications, generation, now.mono));
+        assert!(reach_stage(&mut daemon.connection, Stage::Notifications, generation, now.mono));
         let ready = daemon.step(Input::Observation(Observation::Ready), at(5_000));
         assert!(ready.effects.iter().any(|e| matches!(e,
             Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true))));
@@ -11553,13 +9447,13 @@ mod tests {
         assert!(daemon.output.wants_output());
     }
 
-    fn ready(daemon: &mut Daemon, now: MonoMs) {
-        use crate::pods::link::{Claim, OpenStep};
+    pub(super) fn ready(daemon: &mut Daemon, now: MonoMs) {
+        use crate::pods::link::{reach_stage, Claim, Stage};
         let Claim::Started(generation) = daemon.connection.claim(now) else {
             panic!("claim");
         };
         daemon.note_socket(true, generation, now);
-        assert!(daemon.connection.advance(OpenStep::Notifications, generation, now));
+        assert!(reach_stage(&mut daemon.connection, Stage::Notifications, generation, now));
         assert!(daemon.connection.mark_ready(generation));
     }
 
@@ -11726,7 +9620,7 @@ mod tests {
         // The pods report playback when it changes. A song that keeps playing sends nothing more.
         let elapsed = crate::pods::reports::REPORT_TTL_MS + 60_000;
         now = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
-        daemon.tick(now);
+        daemon.step(crate::step::Input::Tick, now);
         let status = daemon.status_value(now);
         assert_eq!(status["audio_owner"]["holder"], "remote");
         assert_eq!(status["audio_owner"]["playing"], true);
@@ -11756,7 +9650,7 @@ mod tests {
         );
         let later_by = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
         let later = later_by(crate::pods::reports::REPORT_TTL_MS * 3);
-        daemon.tick(later);
+        daemon.step(crate::step::Input::Tick, later);
         // Nothing changed for six minutes on a live link: the pods had nothing new to say.
         assert!(daemon.accessory.source.as_fresh().is_some());
         assert_eq!(daemon.accessory.remote_address.as_fresh(), Some(&phone));
@@ -11764,7 +9658,8 @@ mod tests {
         assert!(daemon.accessory.noise.as_fresh().is_some() || daemon.accessory.noise.is_unknown());
         // Without the link, the battery reading ages out as before.
         daemon.note_socket(false, daemon.connection.generation(), now.mono);
-        daemon.tick(later_by(crate::pods::reports::REPORT_TTL_MS * 3 + 1));
+        daemon
+            .step(crate::step::Input::Tick, later_by(crate::pods::reports::REPORT_TTL_MS * 3 + 1));
         assert!(daemon.accessory.left.as_fresh().is_none());
         assert!(daemon.accessory.left.known().is_some(), "aged, not forgotten");
     }
@@ -12222,8 +10117,7 @@ mod tests {
             for right in [false, true] {
                 daemon.accessory.note_placement(right, Some(true), Some(false), now.mono);
             }
-            daemon.background_requested = true;
-            daemon.connection.claim(now.mono);
+            daemon.handle(Command::Connect, now);
             let opening = daemon.step(Input::Tick, now);
             assert!(opens(&opening.effects));
             for _ in 0..14 {
@@ -12610,16 +10504,66 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_joins_profile_reports_and_exposes_its_blocking_gate() {
+        use crate::pods::lifecycle::Profiles;
+        use crate::step::{Effect, Input, TransportReply};
+        let now = clock();
+        let mut daemon = Daemon::new("xps");
+        daemon.select_accessory(Some(addr(3)));
+        daemon.claim_playback(now);
+        daemon.step(Input::Tick, now);
+        let started = daemon.step(Input::Bluez(true), now);
+        let id = started
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ConnectTransport { id, .. } => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        let mut observed = Profiles {
+            accessory: addr(3),
+            connected: true,
+            services_resolved: false,
+            handsfree: true,
+            busy: false,
+        };
+        daemon.step(Input::BluetoothProfiles(observed), now);
+        let waiting =
+            daemon.step(Input::TransportReply { id, reply: TransportReply::Connected }, now);
+        assert!(!waiting.effects.iter().any(|e| matches!(e, Effect::ConnectHandsfree { .. })));
+        let status = daemon.status_value(now);
+        assert_eq!(status["connection_lifecycle"]["state"], "completing_profiles");
+        assert_eq!(status["connection_lifecycle"]["waiting_for"], serde_json::json!("output"));
+        assert_eq!(status["connection_lifecycle"]["handsfree"], "waiting");
+        observed.services_resolved = true;
+        let ready = daemon.step(Input::BluetoothProfiles(observed), now);
+        assert!(ready.effects.iter().any(|e| matches!(e, Effect::ConnectHandsfree { accessory, id: request } if *accessory == addr(3) && *request == id)));
+        let duplicate = daemon.step(Input::BluetoothProfiles(observed), now);
+        assert!(!duplicate.effects.iter().any(|e| matches!(e, Effect::ConnectHandsfree { .. })));
+        daemon.step(Input::HandsfreeReply { id, ok: false }, now);
+        assert_eq!(
+            daemon.status_value(now)["connection_lifecycle"]["state"],
+            "completing_profiles"
+        );
+        daemon.claim_playback(now);
+        daemon.step(Input::Tick, now);
+        let replacement = daemon.lifecycle.request_id().unwrap();
+        assert_ne!(id, replacement);
+        let stale =
+            daemon.step(Input::TransportReply { id, reply: TransportReply::Connected }, now);
+        assert!(!stale.effects.iter().any(|e| matches!(e, Effect::ConnectHandsfree { .. })));
+    }
+
+    #[test]
     fn a_play_opens_audio_alongside_an_authorized_control_attempt() {
-        use crate::pods::link::OpenStep;
+        use crate::pods::link::{reach_stage, Stage};
         use crate::step::{Effect, Input};
         let now = clock();
         let mut daemon = Daemon::new("xps");
         daemon.select_accessory(Some(addr(3)));
         daemon.claim_playback(now);
         assert_eq!(daemon.connection.stage(), Stage::Connecting);
-        // Merely entering an opening stage has not authorized a radio action yet.
-        assert!(daemon.pace_audio().is_empty());
         let start = daemon.step(Input::Tick, now);
         assert!(start.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
         // Audio waits for the link: paging the pods twice at once collides.
@@ -12628,16 +10572,18 @@ mod tests {
         assert!(linked.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
         let generation = daemon.connection.generation();
         daemon.note_socket(true, generation, now.mono);
-        for stage in [OpenStep::Handshake, OpenStep::Features, OpenStep::Notifications] {
-            assert!(daemon.connection.advance(stage, generation, now.mono));
+        for stage in [Stage::Handshake, Stage::Features, Stage::Notifications] {
+            assert!(reach_stage(&mut daemon.connection, stage, generation, now.mono));
             let next = daemon.step(Input::Tick, now);
             assert!(!next.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
         }
-        // A missing/failed early profile still gets the original ready-stage attempt.
+        // Control readiness must preserve an in-flight audio task and its completion ID.
         assert!(daemon.mark_control_ready(generation));
-        let retry = daemon.step(Input::Tick, now);
-        assert!(retry.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
-        assert!(daemon.pace_audio().is_empty());
+        let request = daemon.lifecycle.request_id();
+        let ready = daemon.step(Input::Tick, now);
+        assert!(!ready.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        assert_eq!(daemon.lifecycle.request_id(), request);
+        assert!(daemon.advance_connection_tasks(now.mono).is_empty());
     }
 
     #[test]
@@ -12646,20 +10592,28 @@ mod tests {
         let mut daemon = Daemon::new("xps");
         daemon.select_accessory(Some(addr(3)));
         daemon.open_connection(now.mono);
-        daemon.link_asked = Some(daemon.connection.generation());
-        assert!(daemon.pace_audio().is_empty(), "background control does not open audio");
-        daemon.output.claim();
-        daemon.link_asked = None;
+        daemon.step(crate::step::Input::Tick, now);
         assert!(
-            daemon.pace_audio().is_empty(),
-            "unstarted/admission-waiting link cannot open audio"
+            daemon.advance_connection_tasks(now.mono).is_empty(),
+            "background control does not open audio"
         );
-        daemon.link_asked = Some(daemon.connection.generation());
+        daemon.output.claim();
+        assert!(
+            daemon.advance_connection_tasks(now.mono).is_empty(),
+            "audio cannot page alongside the in-flight link"
+        );
+        daemon.step(crate::step::Input::Tick, now);
         daemon.keyring_locked = true;
-        assert!(daemon.pace_audio().is_empty(), "locked authorization blocks early audio");
+        assert!(
+            daemon.advance_connection_tasks(now.mono).is_empty(),
+            "locked authorization blocks early audio"
+        );
         daemon.keyring_locked = false;
         daemon.connection.wait_for_request();
-        assert!(daemon.pace_audio().is_empty(), "a canceled attempt cannot open audio");
+        assert!(
+            daemon.advance_connection_tasks(now.mono).is_empty(),
+            "a canceled attempt cannot open audio"
+        );
     }
 
     #[test]
@@ -12672,7 +10626,10 @@ mod tests {
         daemon.claim_playback(now);
         daemon.step(Input::Tick, now);
         daemon.step(Input::Bluez(true), now);
-        assert!(daemon.transport_asked_early);
+        assert_eq!(
+            daemon.lifecycle.progress().state,
+            crate::pods::lifecycle::State::PreparingPaths
+        );
         daemon.last_graph = Some(Graph {
             default_sink: "pods".into(),
             sinks: vec![Sink {
@@ -12685,9 +10642,17 @@ mod tests {
         });
         let generation = daemon.connection.generation();
         daemon.note_socket(true, generation, now.mono);
-        daemon.connection.advance(crate::pods::link::OpenStep::Notifications, generation, now.mono);
+        crate::pods::link::reach_stage(
+            &mut daemon.connection,
+            Stage::Notifications,
+            generation,
+            now.mono,
+        );
         assert!(daemon.mark_control_ready(generation));
-        assert!(!daemon.pace_audio().iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+        assert!(!daemon
+            .advance_connection_tasks(now.mono)
+            .iter()
+            .any(|e| matches!(e, Effect::ConnectTransport { .. })));
         daemon.step(Input::Transport { active: true }, now);
         assert_eq!(daemon.status_value(now)["audio_transport_active"], true);
         daemon.step(Input::Transport { active: false }, now);
@@ -12710,18 +10675,36 @@ mod tests {
         set_up_link(&mut daemon, generation, now);
         assert_eq!(daemon.connection.stage(), Stage::Ready);
         // A busy answer waits a beat, then asks once more.
-        daemon.step(Input::TransportReply(TransportReply::Busy), now);
+        daemon.step(
+            Input::TransportReply {
+                id: daemon.lifecycle.request_id().unwrap(),
+                reply: TransportReply::Busy,
+            },
+            now,
+        );
         assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 0);
         now = later(now, TRANSPORT_RETRY_MS);
         assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 1);
         assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 0);
         // So does a request that went unanswered.
-        daemon.step(Input::TransportReply(TransportReply::TimedOut), now);
+        daemon.step(
+            Input::TransportReply {
+                id: daemon.lifecycle.request_id().unwrap(),
+                reply: TransportReply::TimedOut,
+            },
+            now,
+        );
         now = later(now, TRANSPORT_RETRY_MS);
         assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 1);
         // Past the window the claim stops asking.
         now = later(now, TRANSPORT_RETRY_WINDOW_MS);
-        daemon.step(Input::TransportReply(TransportReply::Busy), now);
+        daemon.step(
+            Input::TransportReply {
+                id: daemon.lifecycle.request_id().unwrap(),
+                reply: TransportReply::Busy,
+            },
+            now,
+        );
         now = later(now, TRANSPORT_RETRY_MS);
         assert_eq!(asks(&daemon.step(Input::Tick, now).effects), 0);
         // A new play is a new claim with its own window.

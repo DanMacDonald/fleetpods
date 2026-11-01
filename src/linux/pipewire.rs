@@ -51,6 +51,7 @@ pub enum Op {
     DefaultSource(String),
     /// Select this codec profile on the card the audio server named.
     Profile {
+        id: crate::pods::lifecycle::RequestId,
         card: String,
         name: String,
     },
@@ -637,14 +638,15 @@ fn apply(
                     }
                 });
             }
-            Op::Profile { card, name } => {
+            Op::Profile { id, card, name } => {
+                let id = *id;
                 let reports = reports.clone();
                 let card_name = card.clone();
                 *profile_op = Some(intro.set_card_profile_by_name(
                     card,
                     name,
                     Some(Box::new(move |ok| {
-                        let _ = reports.send(Input::ProfileResult { ok });
+                        let _ = reports.send(Input::ProfileResult { id, ok });
                         if !ok {
                             eprintln!("fleetpodsd: card profile on {card_name} was not selected");
                         }

@@ -6,32 +6,12 @@ use crate::audio::route::{Graph, Move, StreamTarget};
 use crate::fleet::members::Fleet;
 use crate::fleet::postcard::{self, Postcard};
 use crate::panel::ipc::Command;
-use crate::pods::link::{FailReason, Stage};
+use crate::pods::link::Stage;
 use crate::pods::reports::Pod;
 use crate::pods::setup::{self, Place};
 use crate::types::{Address, Battery, Clock, Generation, MonoMs};
 
 use crate::daemon::{host_id, Daemon};
-
-/// How long after an output rebuild audio must be streaming to the pods.
-const REARM_VERIFY_MS: u64 = 2_500;
-/// Rebuilds after a failed start, per grant.
-const REARM_RETRY_LIMIT: u8 = 2;
-/// A player that pauses this soon after a rebuilt output came back paused
-/// because its stream was moved, not because the user asked.
-const REBUILD_PAUSE_MS: u64 = 500;
-/// How long after losing the pods this laptop may still release its idle
-/// AirPods output early, so the pods start the new owner's audio sooner.
-const RELEASE_OUTPUT_MS: u64 = 3_000;
-/// After a claim sent as a new link becomes ready (or just after, by a play
-/// that waited for it), the rest of the pods' opening reports still
-/// describe who played before it. A remote owner in
-/// them is not a takeover. The pods answer a claim well within this.
-pub(crate) const SETUP_CLAIM_SETTLE_MS: u64 = 1_500;
-/// The pods can send one more report naming the previous owner just before
-/// they grant a claim (2026-10-19: 1 ms apart). A remote report this soon
-/// after a claim waits this long for the grant before it ends the claim.
-const CLAIM_ANSWER_MS: u64 = 300;
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
@@ -151,10 +131,19 @@ pub enum Input {
     AudioLost,
     /// The card profile the daemon selected was or was not applied.
     ProfileResult {
+        id: crate::pods::lifecycle::RequestId,
         ok: bool,
     },
     /// How BlueZ answered the A2DP `ConnectProfile` a `ConnectTransport` sent.
-    TransportReply(TransportReply),
+    TransportReply {
+        id: crate::pods::lifecycle::RequestId,
+        reply: TransportReply,
+    },
+    BluetoothProfiles(crate::pods::lifecycle::Profiles),
+    HandsfreeReply {
+        id: crate::pods::lifecycle::RequestId,
+        ok: bool,
+    },
     Streams(Vec<StreamSnap>),
     /// The startup picture of MPRIS players. This does not claim.
     Players(Vec<PlayerSeen>),
@@ -220,12 +209,19 @@ pub enum Effect {
     },
     /// Select this codec profile on the card the audio server reported.
     SelectProfile {
+        id: crate::pods::lifecycle::RequestId,
         card: String,
         profile: String,
     },
     /// Connect the A2DP transport. Sent only when that transport is not already up.
     ConnectTransport {
         accessory: Address,
+        id: crate::pods::lifecycle::RequestId,
+    },
+    /// Optional signaling after A2DP and service discovery; never selects HFP audio.
+    ConnectHandsfree {
+        accessory: Address,
+        id: crate::pods::lifecycle::RequestId,
     },
     /// Rebuild A2DP after detaching muted streams, preserving the control link.
     /// With the card known, its profile is refreshed (off, then this profile),
@@ -297,38 +293,9 @@ pub struct StepOutcome {
 
 impl Daemon {
     pub fn step(&mut self, input: Input, now: Clock) -> StepOutcome {
+        let tick = matches!(input, Input::Tick);
         let reply = self.apply(input, now);
-        StepOutcome { reply, effects: self.harvest(now) }
-    }
-
-    /// Request local playback when this machine is playing or has a queued
-    /// resume, and no newer remote report has arrived. A remote report stored
-    /// before the claim is older intent, even within the same millisecond.
-    /// A remote report after the claim wins unless the pods grant the claim
-    /// within [`CLAIM_ANSWER_MS`].
-    pub(crate) fn wants_local_confirm(&self, now: MonoMs) -> bool {
-        self.seat.wants_local_confirm(
-            self.output.wants_output(),
-            // A player paused by FleetPods still supplies playback intent.
-            // Rejoining must claim before our Play reply arrives, otherwise
-            // an opening owner report immediately cancels the resumed media.
-            self.audio.local_playing() || !self.resume_players.is_empty(),
-            self.audio.yielded(),
-            &self.accessory.ownership,
-            now,
-        )
-    }
-
-    /// Ask on the existing control link. Ownership and source remain observations
-    /// from the accessory; sending CLAIM is not confirmation of playback.
-    pub(crate) fn request_playback_ownership(&mut self, now: Clock) -> bool {
-        if !self.wants_local_confirm(now.mono) {
-            return false;
-        }
-        self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
-        eprintln!("fleetpodsd: claiming AirPods audio on the existing control link");
-        self.claim_sent_at = Some(now.mono);
-        true
+        StepOutcome { reply, effects: self.advance_session(now, tick) }
     }
 
     fn apply(&mut self, input: Input, now: Clock) -> Option<String> {
@@ -352,36 +319,15 @@ impl Daemon {
                 None
             }
             Input::OutputRestarted { id, ok } => {
-                if self.output.finish_recovery(id, ok) {
-                    eprintln!("fleetpodsd: AirPods sink restart {id} completed (ok={ok})");
-                    if !ok {
-                        self.seat_audio_failure("audio sink restart failed", now);
-                    } else {
-                        // The profile reply precedes stream relinking and Start.
-                        self.rebuild_pause_until = Some(now.mono.saturating_add(REBUILD_PAUSE_MS));
-                    }
-                    self.replan(now);
-                }
+                self.output_restarted(id, ok, now);
                 None
             }
             Input::OutputStarted { id, ok } => {
-                if self.output.finish_start(id, ok) {
-                    if ok {
-                        // Command success is not proof of audible playback.
-                        self.rearm_verify_at = Some(now.mono.saturating_add(REARM_VERIFY_MS));
-                    } else {
-                        self.seat_audio_failure("audio output start failed", now);
-                    }
-                    self.replan(now);
-                }
+                self.output_started(id, ok, now);
                 None
             }
             Input::Command(command) => self.handle(command, now).body,
             Input::Tick => {
-                self.tick(now);
-                if !self.radio_quiet() {
-                    self.replan(now);
-                }
                 self.effects.announce_dirty = true;
                 None
             }
@@ -443,31 +389,7 @@ impl Daemon {
                 None
             }
             Input::ControlSocket { up, generation } => {
-                if generation != self.connection.generation() {
-                    return None;
-                }
-                let was_ready = self.connection.stage() == Stage::Ready;
-                // A control link can outlive our return to the speakers.
-                // Losing that link must not pause or cancel the speaker play.
-                let released_audio = !self.output.wants_output() && self.audio.yielded();
-                let evicted = !up && was_ready && self.evicted_while_playing(now);
-                self.note_socket(up, generation, now.mono);
-                if up {
-                    self.begin_setup(generation, now);
-                } else {
-                    self.accessory_setup = setup::Setup::new();
-                    if was_ready
-                        && !released_audio
-                        && !self.routing.phase().busy()
-                        && !self.connection.apple_reconnect()
-                    {
-                        self.step_back(now);
-                        if evicted {
-                            let players = self.effects.pause_players.clone();
-                            self.plan_rejoin(players, now.mono);
-                        }
-                    }
-                }
+                self.control_socket_changed(up, generation, now);
                 None
             }
             Input::Accessory { generation, packet } => {
@@ -587,22 +509,23 @@ impl Daemon {
                 None
             }
             Input::AudioLost => {
-                self.last_graph = None;
-                self.output.forget_server();
-                self.resume_players.clear();
-                self.resumed_players.clear();
-                self.rebuild_pause_until = None;
-                self.rearm_verify_at = None;
-                self.output_health.forget_server();
-                self.audio.set_routed(false);
+                self.audio_server_lost();
                 None
             }
-            Input::ProfileResult { ok } => {
-                self.note_profile(ok, now);
+            Input::ProfileResult { id, ok } => {
+                self.note_profile(id, ok, now);
                 None
             }
-            Input::TransportReply(reply) => {
-                self.note_transport_reply(reply, now.mono);
+            Input::TransportReply { id, reply } => {
+                self.note_transport_reply(id, reply, now.mono);
+                None
+            }
+            Input::BluetoothProfiles(profiles) => {
+                self.lifecycle.note_profiles(profiles);
+                None
+            }
+            Input::HandsfreeReply { id, ok } => {
+                self.lifecycle.note_handsfree(id, ok);
                 None
             }
             Input::Streams(streams) => {
@@ -615,36 +538,11 @@ impl Daemon {
                 None
             }
             Input::Player { service, playing } => {
-                if playing == Some(false)
-                    && self.output.wants_output()
-                    && self.audio.player_playing(&service)
-                    && (self.output.recovering()
-                        || self.rebuild_pause_until.is_some_and(|until| now.mono.0 < until.0))
-                    && !self.resume_players.contains(&service)
-                {
-                    eprintln!("fleetpodsd: player {service:?} paused during the AirPods rebuild; deferring resume until output start");
-                    self.resume_players.push(service.clone());
-                }
-                let after_yield = self.audio.yielded();
-                // Our own Play continues the claim already in progress.
-                let resumed = playing == Some(true)
-                    && self
-                        .resumed_players
-                        .iter()
-                        .position(|s| s == &service)
-                        .map(|at| self.resumed_players.remove(at))
-                        .is_some();
-                if self.audio.update_player(&service, playing) && !resumed {
-                    eprintln!("fleetpodsd: player {service:?} reported new Playing state (after_yield={after_yield})");
-                    self.remember_activity(now);
-                    self.claim_playback(now);
-                }
-                self.effects.announce_dirty = true;
+                self.player_changed(service, playing, now);
                 None
             }
             Input::Audio(graph) => {
-                self.route_owned_playback(&graph, now);
-                self.follow_graph(&graph, now);
+                self.observe_audio_graph(&graph, now);
                 None
             }
         }
@@ -675,36 +573,10 @@ impl Daemon {
         }
     }
 
-    fn control_ready(&mut self, generation: Generation, now: Clock) {
-        if !self.mark_control_ready(generation) {
-            return;
+    pub(crate) fn begin_setup(&mut self, generation: Generation, now: Clock) {
+        if let Some(hello) = self.connection.begin_setup(generation, now.mono) {
+            self.effects.control_out.push((generation, hello.to_vec()));
         }
-
-        if let Some(peer) = self.peers_seated.first().copied() {
-            self.note_alongside(peer, now.unix);
-        }
-        self.link_ready_at = Some(now.mono);
-        self.output.extend_takeover(now.mono);
-        self.claim_rejoin(now);
-        // A play waiting for this link asked before anything the pods
-        // reported during setup, so those reports cannot override it.
-        if self.output.wants_output() {
-            self.seat.note_claim(self.accessory.ownership.at());
-        }
-        if self.request_playback_ownership(now) {
-            self.setup_claim_at = Some(now.mono);
-        }
-        self.flush_settings();
-        self.effects.announce_dirty = true;
-    }
-
-    fn begin_setup(&mut self, generation: Generation, now: Clock) {
-        if !self.connection.ensure_handshake(generation, now.mono) {
-            return;
-        }
-        let hello = self.accessory_setup.start().to_vec();
-        self.connection.advance(crate::pods::link::OpenStep::Handshake, generation, now.mono);
-        self.effects.control_out.push((generation, hello));
     }
 
     fn feed_accessory(&mut self, packet: &[u8], generation: Generation, now: Clock) {
@@ -716,9 +588,8 @@ impl Daemon {
         // relay, the priority acknowledgement, the peer-reconnect, and
         // the setup report, and states each as a typed observation.
         let (follow, observations) =
-            crate::pods::observe::translate(&mut self.accessory_setup, packet, self.local_address);
+            self.connection.observe(packet, generation, self.local_address, now.mono);
         if let Some(follow) = follow {
-            self.connection.advance(follow.step(), generation, now.mono);
             self.effects.control_out.push((generation, follow.bytes().to_vec()));
             if follow == setup::FollowUp::Notifications {
                 self.effects.control_out.push((generation, setup::request_keys().to_vec()));
@@ -796,88 +667,6 @@ impl Daemon {
         }
     }
 
-    fn observe_ownership(&mut self, local: bool, now: Clock) {
-        eprintln!(
-            "fleetpodsd: media event source=airpods ownership_local={local} mono_ms={}",
-            now.mono.0
-        );
-        self.note_ownership(local, now.mono);
-        if local {
-            self.setup_claim_at = None;
-            self.yield_pending = false;
-        }
-        if !local {
-            // The pods end this laptop's A2DP stream, which can leave its
-            // audio node failed. The next grant relinks unless the sink runs.
-            self.rearm_after_loss = true;
-            self.yield_to_remote_report(now);
-        }
-        self.effects.announce_dirty = true;
-    }
-
-    fn observe_source(&mut self, local: bool, kind: u8, remote: Option<Address>, now: Clock) {
-        eprintln!("fleetpodsd: media event source=airpods audio_local={local} kind={kind} remote={remote:?} mono_ms={}", now.mono.0);
-        self.note_source(local, kind, now.mono);
-        if local && kind > 0 {
-            // Audio already reaches the pods from here; nothing to relink.
-            self.resume_output_on_grant = false;
-            self.rearm_after_loss = false;
-        }
-        if let Some(address) = remote {
-            self.note_remote(address, now.mono);
-        }
-        if !local && kind > 0 {
-            self.yield_to_remote_report(now);
-        }
-        self.effects.announce_dirty = true;
-    }
-
-    fn yield_to_remote_report(&mut self, now: Clock) {
-        // Setup reports describe the seat before acquisition. Once the link is
-        // ready, losing ownership or seeing a remote source ends our claim.
-        // An explicit user switch inside its window is not reversed.
-        if self.seat.user_intent_fresh(now.mono) {
-            eprintln!("fleetpodsd: holding the seat for an explicit user switch");
-            return;
-        }
-        if self
-            .setup_claim_at
-            .is_some_and(|at| now.mono.saturating_since(at) < SETUP_CLAIM_SETTLE_MS)
-        {
-            eprintln!("fleetpodsd: ignoring a remote report that predates this laptop's claim");
-            return;
-        }
-        if self.output.wants_output()
-            && self.claim_sent_at.is_some_and(|at| now.mono.saturating_since(at) < CLAIM_ANSWER_MS)
-        {
-            if !self.yield_pending {
-                eprintln!("fleetpodsd: waiting for the pods to answer this laptop's claim");
-            }
-            self.yield_pending = true;
-            return;
-        }
-        if self.connection.stage() == Stage::Ready && self.output.wants_output() {
-            eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
-            self.step_back(now);
-            self.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
-        }
-    }
-
-    fn link_failed(&mut self, generation: Generation, busy: bool, now: Clock) {
-        if generation != self.connection.generation() {
-            return;
-        }
-        if self.connection.apple_reconnect_releasing() {
-            self.connection.note_socket(false, generation);
-            return;
-        }
-        if !busy && !self.output.holding_takeover() {
-            self.output.fail_acquisition();
-        }
-        let reason = if busy { FailReason::Busy } else { FailReason::Transport };
-        self.note_setup_failed(generation, reason, now.mono);
-    }
-
     fn note_battery(&mut self, slot: PodSlot, level: u8, charging: bool, now: MonoMs) {
         let Some(battery) = Battery::new(level, charging) else {
             return;
@@ -923,25 +712,10 @@ impl Daemon {
         self.observe_nearby(host_id(Some(from)), from, name, now.unix, false, None);
     }
 
-    fn harvest(&mut self, now: Clock) -> Vec<Effect> {
-        self.advance_rejoin(now);
-        self.advance_transport_retry(now.mono);
-        self.reconnect_preferred(now);
-        // A remote report that arrived just after our claim and was never
-        // answered by a grant ends the claim now.
-        if self.yield_pending
-            && self.claim_sent_at.is_none_or(|at| now.mono.saturating_since(at) >= CLAIM_ANSWER_MS)
-        {
-            self.yield_pending = false;
-            if self.accessory.ownership.as_fresh() != Some(&true) {
-                self.yield_to_remote_report(now);
-            }
-        }
+    /// Fleet/radio and persistence work. Session advancement determines when
+    /// this runs relative to local playback and final state publication.
+    pub(crate) fn collect_background_effects(&mut self, now: Clock) -> Vec<Effect> {
         let mut effects = Vec::new();
-        self.introduce_peers();
-        self.claim_idle_on_activity(now);
-        self.tick_ears(now.mono);
-        self.follow_insertion(now);
         if let Some(labels) = self.take_apple_names() {
             effects.push(Effect::StoreDevices(labels));
         }
@@ -1034,9 +808,6 @@ impl Daemon {
         if let Some(bytes) = self.take_roster_watermark() {
             effects.push(Effect::StoreWatermark(bytes));
         }
-        if let Some(generation) = self.take_open_link(now.mono) {
-            effects.push(Effect::OpenLink { generation });
-        }
         if self.effects.follow_link {
             self.effects.follow_link = false;
             effects.push(Effect::FollowLink);
@@ -1056,163 +827,6 @@ impl Daemon {
         for (name, bytes) in std::mem::take(&mut self.effects.secret_out) {
             effects.push(Effect::WriteSecret { name, bytes });
         }
-        let players = std::mem::take(&mut self.effects.pause_players);
-        if !players.is_empty() {
-            // Pausing is the daemon's own decision; do not undo it.
-            self.resume_players.clear();
-            effects.push(Effect::PausePlayers(players));
-        }
-        if let Some(until) = self.release_output_until {
-            if self.output.wants_output() || !self.transport_active || now.mono.0 >= until.0 {
-                self.release_output_until = None;
-            } else if let Some(idle) = self.output_health.outputs.iter().find(|output| {
-                output.address.is_some() && output.address == accessory && output.state != 0
-            }) {
-                // Paused players have left the output. PipeWire would keep
-                // streaming silence to the pods for another second or so.
-                eprintln!("fleetpodsd: releasing the idle AirPods output for the new owner");
-                effects.push(Effect::SuspendOutput { name: idle.name.clone() });
-                self.release_output_until = None;
-            }
-        }
-        if self.effects.drop_link {
-            self.effects.drop_link = false;
-            if let Some(accessory) = accessory {
-                effects.push(Effect::Disconnect { accessory });
-            }
-        }
-        if let Some(accessory) = self.effects.remove_device.take() {
-            effects.push(Effect::RemoveDevice { accessory });
-        }
-        if let Some(effect) = self.pace_microphone() {
-            effects.push(effect);
-        }
-        effects.extend(self.pace_audio());
-        // Ownership loss can damage an existing audio node, not one that has
-        // yet to be created. Opening reports can still name the previous owner.
-        // Do not carry their recovery flags forward onto a fresh output.
-        let has_output = self.config.accessory.is_some_and(|address| {
-            self.last_graph
-                .as_ref()
-                .is_some_and(|graph| graph.sinks.iter().any(|sink| sink.address == Some(address)))
-        });
-        if !has_output {
-            self.rearm_after_loss = false;
-            self.resume_output_on_grant = false;
-        }
-        let granted = self.output.wants_output()
-            && self.connection.stage() == Stage::Ready
-            && self.accessory.ownership.as_fresh() == Some(&true);
-        if !granted {
-            self.force_rearm = false;
-        }
-        if self.rearm_verify_at.is_some_and(|at| now.mono.0 >= at.0) {
-            self.rearm_verify_at = None;
-            if granted
-                && !self.transport_active
-                && self.audio.local_playing()
-                && self.rearm_retries < REARM_RETRY_LIMIT
-            {
-                // Pulse can report the sink running while its node failed.
-                self.rearm_retries += 1;
-                self.force_rearm = true;
-                eprintln!("fleetpodsd: AirPods output did not start; re-arming again");
-            }
-        }
-        if granted
-            && !self.force_rearm
-            && (self.rearm_after_loss || self.resume_output_on_grant)
-            && self.transport_active
-        {
-            // Audio already streams to the pods; there is nothing to relink.
-            // Rebuilding now would cut it. Pulse's sink state is not used:
-            // it reads running even while the node has failed.
-            self.rearm_after_loss = false;
-            self.resume_output_on_grant = false;
-            self.replan(now);
-        }
-        if granted && (self.resume_output_on_grant || self.rearm_after_loss || self.force_rearm) {
-            if let (Some(address), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
-            {
-                let id = self.output_restart_serial + 1;
-                if self.output.begin_recovery(id, address, graph, now.mono) {
-                    // Stop the media clock while its output is unavailable.
-                    // This pause retains the playback claim, unlike yielding.
-                    let players = self.audio.playing_players();
-                    for player in &players {
-                        if !self.resume_players.contains(player) {
-                            self.resume_players.push(player.clone());
-                        }
-                    }
-                    if !players.is_empty() {
-                        effects.push(Effect::PausePlayers(players));
-                    }
-                    self.output_restart_serial = id;
-                    self.resume_output_on_grant = false;
-                    self.rearm_after_loss = false;
-                    if !std::mem::take(&mut self.force_rearm) {
-                        self.rearm_retries = 0;
-                    }
-                    self.replan(now);
-                    eprintln!("fleetpodsd: re-arming AirPods playback after ownership grant");
-                }
-            }
-        }
-        if let Some(effect) = self.pace_output_health(now) {
-            effects.push(effect);
-        }
-        if self.effects.announce_dirty {
-            self.effects.announce_dirty = false;
-            if let Some(address) = self.local_address {
-                let seated = self.connection.stage() == Stage::Ready;
-                let roster = self.audio_roster(now);
-                effects.push(Effect::Announce(postcard::encode_announce(
-                    address,
-                    &self.local_name,
-                    seated,
-                    roster.as_ref(),
-                )));
-            }
-        }
-        // The Router ordered this work; translate it in one place. A quiet
-        // still leads the whole step, before any control write.
-        for work in self.output.take_work(now.mono, self.audio.local_playing()) {
-            match work {
-                crate::audio::route::Work::Restore(streams) => {
-                    effects.push(Effect::Restore(streams));
-                }
-                crate::audio::route::Work::Quiet(streams) => {
-                    effects.insert(0, Effect::MuteStreams(streams));
-                }
-                crate::audio::route::Work::Restart(restart) => {
-                    if let Some(accessory) = accessory {
-                        effects.push(Effect::RestartOutput {
-                            id: restart.id,
-                            name: restart.name,
-                            accessory,
-                            card: self.playback_card(),
-                        });
-                    }
-                }
-                crate::audio::route::Work::Start(start) => {
-                    effects.push(Effect::StartOutput { id: start.id, name: start.name });
-                }
-                crate::audio::route::Work::SetDefault(name) => {
-                    effects.push(Effect::SetDefaultSink { name });
-                }
-                crate::audio::route::Work::Move(moves) => {
-                    effects.push(Effect::MoveStreams(moves));
-                }
-            }
-        }
-        if !self.output.wants_output() {
-            self.resume_players.clear();
-            self.resumed_players.clear();
-        } else if !self.resume_players.is_empty() && !self.output.recovering() {
-            let players = std::mem::take(&mut self.resume_players);
-            self.resumed_players.clone_from(&players);
-            effects.push(Effect::ResumePlayers(players));
-        }
         effects
     }
 
@@ -1223,55 +837,6 @@ impl Daemon {
         }
         self.listening = want;
         Some(if want { Effect::Listen } else { Effect::StopListen })
-    }
-
-    pub(crate) fn replan(&mut self, now: Clock) {
-        let Some(graph) = self.last_graph.clone() else {
-            return;
-        };
-        if self.output.needs_graph() {
-            self.follow_graph(&graph, now);
-        }
-    }
-
-    fn follow_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
-        self.last_graph = Some(graph.clone());
-        let waiting_for_grant = self.resume_output_on_grant
-            && self.output.wants_output()
-            && self.connection.stage() == Stage::Ready;
-        let outcome =
-            self.output.on_graph(self.config.accessory, graph, waiting_for_grant, now.mono);
-        if let Some(failure) = outcome.failure {
-            self.resume_output_on_grant = false;
-            self.seat_audio_failure(failure, now);
-        }
-        self.audio.set_routed(outcome.routed);
-    }
-
-    fn take_open_link(&mut self, now: MonoMs) -> Option<Generation> {
-        if (!self.preferred_connection_allowed() && !self.connection.apple_reconnect())
-            || self.pairing_elsewhere(now)
-            || !self.connection.may_open(now)
-        {
-            return None;
-        }
-        let generation = self.connection.generation();
-        if self.link_asked == Some(generation) {
-            return None;
-        }
-        if !self.background_requested {
-            if let Some(peer) = self.peers_seated.first().copied() {
-                self.request_route(peer);
-            }
-        }
-        self.link_asked = Some(generation);
-        eprintln!(
-            "fleetpodsd: opening control generation={} attempt={} background={}",
-            generation.0,
-            self.connection.retry().0,
-            self.background_requested
-        );
-        Some(generation)
     }
 
     fn commit_keyring(&mut self) {
