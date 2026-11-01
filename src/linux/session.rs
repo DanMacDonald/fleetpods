@@ -584,7 +584,11 @@ enum CallKind {
         address: Address,
         generation: Generation,
     },
-    Profile,
+    Profile {
+        address: Address,
+        generation: Generation,
+    },
+    Handsfree,
     Advertise,
     Unadvertise,
     Remove,
@@ -795,6 +799,19 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
             eprintln!("fleetpodsd: discarded readiness for a replaced control socket");
         }
         service_controller_reset(&bus, &reports, &mut live);
+        if let Some(path) = take_handsfree(&mut live) {
+            eprintln!("fleetpodsd: connecting hands-free after A2DP and service discovery");
+            if let Err(err) = enqueue(
+                &bus,
+                &mut live,
+                &path,
+                "ConnectProfile",
+                Some(bluez::HANDSFREE),
+                CallKind::Handsfree,
+            ) {
+                eprintln!("fleetpodsd: hands-free setup skipped: {err}");
+            }
+        }
         if live.air.want_scan {
             verify_scan(&bus, &mut live);
             ensure_scan(&bus, &mut live);
@@ -827,6 +844,8 @@ struct Live {
     /// `BluezBack` waits until the post-restart power cycle finishes, so the
     /// daemon does not reconnect into a controller that is about to go down.
     bluez_back_pending: bool,
+    /// One best-effort companion profile after a successful local A2DP request.
+    handsfree_after: Option<(Address, Generation)>,
     // Link state is split on purpose across the thread seam: this
     // watcher owns the D-Bus connection and the socket fds, while the
     // daemon owns link stage and policy. The generation originates in
@@ -857,9 +876,42 @@ impl Default for Live {
             defer_attach: false,
             restoring_bluez: false,
             bluez_back_pending: false,
+            handsfree_after: None,
             air: Air::default(),
         }
     }
+}
+
+/// PipeWire waits for missing profiles before exposing A2DP. Finish HFP once
+/// A2DP succeeds and BlueZ finishes discovery; earlier calls return busy.
+/// This is optional signaling setup, never a microphone/profile selection.
+fn take_handsfree(live: &mut Live) -> Option<String> {
+    let (address, generation) = live.handsfree_after?;
+    if generation != live.generation
+        || live.accessory != Some(address)
+        || live.held != Some(address)
+        || live.connected != Some(true)
+        || live.air.reset_blocks_scan()
+    {
+        live.handsfree_after = None;
+        return None;
+    }
+    let device = live.devices.iter().find(|d| d.address == address && d.connected)?;
+    if !device.services_resolved
+        || live.calls.iter().any(|call| {
+            matches!(
+                call.kind,
+                CallKind::Profile { .. }
+                    | CallKind::RestartDisconnect { .. }
+                    | CallKind::RestartConnect { .. }
+                    | CallKind::Handsfree
+            )
+        })
+    {
+        return None;
+    }
+    live.handsfree_after = None;
+    device.handsfree.then(|| device.path.clone())
 }
 
 /// How often a scan believed to be running is confirmed with BlueZ.
@@ -1091,7 +1143,7 @@ fn handle_job(
             if live.calls.iter().any(|call| {
                 matches!(
                     call.kind,
-                    CallKind::Profile
+                    CallKind::Profile { .. }
                         | CallKind::RestartDisconnect { .. }
                         | CallKind::RestartConnect { .. }
                 )
@@ -1106,7 +1158,7 @@ fn handle_job(
                         &path,
                         "ConnectProfile",
                         Some(bluez::A2DP_SINK),
-                        CallKind::Profile,
+                        CallKind::Profile { address, generation: live.generation },
                     ) {
                         eprintln!("fleetpodsd: A2DP connect on {address} failed: {err}");
                     }
@@ -1315,9 +1367,12 @@ fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
             eprintln!("fleetpodsd: adapter power set timed out");
             settle_controller_reset(reports, live, up, false);
         }
-        if matches!(call.kind, CallKind::Profile) {
+        if matches!(call.kind, CallKind::Profile { .. }) {
             eprintln!("fleetpodsd: AirPods audio profile request went unanswered");
             let _ = reports.send(Input::TransportReply(TransportReply::TimedOut));
+        }
+        if matches!(call.kind, CallKind::Handsfree) {
+            eprintln!("fleetpodsd: optional hands-free setup timed out");
         }
         if let CallKind::RestartDisconnect { id, .. } | CallKind::RestartConnect { id } = call.kind
         {
@@ -1410,6 +1465,12 @@ fn on_notice(
             };
             if let Some(connected) = patch.connected {
                 device.connected = connected;
+                if !connected {
+                    device.services_resolved = false;
+                }
+            }
+            if let Some(resolved) = patch.services_resolved {
+                device.services_resolved = resolved;
             }
             if let Some(paired) = patch.paired {
                 device.paired = paired;
@@ -1424,6 +1485,8 @@ fn on_notice(
                 device.name = name;
             }
             if let Some(uuids) = patch.uuids {
+                device.handsfree =
+                    uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(bluez::HANDSFREE));
                 device.control =
                     uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(bluez::CONTROL_SERVICE));
             }
@@ -1574,7 +1637,13 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 eprintln!("fleetpodsd: bluetooth disconnect failed: {err}");
             }
         }
-        CallKind::Profile => {
+        CallKind::Profile { address, generation } => {
+            if matches!(result, CallResult::Done)
+                && generation == live.generation
+                && live.held == Some(address)
+            {
+                live.handsfree_after = Some((address, generation));
+            }
             eprintln!(
                 "fleetpodsd: AirPods audio profile reply after {} ms: {}",
                 call.sent.elapsed().as_millis(),
@@ -1594,6 +1663,16 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 _ => TransportReply::Connected,
             };
             let _ = reports.send(Input::TransportReply(reply));
+        }
+        CallKind::Handsfree => {
+            eprintln!(
+                "fleetpodsd: hands-free profile reply after {} ms: {}",
+                call.sent.elapsed().as_millis(),
+                match result {
+                    CallResult::Done => "connected".to_string(),
+                    CallResult::Failed { name, message } => format!("{name}: {message}"),
+                }
+            );
         }
         CallKind::Remove => {
             if let Some(err) = failed {
@@ -1910,6 +1989,9 @@ fn observe_pairing(bus: &Bus, live: &mut Live, payload: Option<&[u8]>) {
 }
 
 fn note_connected(live: &mut Live, reports: &Sender<Input>, up: bool) {
+    if !up {
+        live.handsfree_after = None;
+    }
     if live.connected == Some(up) {
         return;
     }
@@ -1974,6 +2056,7 @@ fn report_sleep(reports: &Sender<Input>, live: &mut Live, sleeping: bool) {
 }
 
 fn close_control(live: &mut Live, reports: &Sender<Input>) {
+    live.handsfree_after = None;
     let open = live.link.fd().is_some();
     if open {
         eprintln!("fleetpodsd: locally closing control generation={}", live.generation.0);
@@ -1987,6 +2070,7 @@ fn close_control(live: &mut Live, reports: &Sender<Input>) {
 }
 
 fn drop_socket(live: &mut Live, reports: &Sender<Input>) {
+    live.handsfree_after = None;
     // A lost seat waits for an explicit Open/Follow job. BlueZ property updates
     // must not silently attach again and displace another host.
     live.defer_attach = true;
@@ -2972,6 +3056,82 @@ mod advertisement_tests {
     }
 
     #[test]
+    fn handsfree_waits_for_both_audio_success_and_discovery_and_only_runs_once() {
+        for resolved_first in [false, true] {
+            let mut live = handsfree_trial();
+            let address = live.accessory.unwrap();
+            live.devices[0].services_resolved = resolved_first;
+            assert!(take_handsfree(&mut live).is_none(), "no request from discovery alone");
+            live.handsfree_after = Some((address, live.generation));
+            if !resolved_first {
+                assert!(take_handsfree(&mut live).is_none(), "discovery still owns BlueZ");
+                assert!(live.handsfree_after.is_some());
+                live.devices[0].services_resolved = true;
+            }
+            let path = live.devices[0].path.clone();
+            assert_eq!(take_handsfree(&mut live), Some(path));
+            assert!(take_handsfree(&mut live).is_none(), "no companion retry loop");
+        }
+    }
+
+    fn handsfree_trial() -> Live {
+        let address = Address::parse("CC:22:FE:54:DF:C7").unwrap();
+        Live {
+            accessory: Some(address),
+            held: Some(address),
+            connected: Some(true),
+            devices: vec![Device {
+                path: "/org/bluez/hci0/dev_CC_22_FE_54_DF_C7".into(),
+                adapter_path: "/org/bluez/hci0".into(),
+                adapter: None,
+                address,
+                name: "AirPods".into(),
+                rssi: None,
+                paired: true,
+                bonded: true,
+                connected: true,
+                services_resolved: true,
+                handsfree: true,
+                control: true,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn handsfree_does_not_follow_a_replaced_or_released_connection() {
+        for case in ["generation", "accessory", "disconnected", "released", "unsupported"] {
+            let mut live = handsfree_trial();
+            live.handsfree_after = Some((live.accessory.unwrap(), live.generation));
+            match case {
+                "generation" => live.generation.0 += 1,
+                "accessory" => live.accessory = None,
+                "disconnected" => live.connected = Some(false),
+                "released" => live.held = None,
+                "unsupported" => live.devices[0].handsfree = false,
+                _ => unreachable!(),
+            }
+            assert!(take_handsfree(&mut live).is_none(), "{case}");
+            assert!(live.handsfree_after.is_none(), "{case}");
+        }
+    }
+
+    #[test]
+    fn handsfree_waits_for_an_existing_profile_operation() {
+        let mut live = handsfree_trial();
+        live.handsfree_after = Some((live.accessory.unwrap(), live.generation));
+        live.calls.push(PendingCall {
+            serial: 1,
+            kind: CallKind::RestartConnect { id: 1 },
+            sent: Instant::now(),
+        });
+        assert!(take_handsfree(&mut live).is_none());
+        assert!(live.handsfree_after.is_some());
+        live.calls.clear();
+        assert!(take_handsfree(&mut live).is_some());
+    }
+
+    #[test]
     fn removing_bluetooth_pairing_is_distinct_from_an_ordinary_disconnect() {
         for removed in [false, true] {
             let address = Address::parse("CC:22:FE:54:DF:C7").unwrap();
@@ -2988,6 +3148,8 @@ mod advertisement_tests {
                 paired: true,
                 bonded: false,
                 connected: true,
+                services_resolved: false,
+                handsfree: false,
                 control: true,
             });
             let (tx, rx) = mpsc::channel();
@@ -3056,6 +3218,8 @@ mod advertisement_tests {
             paired: true,
             bonded: true,
             connected: true,
+            services_resolved: false,
+            handsfree: false,
             control: true,
         });
         let (tx, rx) = mpsc::channel();
@@ -3119,6 +3283,8 @@ mod advertisement_tests {
                 paired: true,
                 bonded: true,
                 connected: false,
+                services_resolved: false,
+                handsfree: false,
                 control: true,
             };
             let mut live = Live::default();
@@ -3243,6 +3409,8 @@ mod advertisement_tests {
             paired: true,
             bonded: false,
             connected: true,
+            services_resolved: false,
+            handsfree: false,
             control: true,
         });
         let (tx, rx) = std::sync::mpsc::channel();

@@ -189,3 +189,33 @@ the grant. The existing one-rejoin limit still applies. Repeat the case-to-ear
 sequence with the iPhone reconnecting after XPS and verify that recovery sends
 the claim and playback continues without another manual Play. Passing the
 simulated sequence does not establish a successful hardware retest.
+
+## Completing hands-free setup before the profile wait expires
+
+Two temporary XPS trials on 2026-11-01 tested a companion HFP request without
+changing playback codec or microphone selection. Requesting HFP immediately
+after A2DP returned at 10:09:37.923 failed with `br-connection-busy` because
+service discovery was still running. That cycle took 9.82 seconds from the
+control connection attempt to active audio.
+
+Waiting for both A2DP success and `ServicesResolved=true` worked: discovery
+finished at 10:10:59.058, HFP replied at 59.286, both profiles were ready at
+59.530, and the output appeared at 59.555. PipeWire stopped its profile timer
+without waiting for expiry. Active audio followed at 10:11:01.090, 7.77 seconds
+after the connection attempt. The user reported faster playback. Total times
+also include variable Bluetooth negotiation; this is one successful trial,
+not a guaranteed two-second improvement on every connection.
+
+FleetPods now requests HFP once after a successful local A2DP request and
+completed discovery, when the accessory advertises HFP support. The request
+belongs to the current connection generation and is discarded on control release or
+disconnection. Failure is optional and does not fail A2DP or create a retry loop.
+Repeat case insertion and verify the hands-free request follows discovery,
+the playback profile remains A2DP, and the profile wait finishes early.
+
+The same investigation caught a separate pause at 10:09:23.417: after the
+ear-removal pause, the user resumed Brave on the speakers with both pods
+docked. Losing the remaining control link paused Brave again. A link that
+has already released audio now closes without handing off speaker playback.
+The regression test verifies no extra pause/mute and preserves the deferred
+claim for the next insertion. Ear-removal pause behavior is unchanged.

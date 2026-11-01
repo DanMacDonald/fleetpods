@@ -447,6 +447,9 @@ impl Daemon {
                     return None;
                 }
                 let was_ready = self.connection.stage() == Stage::Ready;
+                // A control link can outlive our return to the speakers.
+                // Losing that link must not pause or cancel the speaker play.
+                let released_audio = !self.output.wants_output() && self.audio.yielded();
                 let evicted = !up && was_ready && self.evicted_while_playing(now);
                 self.note_socket(up, generation, now.mono);
                 if up {
@@ -454,6 +457,7 @@ impl Daemon {
                 } else {
                     self.accessory_setup = setup::Setup::new();
                     if was_ready
+                        && !released_audio
                         && !self.routing.phase().busy()
                         && !self.connection.apple_reconnect()
                     {

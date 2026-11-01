@@ -26,6 +26,7 @@ pub const CONTROL_SERVICE: &str = "74ec2172-0bad-4d01-8f77-997b2be0722a";
 
 /// A2DP sink transport. The codec is a card profile, not a different UUID.
 pub const A2DP_SINK: &str = "0000110b-0000-1000-8000-00805f9b34fb";
+pub const HANDSFREE: &str = "0000111e-0000-1000-8000-00805f9b34fb";
 
 /// L2CAP PSM for that service.
 pub const CONTROL_PSM: u16 = 0x1001;
@@ -41,6 +42,8 @@ pub struct Device {
     pub paired: bool,
     pub bonded: bool,
     pub connected: bool,
+    pub services_resolved: bool,
+    pub handsfree: bool,
     pub control: bool,
 }
 
@@ -287,6 +290,7 @@ pub enum CallResult {
 pub struct Patch {
     pub path: String,
     pub connected: Option<bool>,
+    pub services_resolved: Option<bool>,
     pub paired: Option<bool>,
     pub bonded: Option<bool>,
     pub name: Option<String>,
@@ -359,6 +363,8 @@ pub fn device_from(
         paired: prop_bool(props, "Paired"),
         bonded: prop_bool(props, "Bonded"),
         connected: prop_bool(props, "Connected"),
+        services_resolved: prop_bool(props, "ServicesResolved"),
+        handsfree: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(HANDSFREE)),
         control: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(CONTROL_SERVICE)),
     })
 }
@@ -408,6 +414,7 @@ fn properties(message: &Message) -> Option<Notice> {
     Some(Notice::Patch(Patch {
         path,
         connected: flag(&changed, "Connected"),
+        services_resolved: flag(&changed, "ServicesResolved"),
         paired: flag(&changed, "Paired"),
         bonded: flag(&changed, "Bonded"),
         name: prop_string(&changed, "Name"),
@@ -615,6 +622,8 @@ fn devices_from(objects: &Objects) -> Vec<Device> {
             paired: prop_bool(props, "Paired"),
             bonded: prop_bool(props, "Bonded"),
             connected: prop_bool(props, "Connected"),
+            services_resolved: prop_bool(props, "ServicesResolved"),
+            handsfree: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(HANDSFREE)),
             control: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(CONTROL_SERVICE)),
         });
     }
@@ -680,6 +689,8 @@ mod tests {
             paired,
             bonded: false,
             connected,
+            services_resolved: false,
+            handsfree: false,
             control,
         }
     }

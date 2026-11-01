@@ -8299,6 +8299,44 @@ mod tests {
     }
 
     #[test]
+    fn disconnecting_docked_pods_does_not_pause_playback_resumed_on_speakers() {
+        use crate::step::{Effect, Input};
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let brave = "org.mpris.MediaPlayer2.brave";
+        ready_link(&mut daemon, now);
+        daemon.audio.startup_players(&[]);
+        for right in [false, true] {
+            daemon.note_pod(
+                right,
+                Pod {
+                    battery: Battery::new(80, true).unwrap(),
+                    in_ear: Some(false),
+                    in_case: Some(true),
+                },
+                now.mono,
+            );
+        }
+        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, at(1_000));
+        assert!(daemon.audio.local_playing());
+        assert!(!daemon.output.wants_output());
+        assert!(daemon.deferred_playback_claim.is_some());
+        let generation = daemon.connection.generation();
+        let mut effects =
+            daemon.step(Input::ControlSocket { up: false, generation }, at(7_000)).effects;
+        effects.extend(daemon.step(Input::Bluez(false), at(7_000)).effects);
+        effects.extend(daemon.step(Input::Lid { open: false }, at(7_100)).effects);
+        effects.extend(daemon.step(Input::Tick, at(8_000)).effects);
+        assert!(
+            effects.iter().all(|e| !matches!(e, Effect::PausePlayers(_) | Effect::MuteStreams(_))),
+            "{effects:?}"
+        );
+        assert!(daemon.audio.local_playing());
+        assert!(daemon.deferred_playback_claim.is_some(), "insertion can still claim this play");
+    }
+
+    #[test]
     fn a_play_with_both_pods_docked_in_an_open_case_goes_to_the_speakers() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::step::{Effect, Input};
