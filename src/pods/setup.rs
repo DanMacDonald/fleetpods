@@ -3,7 +3,12 @@
 //! The socket is asked for a handshake, then features, then notifications.
 //! Readiness is battery plus ear placement. Unknown packets are ignored.
 
-use crate::types::{Address, NoiseMode};
+use super::observe::Observation;
+use crate::types::{Address, MonoMs, NoiseMode};
+
+pub const SETUP_BUDGET_MS: u64 = 25_000;
+pub const HANDSHAKE_WAIT_MS: u64 = 2_000;
+pub const NOTIFY_WAIT_MS: u64 = 22_000;
 
 const HANDSHAKE: &[u8] = &[
     0x00, 0x00, 0x04, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -32,13 +37,6 @@ impl FollowUp {
         match self {
             Self::Features => FEATURES,
             Self::Notifications => NOTIFICATIONS,
-        }
-    }
-
-    pub fn step(self) -> crate::pods::link::OpenStep {
-        match self {
-            Self::Features => crate::pods::link::OpenStep::Features,
-            Self::Notifications => crate::pods::link::OpenStep::Notifications,
         }
     }
 }
@@ -180,6 +178,7 @@ const SOURCE: &[u8] = &[0x04, 0x00, 0x04, 0x00, 0x0e, 0x00];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
+    Connecting,
     Handshake,
     Features,
     Notifications,
@@ -200,40 +199,6 @@ pub enum Place {
     InCase,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    BudReport {
-        bud: Bud,
-        level: u8,
-        charging: bool,
-        place: Option<Place>,
-    },
-    Case {
-        level: u8,
-        charging: bool,
-    },
-    Ownership(bool),
-    Source {
-        address: Address,
-        kind: u8,
-    },
-    Noise(NoiseMode),
-    Identity {
-        name: String,
-        model: String,
-    },
-    Keys {
-        irk: [u8; 16],
-        encryption: [u8; 16],
-    },
-    /// Who the pods say is connected. This replaces a held fleet roster.
-    PodPeers {
-        peers: Vec<Address>,
-        owner: Option<Address>,
-    },
-    Ready,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Half {
     bud: Bud,
@@ -244,77 +209,121 @@ struct Half {
 
 pub struct Setup {
     phase: Phase,
+    deadline: Option<MonoMs>,
     primary: Option<Bud>,
     secondary: Option<Bud>,
     pending_ears: Option<(u8, u8)>,
     saw_battery: bool,
     saw_ears: bool,
     saw_roster: bool,
-    ready: bool,
     halves: [Option<Half>; 2],
 }
 
 impl Setup {
     pub fn new() -> Self {
         Self {
-            phase: Phase::Handshake,
+            phase: Phase::Connecting,
+            deadline: None,
             primary: None,
             secondary: None,
             pending_ears: None,
             saw_battery: false,
             saw_ears: false,
             saw_roster: false,
-            ready: false,
             halves: [None, None],
         }
     }
 
-    pub fn start(&mut self) -> &'static [u8] {
+    pub fn stage(&self) -> super::link::Stage {
+        use super::link::Stage;
+        match self.phase {
+            Phase::Connecting => Stage::Connecting,
+            Phase::Handshake => Stage::Handshake,
+            Phase::Features => Stage::Features,
+            Phase::Notifications => Stage::Notifications,
+            // Readiness is committed after the caller applies this packet's
+            // reports. Until then the notification budget still covers setup.
+            Phase::Live => Stage::Notifications,
+        }
+    }
+
+    pub fn deadline(&self) -> Option<MonoMs> {
+        self.deadline
+    }
+
+    fn enter(&mut self, phase: Phase, now: MonoMs) {
+        self.phase = phase;
+        self.deadline = match phase {
+            Phase::Connecting | Phase::Features => Some(now.saturating_add(SETUP_BUDGET_MS)),
+            Phase::Handshake => Some(now.saturating_add(HANDSHAKE_WAIT_MS)),
+            Phase::Notifications => Some(now.saturating_add(NOTIFY_WAIT_MS)),
+            Phase::Live => self.deadline,
+        };
+    }
+
+    pub fn connect(&mut self, not_before: MonoMs) {
         *self = Self::new();
+        self.enter(Phase::Connecting, not_before);
+    }
+
+    pub fn start(&mut self, now: MonoMs) -> &'static [u8] {
+        *self = Self::new();
+        self.enter(Phase::Handshake, now);
         HANDSHAKE
     }
 
     /// A setup reply advances the handshake. Anything else is a report, parsed
-    /// the same way before and after the link is ready.
-    pub fn observe(&mut self, packet: &[u8]) -> (Option<FollowUp>, Vec<Event>) {
-        if let Some(follow) = self.take_reply(packet) {
+    /// the same way before and after the link is ready. `setup_time` is absent
+    /// when no attempt may advance; reports still reach the caller.
+    pub fn observe(
+        &mut self,
+        packet: &[u8],
+        local: Option<Address>,
+        setup_time: Option<MonoMs>,
+    ) -> (Option<FollowUp>, Vec<Observation>) {
+        if let Some(follow) = setup_time.and_then(|now| self.take_reply(packet, now)) {
             return (Some(follow), Vec::new());
         }
         let mut events = Vec::new();
         if let Some(report) = parse_report(packet) {
-            self.note_report(report, &mut events);
+            self.note_report(report, local, &mut events);
         }
         // Pods playing for another computer report battery and who is
         // connected at once, but may hold ears until something changes. That
         // would stall a takeover here until the setup times out.
         if self.saw_battery
             && (self.saw_ears || self.saw_roster)
-            && !self.ready
-            && matches!(self.phase, Phase::Notifications | Phase::Live)
+            && self.phase == Phase::Notifications
         {
-            self.ready = true;
-            self.phase = Phase::Live;
-            events.push(Event::Ready);
+            if let Some(now) = setup_time {
+                self.enter(Phase::Live, now);
+                events.push(Observation::Ready);
+            }
         }
         (None, events)
     }
 
-    fn take_reply(&mut self, packet: &[u8]) -> Option<FollowUp> {
+    fn take_reply(&mut self, packet: &[u8], now: MonoMs) -> Option<FollowUp> {
         if packet.starts_with(HANDSHAKE_ACK)
             && self.phase == Phase::Handshake
             && (packet.len() < 6 || packet[4..6] == [0, 0])
         {
-            self.phase = Phase::Features;
+            self.enter(Phase::Features, now);
             return Some(FollowUp::Features);
         }
         if packet.starts_with(FEATURES_ACK) && self.phase == Phase::Features {
-            self.phase = Phase::Notifications;
+            self.enter(Phase::Notifications, now);
             return Some(FollowUp::Notifications);
         }
         None
     }
 
-    fn note_report(&mut self, report: Report, events: &mut Vec<Event>) {
+    fn note_report(
+        &mut self,
+        report: Report,
+        local: Option<Address>,
+        events: &mut Vec<Observation>,
+    ) {
         match report {
             Report::Battery(cells) => {
                 self.saw_battery = true;
@@ -335,23 +344,30 @@ impl Setup {
                 }
             }
             Report::Ears { primary, secondary } => self.apply_ears(primary, secondary, events),
-            Report::Ownership(local) => events.push(Event::Ownership(local)),
-            Report::Source { address, kind } => events.push(Event::Source { address, kind }),
-            Report::Noise(mode) => events.push(Event::Noise(mode)),
-            Report::Identity { name, model } => events.push(Event::Identity { name, model }),
-            Report::Keys { irk, encryption } => events.push(Event::Keys { irk, encryption }),
+            Report::Ownership(local) => events.push(Observation::Ownership(local)),
+            Report::Source { address, kind } => {
+                let mine = local == Some(address);
+                events.push(Observation::Source {
+                    local: mine,
+                    kind,
+                    remote: (!mine).then_some(address),
+                });
+            }
+            Report::Noise(mode) => events.push(Observation::Noise(mode)),
+            Report::Identity { name, model } => events.push(Observation::Identity { name, model }),
+            Report::Keys { irk, encryption } => events.push(Observation::Keys { irk, encryption }),
             Report::PodPeers { peers, owner } => {
                 if matches!(self.phase, Phase::Notifications | Phase::Live) {
                     self.saw_roster = true;
                 }
-                events.push(Event::PodPeers { peers, owner });
+                events.push(Observation::PodPeers { peers, owner });
             }
         }
     }
 
-    fn store(&mut self, cell: Cell, events: &mut Vec<Event>) {
+    fn store(&mut self, cell: Cell, events: &mut Vec<Observation>) {
         let Part::Bud(bud) = cell.part else {
-            events.push(Event::Case { level: cell.level, charging: cell.charging });
+            events.push(Observation::CaseBattery { level: cell.level, charging: cell.charging });
             return;
         };
         let place = self
@@ -366,10 +382,10 @@ impl Setup {
         } else if let Some(slot) = self.halves.iter_mut().find(|slot| slot.is_none()) {
             *slot = Some(half);
         }
-        events.push(Event::BudReport { bud, level: cell.level, charging: cell.charging, place });
+        events.push(Observation::Bud { bud, level: cell.level, charging: cell.charging, place });
     }
 
-    fn apply_ears(&mut self, primary: u8, secondary: u8, events: &mut Vec<Event>) {
+    fn apply_ears(&mut self, primary: u8, secondary: u8, events: &mut Vec<Observation>) {
         let (Some(primary_bud),) = (self.primary,) else {
             self.pending_ears = Some((primary, secondary));
             return;
@@ -406,7 +422,7 @@ impl Setup {
         }
     }
 
-    fn place(&mut self, bud: Bud, byte: u8, events: &mut Vec<Event>) {
+    fn place(&mut self, bud: Bud, byte: u8, events: &mut Vec<Observation>) {
         let place = place_of(byte);
         let slot = self.halves.iter_mut().find(|half| half.is_some_and(|half| half.bud == bud));
         let Some(slot) = slot else {
@@ -416,7 +432,7 @@ impl Setup {
             return;
         };
         half.place = place;
-        events.push(Event::BudReport { bud, level: half.level, charging: half.charging, place });
+        events.push(Observation::Bud { bud, level: half.level, charging: half.charging, place });
     }
 }
 
@@ -474,17 +490,17 @@ pub fn parse_report(packet: &[u8]) -> Option<Report> {
     if packet.len() == 11 && packet.starts_with(OWNERSHIP) && matches!(packet[7], 0 | 1) {
         return Some(Report::Ownership(packet[7] == 1));
     }
-    if let Some(Event::Source { address, kind }) = parse_source(packet) {
-        return Some(Report::Source { address, kind });
+    if let Some(report) = parse_source(packet) {
+        return Some(report);
     }
     if let Some(mode) = parse_noise(packet) {
         return Some(Report::Noise(mode));
     }
-    if let Some(Event::Identity { name, model }) = parse_metadata(packet) {
-        return Some(Report::Identity { name, model });
+    if let Some(report) = parse_metadata(packet) {
+        return Some(report);
     }
-    if let Some(Event::Keys { irk, encryption }) = parse_keys(packet) {
-        return Some(Report::Keys { irk, encryption });
+    if let Some(report) = parse_keys(packet) {
+        return Some(report);
     }
     if let Some((peers, owner)) = connected_roster(packet) {
         return Some(Report::PodPeers { peers, owner });
@@ -584,16 +600,16 @@ fn parse_battery(packet: &[u8]) -> Option<Vec<Cell>> {
     Some(cells)
 }
 
-fn parse_source(packet: &[u8]) -> Option<Event> {
+fn parse_source(packet: &[u8]) -> Option<Report> {
     if packet.len() != 13 || !packet.starts_with(SOURCE) || packet[12] > 2 {
         return None;
     }
     let raw = [packet[11], packet[10], packet[9], packet[8], packet[7], packet[6]];
     let address = Address::new(raw)?;
-    Some(Event::Source { address, kind: packet[12] })
+    Some(Report::Source { address, kind: packet[12] })
 }
 
-fn parse_metadata(packet: &[u8]) -> Option<Event> {
+fn parse_metadata(packet: &[u8]) -> Option<Report> {
     const HEADER: &[u8] = &[0x04, 0x00, 0x04, 0x00, 0x1d];
     if !packet.starts_with(HEADER) || packet.len() < HEADER.len() + 6 {
         return None;
@@ -602,7 +618,7 @@ fn parse_metadata(packet: &[u8]) -> Option<Event> {
     let name = c_string(packet, &mut pos)?;
     let model = c_string(packet, &mut pos)?;
     let _manufacturer = c_string(packet, &mut pos)?;
-    Some(Event::Identity { name, model })
+    Some(Report::Identity { name, model })
 }
 
 fn c_string(packet: &[u8], pos: &mut usize) -> Option<String> {
@@ -620,7 +636,7 @@ fn c_string(packet: &[u8], pos: &mut usize) -> Option<String> {
     Some(text)
 }
 
-fn parse_keys(packet: &[u8]) -> Option<Event> {
+fn parse_keys(packet: &[u8]) -> Option<Report> {
     const HEADER: &[u8] = &[0x04, 0x00, 0x04, 0x00, 0x31, 0x00, 0x02];
     if packet.len() < 47 || !packet.starts_with(HEADER) {
         return None;
@@ -649,7 +665,7 @@ fn parse_keys(packet: &[u8]) -> Option<Event> {
     index += 3;
     let mut encryption = [0u8; 16];
     encryption.copy_from_slice(&packet[index..index + 16]);
-    Some(Event::Keys { irk, encryption })
+    Some(Report::Keys { irk, encryption })
 }
 
 fn parse_noise(packet: &[u8]) -> Option<NoiseMode> {
@@ -697,23 +713,23 @@ mod tests {
         let ears = [4, 0, 4, 0, 6, 0, 2, 2];
         for ears_first in [false, true] {
             let mut setup = Setup::new();
-            setup.start();
-            setup.observe(&handshake_ack());
-            setup.observe(&features_ack());
+            setup.start(MonoMs(0));
+            setup.observe(&handshake_ack(), None, Some(MonoMs(0)));
+            setup.observe(&features_ack(), None, Some(MonoMs(0)));
             let (first, last): (&[u8], &[u8]) =
                 if ears_first { (&ears, &battery) } else { (&battery, &ears) };
-            assert!(!setup.observe(first).1.contains(&Event::Ready));
-            let events = setup.observe(last).1;
-            assert!(events.contains(&Event::Ready));
+            assert!(!setup.observe(first, None, Some(MonoMs(0))).1.contains(&Observation::Ready));
+            let events = setup.observe(last, None, Some(MonoMs(0))).1;
+            assert!(events.contains(&Observation::Ready));
             for (bud, level) in [(Bud::Right, 80), (Bud::Left, 79)] {
-                assert!(events.contains(&Event::BudReport {
+                assert!(events.contains(&Observation::Bud {
                     bud,
                     level,
                     charging: false,
                     place: Some(Place::InCase),
                 }));
             }
-            assert!(!setup.observe(&ears).1.contains(&Event::Ready));
+            assert!(!setup.observe(&ears, None, Some(MonoMs(0))).1.contains(&Observation::Ready));
             let mut malformed = battery;
             malformed[8] = 0;
             assert!(parse_report(&malformed).is_none());
@@ -727,90 +743,109 @@ mod tests {
         let roster = [0x04, 0x00, 0x04, 0x00, 0x2e, 0x00, 0x01, 0x02, 0x00];
         for subscribed in [true, false] {
             let mut setup = Setup::new();
-            setup.start();
-            setup.observe(&handshake_ack());
+            setup.start(MonoMs(0));
+            setup.observe(&handshake_ack(), None, Some(MonoMs(0)));
             if subscribed {
-                setup.observe(&features_ack());
+                setup.observe(&features_ack(), None, Some(MonoMs(0)));
             }
-            assert!(!setup.observe(&roster).1.contains(&Event::Ready));
-            let events = setup.observe(&sample_battery()).1;
-            assert_eq!(events.contains(&Event::Ready), subscribed, "only after subscribing");
-            assert!(!setup.observe(&sample_ears()).1.contains(&Event::Ready), "ready once");
+            assert!(!setup.observe(&roster, None, Some(MonoMs(0))).1.contains(&Observation::Ready));
+            let events = setup.observe(&sample_battery(), None, Some(MonoMs(0))).1;
+            assert_eq!(events.contains(&Observation::Ready), subscribed, "only after subscribing");
+            assert!(
+                !setup
+                    .observe(&sample_ears(), None, Some(MonoMs(0)))
+                    .1
+                    .contains(&Observation::Ready),
+                "ready once"
+            );
         }
     }
 
     #[test]
     fn an_ear_report_after_a_role_swap_does_not_move_both_pods() {
         let mut setup = Setup::new();
-        setup.start();
-        setup.observe(&handshake_ack());
-        setup.observe(&features_ack());
-        setup.observe(&sample_battery());
+        setup.start(MonoMs(0));
+        setup.observe(&handshake_ack(), None, Some(MonoMs(0)));
+        setup.observe(&features_ack(), None, Some(MonoMs(0)));
+        setup.observe(&sample_battery(), None, Some(MonoMs(0)));
         // Primary in an ear, secondary docked.
-        setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02]);
+        setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02], None, Some(MonoMs(0)));
         let placed = |setup: &Setup| {
             setup.halves.iter().flatten().map(|half| (half.bud, half.place)).collect::<Vec<_>>()
         };
         let before = placed(&setup);
         // The docked pod became primary: the same two places, listed the other way.
-        let events = setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x02, 0x00]).1;
+        let events = setup
+            .observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x02, 0x00], None, Some(MonoMs(0)))
+            .1;
         assert_eq!(placed(&setup), before, "neither pod moved");
         assert!(events.iter().all(|event| match event {
-            Event::BudReport { bud, place, .. } => before.contains(&(*bud, *place)),
+            Observation::Bud { bud, place, .. } => before.contains(&(*bud, *place)),
             _ => true,
         }));
         // A real single move under the new roles still lands on the right pod.
         let worn = before.iter().find(|(_, place)| *place == Some(Place::InEar)).unwrap().0;
-        setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x02, 0x01]);
+        setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x02, 0x01], None, Some(MonoMs(0)));
         assert!(placed(&setup).contains(&(worn, Some(Place::Out))), "the worn pod came out");
     }
 
     #[test]
     fn a_refused_handshake_does_not_start_feature_negotiation() {
         let mut setup = Setup::new();
-        setup.start();
-        assert_eq!(setup.observe(&[1, 0, 4, 0, 0x85, 0]), (None, vec![]));
-        assert_eq!(setup.observe(&[1, 0, 4, 0, 0, 0]).0, Some(FollowUp::Features));
+        setup.start(MonoMs(0));
+        assert_eq!(setup.observe(&[1, 0, 4, 0, 0x85, 0], None, Some(MonoMs(0))), (None, vec![]));
+        assert_eq!(
+            setup.observe(&[1, 0, 4, 0, 0, 0], None, Some(MonoMs(0))).0,
+            Some(FollowUp::Features)
+        );
     }
 
     #[test]
     fn setup_waits_for_battery_and_ears_before_ready() {
         let mut setup = Setup::new();
-        assert_eq!(setup.start(), HANDSHAKE);
-        let (next, events) = setup.observe(&handshake_ack());
+        assert_eq!(setup.start(MonoMs(0)), HANDSHAKE);
+        let (next, events) = setup.observe(&handshake_ack(), None, Some(MonoMs(0)));
         assert_eq!(next, Some(FollowUp::Features));
         assert!(events.is_empty());
-        let (next, _) = setup.observe(&features_ack());
+        let (next, _) = setup.observe(&features_ack(), None, Some(MonoMs(0)));
         assert_eq!(next, Some(FollowUp::Notifications));
-        let (_, events) = setup.observe(&sample_battery());
+        let (_, events) = setup.observe(&sample_battery(), None, Some(MonoMs(0)));
         assert!(events
             .iter()
-            .any(|event| matches!(event, Event::BudReport { bud: Bud::Left, level: 80, .. })));
-        assert!(events.iter().any(|event| matches!(event, Event::Case { level: 40, .. })));
-        assert!(!events.iter().any(|event| matches!(event, Event::Ready)));
-        let (_, events) = setup.observe(&sample_ears());
+            .any(|event| matches!(event, Observation::Bud { bud: Bud::Left, level: 80, .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Observation::CaseBattery { level: 40, .. })));
+        assert!(!events.iter().any(|event| matches!(event, Observation::Ready)));
+        let (_, events) = setup.observe(&sample_ears(), None, Some(MonoMs(0)));
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::BudReport { bud: Bud::Left, place: Some(Place::InEar), .. }
+            Observation::Bud { bud: Bud::Left, place: Some(Place::InEar), .. }
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::BudReport { bud: Bud::Right, place: Some(Place::InCase), .. }
+            Observation::Bud { bud: Bud::Right, place: Some(Place::InCase), .. }
         )));
-        assert!(events.iter().any(|event| matches!(event, Event::Ready)));
+        assert!(events.iter().any(|event| matches!(event, Observation::Ready)));
     }
 
     #[test]
     fn ownership_and_noise_are_not_a_second_setup() {
         let mut setup = Setup::new();
-        let _ = setup.start();
-        let (_, events) =
-            setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00]);
-        assert_eq!(events, vec![Event::Ownership(false)]);
-        let (_, events) =
-            setup.observe(&[0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0d, 0x02, 0x00, 0x00, 0x00]);
-        assert_eq!(events, vec![Event::Noise(NoiseMode::Anc)]);
-        let (_, events) = setup.observe(&[0xff, 0x00]);
+        let _ = setup.start(MonoMs(0));
+        let (_, events) = setup.observe(
+            &[0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00],
+            None,
+            Some(MonoMs(0)),
+        );
+        assert_eq!(events, vec![Observation::Ownership(false)]);
+        let (_, events) = setup.observe(
+            &[0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x0d, 0x02, 0x00, 0x00, 0x00],
+            None,
+            Some(MonoMs(0)),
+        );
+        assert_eq!(events, vec![Observation::Noise(NoiseMode::Anc)]);
+        let (_, events) = setup.observe(&[0xff, 0x00], None, Some(MonoMs(0)));
         assert!(events.is_empty());
     }
 
@@ -819,19 +854,19 @@ mod tests {
         let mut setup = Setup::new();
         let mut packet = vec![0x04, 0x00, 0x04, 0x00, 0x1d, 0, 0, 0, 0, 0, 0];
         packet.extend_from_slice(b"AirPods Pro\0A3064\0Apple Inc.\0");
-        let (_, events) = setup.observe(&packet);
+        let (_, events) = setup.observe(&packet, None, Some(MonoMs(0)));
         assert_eq!(
             events,
-            vec![Event::Identity { name: "AirPods Pro".into(), model: "A3064".into() }]
+            vec![Observation::Identity { name: "AirPods Pro".into(), model: "A3064".into() }]
         );
 
         let mut keys = vec![0x04, 0x00, 0x04, 0x00, 0x31, 0x00, 0x02, 0x01, 0x00, 0x10, 0x00];
         keys.extend_from_slice(&[0x11; 16]);
         keys.extend_from_slice(&[0x04, 0x00, 0x10, 0x00]);
         keys.extend_from_slice(&[0x22; 16]);
-        let (_, events) = setup.observe(&keys);
+        let (_, events) = setup.observe(&keys, None, Some(MonoMs(0)));
         match &events[..] {
-            [Event::Keys { irk, encryption }] => {
+            [Observation::Keys { irk, encryption }] => {
                 assert_eq!(irk, &[0x11; 16]);
                 assert_eq!(encryption, &[0x22; 16]);
             }
@@ -884,10 +919,12 @@ mod tests {
             packet.extend([first_state, first_flags]);
             packet.extend(second.bytes());
             packet.extend([2, second_flags]);
-            let (_, events) = Setup::new().observe(&packet);
-            assert!(matches!(&events[..], [Event::PodPeers { owner, .. }] if *owner == expected));
+            let (_, events) = Setup::new().observe(&packet, None, Some(MonoMs(0)));
+            assert!(
+                matches!(&events[..], [Observation::PodPeers { owner, .. }] if *owner == expected)
+            );
             packet.pop();
-            assert!(Setup::new().observe(&packet).1.is_empty());
+            assert!(Setup::new().observe(&packet, None, Some(MonoMs(0))).1.is_empty());
         }
     }
 

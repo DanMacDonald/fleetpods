@@ -13,7 +13,7 @@ pub mod time;
 pub use address::{valid_name, Address};
 pub use code::Code;
 pub use evidence::Evidence;
-pub use id::{FleetId, Generation, HostId, InvitationId, OperationId, SessionId};
+pub use id::{FleetId, Generation, HostId, InvitationId, SessionId};
 pub use listening::{Battery, EarBehavior, Lid, LidState, NoiseMode};
 pub use model::Model;
 pub use playback::{PlayKind, PlaybackEvent};

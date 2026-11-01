@@ -59,13 +59,17 @@ All fleet daemons must be upgraded for this policy: older versions ignore versio
 ## Audio handoffs
 
 `audio::route::Router` owns saved stream state from acquisition through routing,
-handoff drain and recovery. The daemon supplies claim/release intent, graph
-observations and the clock. It drains ordered work once per step after all
-ownership and recovery decisions. Mutes execute ahead of player pauses and
-control writes. Recovery can cancel a queued restore before it reaches Linux;
+handoff drain and recovery. `daemon::session` coordinates claim/release intent,
+graph observations and the clock. Its `finish_session` plans and drains routing
+once per step after ownership and recovery decisions. Mutes execute ahead of
+player pauses and control writes. Recovery can cancel a queued restore before it reaches Linux;
 a new claim inherits a handoff's originals before reading a muted graph. An
 audio-server restart discards saved serials and every queued mute or restore.
 `Audio` keeps player observations, not a second copy of routing holds.
+Deferred claims, background/rejoin intent, ownership timing, player resumes and
+recovery bookkeeping are private to `Session`.
+Claim and release operations retire pending setup and player work together;
+input dispatch forwards observations without manipulating those fields.
 
 ## Artwork ownership
 
@@ -191,20 +195,56 @@ uses address order until the other laptop's roster names the same devices,
 then follows that. Status lists `connected_peers` in this order, and the
 panel draws the Omarchy seat oldest left, newest right on every laptop.
 
+## Connection-to-playback lifecycle
+
+`daemon::session` collects claim, release, disconnect, reconnect and recovery
+coordination. Callers request an operation rather than resetting each owner.
+`step` applies the input and calls `advance_session` once. That method owns the
+order of timed work, intent decisions, fleet effects, final routing/setup and
+announcement. Its helpers are private; dispatch does not schedule them separately.
+The common release operation distinguishes handoff pauses, speaker playback,
+preference release and waiting for availability.
+Admission queries are read-only; one cancellation operation retires attempts
+for pairing, stowage or superseded preference. Connection contains the sole
+Apple reconnect sequence and applies its link transitions. Router's recovery
+enum owns parking, reset, relink, settling and Start, replacing separate optional
+phase fields.
+
+`pods::lifecycle::Lifecycle` owns one ordered sequence of launch and transition
+gates. Linking issues `OpenLink` under the existing admission/backoff policy;
+PreparingPaths starts A2DP and
+codec work; CompletingProfiles arms optional HFP and waits for output; Routing
+joins the router and transport observations before Streaming. Resource-owned
+tasks retain in-flight work across later phases. Control setup, A2DP, codec
+selection and session-owned output verification share `retry::Task` for attempt identity,
+deadlines, backoff and budgets; resource policies and success observations
+remain explicit in their owners. Status reads those states
+without constructing another task/dependency model. See [the lifecycle](connection-lifecycle.md).
+
+The Linux adapters execute tagged requests and report results. Link/AACP retries
+stay in `pods::link`, using one shared task through the explicit setup stages;
+stream mute/move/recovery transactions stay in
+`audio::route::Router`. The lifecycle owns launch order and the joins between
+these existing owners, not duplicate retry/restoration loops. Failed Apple
+reconnect recovery is one delayed, bounded operation in Connection: three
+attempts after an initial three-second wait. Session admits or cancels it using
+availability and preference; it has no separate reopen counter or timer.
+
 ## Audio before control readiness
 
 AACP control setup and A2DP audio are separate connections. A playback claim can
 open the missing audio profile alongside a control attempt that the existing
-link lifecycle has already authorized. `pace_audio` uses the current generation's
-`link_asked` marker, an opening stage, the preferred-connector gate, and a
+link lifecycle has already authorized. `pods::lifecycle` uses the current generation's
+lifecycle-owned link request, an opening stage, the preferred-connector gate, and a
 connected Bluetooth link. It waits for the link because a profile connect that
 pages the pods alongside the control socket can collide with it: both fail as
 "Host is down", the profile call goes unanswered, and BlueZ then answers every
 later request "br-connection-busy" for most of a minute. Merely waiting for
 admission, background control setup without a playback claim, and canceled
 attempts cannot initiate early audio. Codec selection and disruptive output
-recovery still require a ready control link. If an early profile request fails,
-the request at control readiness remains available. An already present audio
+recovery still require a ready control link. A running early profile request keeps its identity across control readiness.
+A terminal early failure gets a ready-stage fallback, and transient refusals
+keep the existing bounded retry window. An already present audio
 profile is not reopened just because control setup completes.
 
 The Linux edge reports each `ConnectProfile` answer, and a call that expires
@@ -222,8 +262,14 @@ does not release them. A browser that closes its stream while paused can resume
 onto the prepared default sink. Failed starts, cancellation, audio-server loss
 and the five-second recovery deadline retire pending resumes; stale Start replies
 cannot release a later recovery. Command completion does not prove audible or
-synchronized playback, so the transport watchdog still verifies streaming after
-the player resumes.
+synchronized playback. A session-owned `retry::Task` checks for active
+Bluetooth transport 2.5 seconds after Start, with the player already resumed,
+allowing two further rebuilds if playback is still requested but transport never
+starts. It replaces
+the separate verification deadline, retry counter, forced-retry flag and request
+serial. Router admission happens before an attempt consumes budget. Explicit
+reset/Start failures and router timeouts end recovery; they are not retried by
+verification.
 
 While a play waits for the pods, its speaker streams stay muted for up to 12
 seconds before they are given back to the speakers. Each step toward the pods

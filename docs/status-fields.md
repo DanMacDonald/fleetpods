@@ -19,7 +19,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `ear_reported` | An ear placement has been reported |
 | `pairing_keys_ready` | Both accessory keys are stored. Missing stays `false`, not omitted |
 | `handoff_ready` | Socket up and connection stage `ready` |
-| `control_connection.stage`, `.reason`, `.failed_stage`, `.recovering`, `.retry`, `.retry_limit` | `pods::link`. Retry and terminal failure are different stages |
+| `control_connection.stage`, `.reason`, `.failed_stage`, `.recovering`, `.retry`, `.retry_limit` | `pods::link`, projecting its shared task budget. Limit is five for ordinary setup, three for background recovery after failed Apple reconnect; Busy reuses the attempt. Retry and terminal failure are different stages |
 | `control_connection.next_retry_ms` | Connection deadline, Unix ms. Omitted when no deadline is armed |
 | `control_connection.peer_reconnect`, `.peer_reconnect_error` | Apple reconnect flag on `pods::link` |
 | `noise_mode` | Accessory-confirmed mode, or `-1`. The saved preference is not copied in |
@@ -111,3 +111,22 @@ prefers fresh owner telemetry. Case/lid use the newer observation, with their
 original freshness limits. Unknown remote fields and expired reports fall back
 to direct evidence. The raw local accessory observations and connection state
 are not overwritten. See [shared pod telemetry](architecture.md#shared-pod-telemetry).
+
+
+## Connection lifecycle diagnostics
+
+`connection_lifecycle` reads `Lifecycle::progress`: the actual `state`, the
+`waiting_for` gate recorded by the lifecycle, and the owned `audio_profile`,
+`handsfree` and `codec` resource states. An empty gate means nothing currently
+blocks that phase. No status value drives a decision.
+
+Codec `selecting` means a tagged request is pending; `awaiting_graph` means the
+server acknowledged it; `selected` requires observing the requested profile on
+the card. Codec `retry_wait` is the one-second delay after failure or timeout;
+`exhausted` means all three attempts were used for the current target. Requests
+and graph confirmation each have a five-second deadline. These states come
+directly from the shared retry task, as do A2DP's existing retry/exhaustion states.
+HFP may still be waiting, connecting or failed while the main phase is
+streaming. Streaming requires output, routed playback without recovery, and
+observed active transport; it does not measure audibility or video sync. Legacy
+control-stage fields retain their meanings. See [the lifecycle](connection-lifecycle.md).

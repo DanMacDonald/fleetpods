@@ -615,3 +615,27 @@ fn bit(value: Option<bool>) -> i64 {
 fn unix_at(clock: Clock, at: Option<crate::types::MonoMs>) -> u64 {
     at.map(|at| clock.unix_at(at).0).unwrap_or(0)
 }
+
+/// Read the owner's actual states; there is no diagnostic task graph.
+pub fn lifecycle(p: &crate::pods::lifecycle::Progress<'_>) -> Value {
+    use crate::pods::lifecycle::Handsfree;
+    use crate::retry::State;
+    json!({
+        "state": p.state.wire(), "waiting_for": p.waiting_for,
+        "audio_profile": match p.audio.state() {
+            State::Idle => "idle", State::Running { .. } | State::Confirming { .. } => "connecting",
+            State::Backoff { .. } | State::Deferred { .. } => "retry_wait", State::Succeeded { .. } => "connected",
+            State::Exhausted => "exhausted",
+        },
+        "handsfree": match p.handsfree {
+            Handsfree::Idle => "idle", Handsfree::Waiting { .. } => "waiting",
+            Handsfree::Connecting { .. } => "connecting", Handsfree::Finished { ok: true } => "complete",
+            Handsfree::Finished { ok: false } => "failed", Handsfree::Unsupported => "unsupported",
+        },
+        "codec": match p.codec.state() {
+            State::Idle => "idle", State::Running { .. } => "selecting",
+            State::Confirming { .. } => "awaiting_graph", State::Succeeded { .. } => "selected",
+            State::Backoff { .. } | State::Deferred { .. } => "retry_wait", State::Exhausted => "exhausted",
+        },
+    })
+}

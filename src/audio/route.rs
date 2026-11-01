@@ -71,23 +71,65 @@ struct RouteState {
     restore_sent: BTreeSet<(u32, u64)>,
     takeover_started: Option<MonoMs>,
     missing_since: BTreeMap<(u32, u64), MonoMs>,
-    recovery: Option<Recovery>,
-    start_after_relink: Option<Restart>,
-    starting: Option<u64>,
-    recovery_deadline: Option<MonoMs>,
-    relinked_at: Option<MonoMs>,
+    recovery: Recovery,
     /// Released with the pods still connected: move streams off them too.
     returning: bool,
     asked_return: Option<MonoMs>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-struct Recovery {
-    id: u64,
-    sink: String,
-    via: String,
-    started: MonoMs,
-    resetting: bool,
+/// Exactly one recovery phase owns its request and deadlines. Returning to
+/// Idle retires every phase, including late reset/Start callbacks.
+#[derive(Clone, Debug, Default, PartialEq)]
+enum Recovery {
+    #[default]
+    Idle,
+    Parking {
+        id: u64,
+        sink: String,
+        via: String,
+        started: MonoMs,
+        until: MonoMs,
+    },
+    Resetting {
+        output: Restart,
+        started: MonoMs,
+        until: MonoMs,
+    },
+    Relinking {
+        output: Restart,
+        until: MonoMs,
+    },
+    Settling {
+        output: Restart,
+        since: MonoMs,
+        until: MonoMs,
+    },
+    Starting {
+        id: u64,
+        until: MonoMs,
+    },
+}
+
+impl Recovery {
+    fn deadline(&self) -> Option<MonoMs> {
+        match self {
+            Self::Idle => None,
+            Self::Parking { until, .. }
+            | Self::Resetting { until, .. }
+            | Self::Relinking { until, .. }
+            | Self::Settling { until, .. }
+            | Self::Starting { until, .. } => Some(*until),
+        }
+    }
+
+    fn reset_timed_out(&self, now: MonoMs) -> bool {
+        match self {
+            Self::Parking { started, .. } | Self::Resetting { started, .. } => {
+                now.saturating_since(*started) >= 1_500
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,7 +156,7 @@ impl RouteState {
 
     /// Rebuilding includes relinking streams and awaiting the node Start reply.
     pub fn recovering(&self) -> bool {
-        self.recovery.is_some() || self.start_after_relink.is_some() || self.starting.is_some()
+        !matches!(self.recovery, Recovery::Idle)
     }
 
     pub fn holding_takeover(&self) -> bool {
@@ -123,11 +165,7 @@ impl RouteState {
 
     /// The audio server restarted. Stream serials from it are no longer the same streams.
     pub fn forget_server(&mut self) {
-        self.recovery = None;
-        self.start_after_relink = None;
-        self.starting = None;
-        self.recovery_deadline = None;
-        self.relinked_at = None;
+        self.recovery = Recovery::Idle;
         self.held.clear();
         self.missing_since.clear();
         self.quieted.clear();
@@ -153,11 +191,7 @@ impl RouteState {
             restore_sent: BTreeSet::new(),
             takeover_started: None,
             missing_since: BTreeMap::new(),
-            recovery: None,
-            start_after_relink: None,
-            starting: None,
-            recovery_deadline: None,
-            relinked_at: None,
+            recovery: Recovery::Idle,
             returning: false,
             asked_return: None,
         }
@@ -215,17 +249,13 @@ impl RouteState {
         self.asked_move = None;
         self.asked_restore = None;
         self.restore_sent.clear();
-        self.start_after_relink = None;
-        self.starting = None;
-        self.recovery_deadline = Some(now.saturating_add(5_000));
-        self.relinked_at = None;
-        self.recovery = Some(Recovery {
+        self.recovery = Recovery::Parking {
             id,
             sink: sink.name.clone(),
             via: via.name.clone(),
             started: now,
-            resetting: false,
-        });
+            until: now.saturating_add(5_000),
+        };
         true
     }
 
@@ -240,26 +270,25 @@ impl RouteState {
     }
 
     pub fn finish_recovery(&mut self, id: u64, ok: bool) -> bool {
-        if !self.recovery.as_ref().is_some_and(|r| r.id == id && r.resetting) {
+        let Recovery::Resetting { output, until, .. } = &self.recovery else { return false };
+        if output.id != id {
             return false;
         }
-        let recovery = self.recovery.take().unwrap();
-        self.start_after_relink = ok.then_some(Restart { id, name: recovery.sink });
-        self.relinked_at = None;
-        self.asked_move = None;
-        if !ok {
+        self.recovery = if ok {
+            Recovery::Relinking { output: output.clone(), until: *until }
+        } else {
             self.want = false;
-            self.recovery_deadline = None;
-        }
+            Recovery::Idle
+        };
+        self.asked_move = None;
         true
     }
 
     pub fn finish_start(&mut self, id: u64, ok: bool) -> bool {
-        if self.starting != Some(id) {
+        if !matches!(self.recovery, Recovery::Starting { id: current, .. } if current == id) {
             return false;
         }
-        self.starting = None;
-        self.recovery_deadline = None;
+        self.recovery = Recovery::Idle;
         if !ok {
             self.want = false;
         }
@@ -381,12 +410,6 @@ impl Router {
         if let Some(started) = self.state.takeover_started.as_mut() {
             *started = now;
         }
-    }
-    pub fn needs_graph(&self) -> bool {
-        self.state.want
-            || self.state.returning
-            || self.state.from.is_some()
-            || !self.state.held.is_empty()
     }
 
     /// Saved states from an acquisition that muted streams before routing.
@@ -659,31 +682,31 @@ fn plan(
     if !state.want {
         return release(state, accessory_sink, graph, now);
     }
-    if state.recovery_deadline.is_some_and(|until| now >= until) {
+    if state.recovery.deadline().is_some_and(|until| now >= until) {
         let mut action = release(state, accessory_sink, graph, now);
         action.failure = Some("audio relink/start timed out");
         return action;
     }
-    if let Some(recovery) = state.recovery.clone() {
-        if now.saturating_since(recovery.started) >= 1_500 {
-            let mut action = release(state, accessory_sink, graph, now);
-            action.failure = Some("audio recovery timed out");
-            return action;
-        }
-        if recovery.resetting {
-            return waiting(state);
-        }
+    if state.recovery.reset_timed_out(now) {
+        let mut action = release(state, accessory_sink, graph, now);
+        action.failure = Some("audio recovery timed out");
+        return action;
+    }
+    if matches!(state.recovery, Recovery::Resetting { .. }) {
+        return waiting(state);
+    }
+    if let Recovery::Parking { id, sink, via, started, until } = state.recovery.clone() {
         let on_pods: Vec<_> = state
             .held
             .iter()
             .filter_map(|s| find_held(graph, s))
-            .filter(|s| s.sink == recovery.sink)
+            .filter(|s| s.sink == sink)
             .collect();
         let hot: Vec<_> = state
             .held
             .iter()
             .filter_map(|saved| find_held(graph, saved))
-            .filter(|s| (s.sink == recovery.sink || s.sink == recovery.via) && !s.mute)
+            .filter(|s| (s.sink == sink || s.sink == via) && !s.mute)
             .map(target)
             .collect();
         if !hot.is_empty() {
@@ -701,13 +724,14 @@ fn plan(
             }
             let mut action = waiting(state);
             if ask {
-                action.move_streams = Some(Move { sink: recovery.via, streams: moving });
+                action.move_streams = Some(Move { sink: via, streams: moving });
             }
             return action;
         }
-        state.recovery.as_mut().unwrap().resetting = true;
+        let output = Restart { id, name: sink };
+        state.recovery = Recovery::Resetting { output: output.clone(), started, until };
         let mut action = waiting(state);
-        action.restart_output = Some(Restart { id: recovery.id, name: recovery.sink });
+        action.restart_output = Some(output);
         return action;
     }
     let Some(sink) = accessory_sink else {
@@ -773,19 +797,24 @@ fn plan(
         None
     };
     let mut start_output = None;
-    if state.start_after_relink.is_some()
-        && state.held.is_empty()
-        && moving_is_complete(&state, graph, &sink.name)
-    {
-        let relinked = *state.relinked_at.get_or_insert(now);
-        if now.saturating_since(relinked) >= 250 {
-            start_output = state.start_after_relink.take();
-            state.starting = start_output.as_ref().map(|start| start.id);
-            state.relinked_at = None;
+    let complete = state.held.is_empty() && moving_is_complete(&state, graph, &sink.name);
+    state.recovery = match state.recovery {
+        Recovery::Relinking { output, until } if complete => {
+            Recovery::Settling { output, until, since: now }
         }
-    } else {
-        state.relinked_at = None;
-    }
+        Recovery::Settling { output, until, since } => {
+            if !complete {
+                Recovery::Relinking { output, until }
+            } else if now.saturating_since(since) >= 250 {
+                let id = output.id;
+                start_output = Some(output);
+                Recovery::Starting { id, until }
+            } else {
+                Recovery::Settling { output, until, since }
+            }
+        }
+        other => other,
+    };
     RouteAction {
         routed: true,
         quiet: Vec::new(),
@@ -811,11 +840,7 @@ fn release(
     graph: &Graph,
     now: MonoMs,
 ) -> RouteAction {
-    state.recovery = None;
-    state.start_after_relink = None;
-    state.starting = None;
-    state.recovery_deadline = None;
-    state.relinked_at = None;
+    state.recovery = Recovery::Idle;
     let restore = std::mem::take(&mut state.held);
     state.quieted.clear();
     state.restore_sent.clear();
@@ -1470,10 +1495,8 @@ mod tests {
         };
         let mut state = RouteState { want: true, ..RouteState::default() };
         assert!(state.begin_recovery(1, pods, &graph, MonoMs(0)));
-        assert_eq!(
-            state.recovery.as_ref().unwrap().via,
-            "alsa_output.pci-0000_00_1f.3.analog-stereo"
-        );
+        assert!(matches!(&state.recovery, Recovery::Parking { via, .. }
+            if via == "alsa_output.pci-0000_00_1f.3.analog-stereo"));
     }
 
     #[test]
@@ -1541,6 +1564,46 @@ mod tests {
         assert!(!state.finish_start(6, true));
         assert!(state.finish_start(7, true));
         assert!(!state.recovering());
+    }
+
+    #[test]
+    fn release_and_server_loss_retire_every_recovery_phase() {
+        let pods = address();
+        let picture = graph(
+            "pods",
+            vec![sink("pods", Some(pods), Some("a2dp-sink")), sink("speakers", None, None)],
+            vec![],
+        );
+        let mut router = Router::new();
+        router.claim();
+        assert!(router.begin_recovery(7, pods, &picture, MonoMs(0)));
+        let mut phases = vec![router.clone()];
+        router.on_graph(Some(pods), &picture, false, MonoMs(10));
+        phases.push(router.clone()); // Reset request is still queued.
+        assert!(router.finish_recovery(7, true));
+        phases.push(router.clone());
+        router.on_graph(Some(pods), &picture, false, MonoMs(20));
+        phases.push(router.clone());
+        router.on_graph(Some(pods), &picture, false, MonoMs(270));
+        phases.push(router); // Start request is still queued.
+        for phase in phases {
+            for server_lost in [false, true] {
+                let mut cancelled = phase.clone();
+                if server_lost {
+                    cancelled.forget_server();
+                } else {
+                    cancelled.release();
+                    cancelled.on_graph(Some(pods), &picture, false, MonoMs(300));
+                }
+                assert!(!cancelled.recovering());
+                assert!(!cancelled.finish_recovery(7, true));
+                assert!(!cancelled.finish_start(7, true));
+                assert!(!cancelled
+                    .take_work(MonoMs(300), false)
+                    .iter()
+                    .any(|work| matches!(work, Work::Restart(_) | Work::Start(_))));
+            }
+        }
     }
 
     #[test]

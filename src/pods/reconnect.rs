@@ -1,8 +1,9 @@
 //! The Apple reconnect cadence.
 //!
 //! Pause local audio, ask seated fleet peers to leave, drop this link, then
-//! rejoin. The state machine owns the phases and their deadlines; the daemon
-//! supplies the facts and performs the returned action.
+//! rejoin. Connection contains this state machine and applies its link
+//! transitions. The session supplies player/peer facts and performs the
+//! external actions. There is no separate reconnect phase in Connection.
 
 use crate::types::MonoMs;
 
@@ -44,6 +45,7 @@ pub struct Facts {
 
 enum State {
     Idle,
+    Complete,
     Pausing {
         until: MonoMs,
     },
@@ -74,6 +76,28 @@ impl Reconnect {
         self.state = State::Pausing { until: now.saturating_add(PAUSE_WAIT_MS) };
     }
 
+    pub fn active(&self) -> bool {
+        !matches!(self.state, State::Idle | State::Complete)
+    }
+
+    pub fn releasing(&self) -> bool {
+        matches!(
+            self.state,
+            State::Pausing { .. }
+                | State::Awaiting { .. }
+                | State::Dropping { .. }
+                | State::Waiting { sent: false, .. }
+        )
+    }
+
+    /// Readiness ends reconnect intent immediately; the next advance reports
+    /// completion to the playback owner exactly once.
+    pub fn connected(&mut self) {
+        if self.active() {
+            self.state = State::Complete;
+        }
+    }
+
     pub fn cancel(&mut self) {
         self.state = State::Idle;
     }
@@ -81,6 +105,10 @@ impl Reconnect {
     pub fn advance(&mut self, now: MonoMs, facts: Facts) -> Advance {
         match self.state {
             State::Idle => Advance::None,
+            State::Complete => {
+                self.state = State::Idle;
+                Advance::Done
+            }
             State::Pausing { until } => {
                 if !facts.quiet && now.0 < until.0 {
                     return Advance::None;

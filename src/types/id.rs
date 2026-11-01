@@ -4,10 +4,6 @@
 
 use std::fmt;
 
-/// One local connection attempt. Completions for an older id are ignored.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OperationId(pub u64);
-
 /// Bumped when a connection is superseded. In-flight callbacks carry the old value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Generation(pub u64);

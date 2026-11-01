@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::panel::ipc::Command;
+use crate::pods::lifecycle::{Profiles, RequestId};
 use crate::step::{Effect, Input, TransportReply};
 use crate::types::{Address, Clock, Generation};
 use crate::Daemon;
@@ -32,6 +33,11 @@ enum Job {
     },
     ConnectTransport {
         address: Address,
+        id: RequestId,
+    },
+    ConnectHandsfree {
+        address: Address,
+        id: RequestId,
     },
     RestartOutput {
         id: u64,
@@ -388,16 +394,20 @@ impl Session {
             Effect::WriteControl { accessory, bytes, .. } => {
                 self.radio(Job::Write { address: *accessory, bytes: bytes.clone() })
             }
-            Effect::SelectProfile { card, profile } => {
+            Effect::SelectProfile { id, card, profile } => {
                 if let Some(audio) = &self.audio {
                     audio.send(vec![pipewire::Op::Profile {
+                        id: *id,
                         card: card.clone(),
                         name: profile.clone(),
                     }]);
                 }
             }
-            Effect::ConnectTransport { accessory } => {
-                self.radio(Job::ConnectTransport { address: *accessory })
+            Effect::ConnectTransport { accessory, id } => {
+                self.radio(Job::ConnectTransport { address: *accessory, id: *id })
+            }
+            Effect::ConnectHandsfree { accessory, id } => {
+                self.radio(Job::ConnectHandsfree { address: *accessory, id: *id })
             }
             Effect::RestartOutput { id, accessory, card, .. } => match (card, &self.audio) {
                 // Rebuilding the card's nodes is local and quick; a Bluetooth
@@ -585,10 +595,11 @@ enum CallKind {
         generation: Generation,
     },
     Profile {
-        address: Address,
-        generation: Generation,
+        id: RequestId,
     },
-    Handsfree,
+    Handsfree {
+        id: RequestId,
+    },
     Advertise,
     Unadvertise,
     Remove,
@@ -799,19 +810,7 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
             eprintln!("fleetpodsd: discarded readiness for a replaced control socket");
         }
         service_controller_reset(&bus, &reports, &mut live);
-        if let Some(path) = take_handsfree(&mut live) {
-            eprintln!("fleetpodsd: connecting hands-free after A2DP and service discovery");
-            if let Err(err) = enqueue(
-                &bus,
-                &mut live,
-                &path,
-                "ConnectProfile",
-                Some(bluez::HANDSFREE),
-                CallKind::Handsfree,
-            ) {
-                eprintln!("fleetpodsd: hands-free setup skipped: {err}");
-            }
-        }
+        report_profiles(&reports, &mut live);
         if live.air.want_scan {
             verify_scan(&bus, &mut live);
             ensure_scan(&bus, &mut live);
@@ -844,8 +843,8 @@ struct Live {
     /// `BluezBack` waits until the post-restart power cycle finishes, so the
     /// daemon does not reconnect into a controller that is about to go down.
     bluez_back_pending: bool,
-    /// One best-effort companion profile after a successful local A2DP request.
-    handsfree_after: Option<(Address, Generation)>,
+    /// Deduplicated observations; scheduling lives in pods::lifecycle.
+    reported_profiles: Option<Profiles>,
     // Link state is split on purpose across the thread seam: this
     // watcher owns the D-Bus connection and the socket fds, while the
     // daemon owns link stage and policy. The generation originates in
@@ -876,42 +875,88 @@ impl Default for Live {
             defer_attach: false,
             restoring_bluez: false,
             bluez_back_pending: false,
-            handsfree_after: None,
+            reported_profiles: None,
             air: Air::default(),
         }
     }
 }
 
-/// PipeWire waits for missing profiles before exposing A2DP. Finish HFP once
-/// A2DP succeeds and BlueZ finishes discovery; earlier calls return busy.
-/// This is optional signaling setup, never a microphone/profile selection.
-fn take_handsfree(live: &mut Live) -> Option<String> {
-    let (address, generation) = live.handsfree_after?;
-    if generation != live.generation
-        || live.accessory != Some(address)
+/// Report the facts needed by the lifecycle, including worker contention.
+fn report_profiles(reports: &Sender<Input>, live: &mut Live) {
+    let Some(address) = live.accessory else {
+        live.reported_profiles = None;
+        return;
+    };
+    let device = live.devices.iter().find(|d| d.address == address);
+    let profiles = Profiles {
+        accessory: address,
+        connected: live.connected == Some(true)
+            && live.held == Some(address)
+            && !live.air.reset_blocks_scan(),
+        services_resolved: device.is_some_and(|d| d.connected && d.services_resolved),
+        handsfree: device.is_some_and(|d| d.handsfree),
+        busy: profile_busy(live, true),
+    };
+    if live.reported_profiles != Some(profiles) {
+        live.reported_profiles = Some(profiles);
+        let _ = reports.send(Input::BluetoothProfiles(profiles));
+    }
+}
+
+fn profile_busy(live: &Live, include_handsfree: bool) -> bool {
+    live.calls.iter().any(|call| {
+        matches!(
+            call.kind,
+            CallKind::Profile { .. }
+                | CallKind::RestartDisconnect { .. }
+                | CallKind::RestartConnect { .. }
+        ) || (include_handsfree && matches!(call.kind, CallKind::Handsfree { .. }))
+    })
+}
+
+/// Execute a domain decision. Reject stale or contending jobs with a result;
+/// never silently leave a lifecycle task running after declining its request.
+fn connect_profile(
+    bus: &Bus,
+    reports: &Sender<Input>,
+    live: &mut Live,
+    address: Address,
+    id: RequestId,
+    handsfree: bool,
+) {
+    let failure = if id.generation != live.generation
         || live.held != Some(address)
-        || live.connected != Some(true)
         || live.air.reset_blocks_scan()
     {
-        live.handsfree_after = None;
-        return None;
+        Some(TransportReply::Failed)
+    } else if profile_busy(live, handsfree) {
+        Some(TransportReply::Busy)
+    } else {
+        let result = match live.paths.get(&address).cloned() {
+            Some(path) => enqueue(
+                bus,
+                live,
+                &path,
+                "ConnectProfile",
+                Some(if handsfree { bluez::HANDSFREE } else { bluez::A2DP_SINK }),
+                if handsfree { CallKind::Handsfree { id } } else { CallKind::Profile { id } },
+            ),
+            None => Err(format!("no BlueZ device for {address}")),
+        };
+        if let Err(err) = result {
+            eprintln!("fleetpodsd: profile request failed: {err}");
+            Some(TransportReply::Failed)
+        } else {
+            None
+        }
+    };
+    if let Some(reply) = failure {
+        let _ = reports.send(if handsfree {
+            Input::HandsfreeReply { id, ok: false }
+        } else {
+            Input::TransportReply { id, reply }
+        });
     }
-    let device = live.devices.iter().find(|d| d.address == address && d.connected)?;
-    if !device.services_resolved
-        || live.calls.iter().any(|call| {
-            matches!(
-                call.kind,
-                CallKind::Profile { .. }
-                    | CallKind::RestartDisconnect { .. }
-                    | CallKind::RestartConnect { .. }
-                    | CallKind::Handsfree
-            )
-        })
-    {
-        return None;
-    }
-    live.handsfree_after = None;
-    device.handsfree.then(|| device.path.clone())
 }
 
 /// How often a scan believed to be running is confirmed with BlueZ.
@@ -1139,32 +1184,12 @@ fn handle_job(
             sync(reports, configured, live);
             true
         }
-        Job::ConnectTransport { address } => {
-            if live.calls.iter().any(|call| {
-                matches!(
-                    call.kind,
-                    CallKind::Profile { .. }
-                        | CallKind::RestartDisconnect { .. }
-                        | CallKind::RestartConnect { .. }
-                )
-            }) {
-                return true;
-            }
-            match live.paths.get(&address).cloned() {
-                Some(path) => {
-                    if let Err(err) = enqueue(
-                        bus,
-                        live,
-                        &path,
-                        "ConnectProfile",
-                        Some(bluez::A2DP_SINK),
-                        CallKind::Profile { address, generation: live.generation },
-                    ) {
-                        eprintln!("fleetpodsd: A2DP connect on {address} failed: {err}");
-                    }
-                }
-                None => eprintln!("fleetpodsd: no BlueZ device for {address}"),
-            }
+        Job::ConnectTransport { address, id } => {
+            connect_profile(bus, reports, live, address, id, false);
+            true
+        }
+        Job::ConnectHandsfree { address, id } => {
+            connect_profile(bus, reports, live, address, id, true);
             true
         }
         Job::RestartOutput { id, address } => {
@@ -1367,12 +1392,13 @@ fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
             eprintln!("fleetpodsd: adapter power set timed out");
             settle_controller_reset(reports, live, up, false);
         }
-        if matches!(call.kind, CallKind::Profile { .. }) {
+        if let CallKind::Profile { id } = call.kind {
             eprintln!("fleetpodsd: AirPods audio profile request went unanswered");
-            let _ = reports.send(Input::TransportReply(TransportReply::TimedOut));
+            let _ = reports.send(Input::TransportReply { id, reply: TransportReply::TimedOut });
         }
-        if matches!(call.kind, CallKind::Handsfree) {
+        if let CallKind::Handsfree { id } = call.kind {
             eprintln!("fleetpodsd: optional hands-free setup timed out");
+            let _ = reports.send(Input::HandsfreeReply { id, ok: false });
         }
         if let CallKind::RestartDisconnect { id, .. } | CallKind::RestartConnect { id } = call.kind
         {
@@ -1637,13 +1663,7 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 eprintln!("fleetpodsd: bluetooth disconnect failed: {err}");
             }
         }
-        CallKind::Profile { address, generation } => {
-            if matches!(result, CallResult::Done)
-                && generation == live.generation
-                && live.held == Some(address)
-            {
-                live.handsfree_after = Some((address, generation));
-            }
+        CallKind::Profile { id } => {
             eprintln!(
                 "fleetpodsd: AirPods audio profile reply after {} ms: {}",
                 call.sent.elapsed().as_millis(),
@@ -1662,9 +1682,11 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 _ if failed.is_some() => TransportReply::Failed,
                 _ => TransportReply::Connected,
             };
-            let _ = reports.send(Input::TransportReply(reply));
+            let _ = reports.send(Input::TransportReply { id, reply });
         }
-        CallKind::Handsfree => {
+        CallKind::Handsfree { id } => {
+            let _ =
+                reports.send(Input::HandsfreeReply { id, ok: matches!(result, CallResult::Done) });
             eprintln!(
                 "fleetpodsd: hands-free profile reply after {} ms: {}",
                 call.sent.elapsed().as_millis(),
@@ -1989,9 +2011,6 @@ fn observe_pairing(bus: &Bus, live: &mut Live, payload: Option<&[u8]>) {
 }
 
 fn note_connected(live: &mut Live, reports: &Sender<Input>, up: bool) {
-    if !up {
-        live.handsfree_after = None;
-    }
     if live.connected == Some(up) {
         return;
     }
@@ -2056,7 +2075,6 @@ fn report_sleep(reports: &Sender<Input>, live: &mut Live, sleeping: bool) {
 }
 
 fn close_control(live: &mut Live, reports: &Sender<Input>) {
-    live.handsfree_after = None;
     let open = live.link.fd().is_some();
     if open {
         eprintln!("fleetpodsd: locally closing control generation={}", live.generation.0);
@@ -2070,7 +2088,6 @@ fn close_control(live: &mut Live, reports: &Sender<Input>) {
 }
 
 fn drop_socket(live: &mut Live, reports: &Sender<Input>) {
-    live.handsfree_after = None;
     // A lost seat waits for an explicit Open/Follow job. BlueZ property updates
     // must not silently attach again and displace another host.
     live.defer_attach = true;
@@ -3055,25 +3072,6 @@ mod advertisement_tests {
         message
     }
 
-    #[test]
-    fn handsfree_waits_for_both_audio_success_and_discovery_and_only_runs_once() {
-        for resolved_first in [false, true] {
-            let mut live = handsfree_trial();
-            let address = live.accessory.unwrap();
-            live.devices[0].services_resolved = resolved_first;
-            assert!(take_handsfree(&mut live).is_none(), "no request from discovery alone");
-            live.handsfree_after = Some((address, live.generation));
-            if !resolved_first {
-                assert!(take_handsfree(&mut live).is_none(), "discovery still owns BlueZ");
-                assert!(live.handsfree_after.is_some());
-                live.devices[0].services_resolved = true;
-            }
-            let path = live.devices[0].path.clone();
-            assert_eq!(take_handsfree(&mut live), Some(path));
-            assert!(take_handsfree(&mut live).is_none(), "no companion retry loop");
-        }
-    }
-
     fn handsfree_trial() -> Live {
         let address = Address::parse("CC:22:FE:54:DF:C7").unwrap();
         Live {
@@ -3099,36 +3097,35 @@ mod advertisement_tests {
     }
 
     #[test]
-    fn handsfree_does_not_follow_a_replaced_or_released_connection() {
-        for case in ["generation", "accessory", "disconnected", "released", "unsupported"] {
-            let mut live = handsfree_trial();
-            live.handsfree_after = Some((live.accessory.unwrap(), live.generation));
-            match case {
-                "generation" => live.generation.0 += 1,
-                "accessory" => live.accessory = None,
-                "disconnected" => live.connected = Some(false),
-                "released" => live.held = None,
-                "unsupported" => live.devices[0].handsfree = false,
-                _ => unreachable!(),
-            }
-            assert!(take_handsfree(&mut live).is_none(), "{case}");
-            assert!(live.handsfree_after.is_none(), "{case}");
-        }
-    }
-
-    #[test]
-    fn handsfree_waits_for_an_existing_profile_operation() {
+    fn profile_observations_report_discovery_contention_and_release_once() {
         let mut live = handsfree_trial();
-        live.handsfree_after = Some((live.accessory.unwrap(), live.generation));
+        let (tx, rx) = std::sync::mpsc::channel();
+        report_profiles(&tx, &mut live);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::BluetoothProfiles(Profiles {
+                connected: true,
+                services_resolved: true,
+                busy: false,
+                ..
+            }))
+        ));
+        report_profiles(&tx, &mut live);
+        assert!(rx.try_recv().is_err());
         live.calls.push(PendingCall {
             serial: 1,
             kind: CallKind::RestartConnect { id: 1 },
             sent: Instant::now(),
         });
-        assert!(take_handsfree(&mut live).is_none());
-        assert!(live.handsfree_after.is_some());
+        report_profiles(&tx, &mut live);
+        assert!(matches!(rx.try_recv(), Ok(Input::BluetoothProfiles(Profiles { busy: true, .. }))));
         live.calls.clear();
-        assert!(take_handsfree(&mut live).is_some());
+        live.held = None;
+        report_profiles(&tx, &mut live);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Input::BluetoothProfiles(Profiles { connected: false, busy: false, .. }))
+        ));
     }
 
     #[test]

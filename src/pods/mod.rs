@@ -4,6 +4,7 @@
 //! confirmed. `prefs` stores what the user asked for before that confirmation.
 
 pub mod air;
+pub mod lifecycle;
 pub mod link;
 pub mod nearby;
 pub mod observe;

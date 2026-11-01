@@ -616,6 +616,7 @@ impl World {
             | Effect::RestartOutput { .. }
             | Effect::StartOutput { .. }
             | Effect::ConnectTransport { .. }
+            | Effect::ConnectHandsfree { .. }
             | Effect::RemoveDevice { .. }
             | Effect::ShowMicrophone { .. }
             | Effect::HideMicrophone
