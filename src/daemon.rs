@@ -12358,6 +12358,47 @@ mod tests {
         }
     }
     #[test]
+    fn bluetooth_connect_defers_routine_broadcasts_without_blocking_audio_or_recovery() {
+        use crate::step::{Effect, Input};
+        let later = |ms| Clock::new(clock().mono.0 + ms, clock().unix.0 + ms);
+        let advertises =
+            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::Advertise(_)));
+        for ending in ["connected", "failed", "canceled"] {
+            let mut daemon = Daemon::new("xps");
+            daemon.set_local_address(Some(addr(1)));
+            daemon.select_accessory(Some(addr(3)));
+            assert!(advertises(&daemon.step(Input::Tick, clock()).effects));
+            daemon.claim_playback(later(600));
+            let start = daemon.step(Input::Tick, later(600));
+            let release = start.effects.iter().position(|e| matches!(e, Effect::ReleaseAir));
+            let open = start.effects.iter().position(|e| matches!(e, Effect::OpenLink { .. }));
+            assert!(release.is_some() && open.is_some() && release < open);
+            assert!(!advertises(&start.effects));
+            assert!(daemon.listening, "incoming observations must keep flowing");
+            let waiting = daemon.step(Input::Tick, later(3_600));
+            assert!(!advertises(&waiting.effects));
+            assert!(!waiting.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            let generation = daemon.connection.generation();
+            let input = match ending {
+                "connected" => Input::Bluez(true),
+                "failed" => Input::LinkFailed { generation, busy: false },
+                _ => Input::Command(Command::Disconnect),
+            };
+            let ended = daemon.step(input, later(4_000));
+            assert!(advertises(&ended.effects), "routine traffic resumes after {ending}");
+            if ending == "connected" {
+                assert!(ended.effects.iter().any(|e| matches!(e, Effect::ConnectTransport { .. })));
+                assert_eq!(daemon.connection.stage(), Stage::Connecting);
+            } else if ending == "failed" {
+                let retry = daemon.step(Input::Tick, later(5_000));
+                assert!(retry.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+                assert!(retry.effects.iter().any(|e| matches!(e, Effect::ReleaseAir)));
+                assert!(!advertises(&retry.effects));
+            }
+        }
+    }
+
+    #[test]
     fn a_play_opens_audio_alongside_an_authorized_control_attempt() {
         use crate::pods::link::OpenStep;
         use crate::step::{Effect, Input};

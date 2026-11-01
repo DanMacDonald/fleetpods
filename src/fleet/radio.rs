@@ -174,6 +174,10 @@ pub struct Schedule {
     roster: Option<Vec<u8>>,
     roster_remaining: u8,
     roster_urgent: bool,
+    /// All three copies of a seat change remain coordination traffic.
+    roster_changed: bool,
+    /// Spare the controller routine announcements while opening a Bluetooth link.
+    defer_routine: bool,
     /// After presence, the next free slot belongs to a waiting roster.
     roster_next: bool,
     route: Option<Vec<u8>>,
@@ -203,6 +207,8 @@ impl Schedule {
             roster: None,
             roster_remaining: 0,
             roster_urgent: false,
+            roster_changed: false,
+            defer_routine: false,
             roster_next: false,
             route: None,
             route_urgent: false,
@@ -254,6 +260,7 @@ impl Schedule {
         self.roster = Some(frame);
         self.roster_remaining = 1;
         self.roster_urgent = false;
+        self.roster_changed = false;
     }
 
     /// A seat change takes the next non-pairing slot, then repeats twice in
@@ -262,16 +269,27 @@ impl Schedule {
         self.roster = Some(frame);
         self.roster_remaining = 3;
         self.roster_urgent = true;
+        self.roster_changed = true;
     }
 
     pub fn clear_roster(&mut self) {
         self.roster = None;
         self.roster_remaining = 0;
         self.roster_urgent = false;
+        self.roster_changed = false;
     }
 
     pub fn has_roster(&self) -> bool {
         self.roster.is_some()
+    }
+
+    /// Retain routine snapshots for later, while enrollment, preference and
+    /// handoff coordination keep their slots. Returns whether the mode changed.
+    /// An advertisement already on air finishes its bounded 500 ms slot.
+    pub fn defer_routine(&mut self, defer: bool) -> bool {
+        let changed = self.defer_routine != defer;
+        self.defer_routine = defer;
+        changed
     }
 
     /// Keep a routing packet until it is cleared. A changed packet starts on
@@ -422,6 +440,14 @@ impl Schedule {
             self.mark_aired(now);
             return Some(Item::Activity(bytes));
         }
+        if self.defer_routine && self.route.is_none() {
+            // Preserve the entire seat-change burst and enrollment retries.
+            // Routine presence/roster/telemetry stay queued and can coalesce.
+            if self.roster_changed {
+                return self.take_roster(now);
+            }
+            return self.take_repeat(now);
+        }
         // A handoff keeps its full rotation; telemetry resumes after its
         // acknowledgement/retry window, carrying only the latest snapshot.
         if self.route.is_none() {
@@ -485,6 +511,7 @@ impl Schedule {
         self.roster_remaining = self.roster_remaining.saturating_sub(1);
         if self.roster_remaining == 0 {
             self.roster = None;
+            self.roster_changed = false;
         }
         self.roster_urgent = false;
         self.roster_next = false;
@@ -528,6 +555,81 @@ mod tests {
 
     fn addr(byte: u8) -> Address {
         Address::new([byte, 0, 0, 0, 0, 1]).unwrap()
+    }
+
+    #[test]
+    fn connecting_releases_routine_airtime_and_resumes_with_latest_snapshots() {
+        let mut schedule = Schedule::new();
+        schedule.offer(vec![1]);
+        assert_eq!(schedule.due(MonoMs(0)), Duty::Publish(Item::Presence(vec![1])));
+        schedule.defer_routine(true);
+        schedule.offer(vec![2]);
+        schedule.offer_roster(vec![3]);
+        schedule.offer_pod_state(vec![4]);
+        assert_eq!(schedule.due(MonoMs(499)), Duty::Hold);
+        assert_eq!(schedule.due(MonoMs(500)), Duty::Release);
+        assert_eq!(schedule.due(MonoMs(1_000)), Duty::Hold);
+        schedule.offer(vec![5]);
+        schedule.offer_roster(vec![6]);
+        schedule.offer_pod_state(vec![7]);
+        assert_eq!(schedule.due(MonoMs(5_000)), Duty::Hold);
+        schedule.defer_routine(false);
+        assert_eq!(schedule.due(MonoMs(5_000)), Duty::Publish(Item::PodState(vec![7])));
+        assert_eq!(schedule.due(MonoMs(5_500)), Duty::Publish(Item::Presence(vec![5])));
+        assert_eq!(schedule.due(MonoMs(6_000)), Duty::Publish(Item::Roster(vec![6])));
+        assert_eq!(schedule.due(MonoMs(6_500)), Duty::Release);
+    }
+
+    #[test]
+    fn connecting_preserves_preferences_seat_change_bursts_and_handoff_authentication() {
+        let mut schedule = Schedule::new();
+        schedule.defer_routine(true);
+        schedule.offer_pod_state(vec![1]);
+        schedule.offer_handoff_presence(vec![2]);
+        schedule.offer_roster_change(vec![3]);
+        schedule.offer_activity(vec![4]);
+        assert_eq!(schedule.due(MonoMs(0)), Duty::Publish(Item::Roster(vec![3])));
+        assert_eq!(schedule.due(MonoMs(500)), Duty::Publish(Item::Presence(vec![2])));
+        assert_eq!(schedule.due(MonoMs(1_000)), Duty::Publish(Item::Activity(vec![4])));
+        assert_eq!(schedule.due(MonoMs(1_500)), Duty::Publish(Item::Roster(vec![3])));
+        assert_eq!(schedule.due(MonoMs(2_000)), Duty::Publish(Item::Roster(vec![3])));
+        assert_eq!(schedule.due(MonoMs(2_500)), Duty::Release);
+        // A live handoff retains its presence/roster/route rotation, including
+        // the presence needed to authenticate a peer's routing packets.
+        schedule.offer_route(vec![5], MonoMs(5_000));
+        schedule.offer_handoff_presence(vec![6]);
+        schedule.offer_roster(vec![7]);
+        assert_eq!(schedule.due(MonoMs(3_000)), Duty::Publish(Item::Route(vec![5])));
+        assert_eq!(schedule.due(MonoMs(3_500)), Duty::Publish(Item::Presence(vec![6])));
+        assert_eq!(schedule.due(MonoMs(4_000)), Duty::Publish(Item::Roster(vec![7])));
+        assert_eq!(schedule.due(MonoMs(4_500)), Duty::Publish(Item::Route(vec![5])));
+        assert_eq!(schedule.due(MonoMs(5_001)), Duty::Release);
+        assert_eq!(schedule.due(MonoMs(6_000)), Duty::Hold);
+        schedule.defer_routine(false);
+        assert_eq!(schedule.due(MonoMs(6_000)), Duty::Publish(Item::PodState(vec![1])));
+    }
+
+    #[test]
+    fn connecting_keeps_enrollment_fragments_and_retries_airing() {
+        let mut schedule = Schedule::new();
+        schedule.defer_routine(true);
+        schedule.offer(vec![1]);
+        let frame = vec![9; 200];
+        schedule.push(addr(2), frame.clone());
+        schedule.note_source(addr(1), || Some([5; 8]));
+        let mut inbox = Inbox::new();
+        for at in [0, 500, 1_000, 1_500] {
+            let Duty::Publish(Item::Letter(bytes)) = schedule.due(MonoMs(at)) else {
+                panic!("enrollment must still air during connection attempts");
+            };
+            let received = inbox.accept(&bytes, Some(addr(2)), MonoMs(at));
+            if at == 500 {
+                assert_eq!(received, Some((addr(1), frame.clone())));
+            } else {
+                assert_eq!(received, None);
+            }
+        }
+        assert_eq!(schedule.due(MonoMs(121_000)), Duty::Release);
     }
 
     #[test]

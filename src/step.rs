@@ -949,6 +949,19 @@ impl Daemon {
             }
         } else {
             self.radio_silenced = false;
+            // Once the ACL is up, audio and control setup can run alongside
+            // ordinary fleet traffic. Before that, leave paging room on the
+            // controller without delaying admission, handoff or discovery.
+            let connecting = self.connection.stage() == Stage::Connecting
+                && self.connection.may_open(now.mono)
+                && self.connection.bluez() != Some(true)
+                && self.connection.socket_up() != Some(true);
+            if self.outbound.defer_routine(connecting) {
+                eprintln!(
+                    "fleetpodsd: routine fleet advertisements {}",
+                    if connecting { "deferred while Bluetooth connects" } else { "resumed" }
+                );
+            }
             self.offer_presence(now);
             self.offer_roster(now);
             self.offer_activity(now);

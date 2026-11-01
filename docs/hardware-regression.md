@@ -82,7 +82,8 @@ This is a hardware checklist, not a claim of completed hardware validation. The 
 ## Audio starts before control setup
 
 - With a genuine playback request and the audio profile absent, confirm the
-  authorized control attempt and A2DP profile request start together. Compare
+  authorized control attempt starts first and the A2DP profile request follows
+  as soon as Bluetooth is connected, without waiting for control setup. Compare
   first active audio transport with the later control-ready event; startup time
   still depends on the AirPods and Bluetooth controller.
 - Repeat after opening the case, an explicit Connect/Play, and a fleet handoff.
@@ -92,3 +93,30 @@ This is a hardware checklist, not a claim of completed hardware validation. The 
   XPS seated and shows Playing, with no connecting spinner. Pausing or dropping
   the audio transport should restore ordinary connection progress if control
   is still opening. Raw status must retain the true control stage.
+
+## Routine advertisements during connection attempts
+
+- With the iPhone connected and the XPS disconnected, press Play while the pods
+  are available. Check for `routine fleet advertisements deferred while Bluetooth
+  connects`, followed by `resumed` when Bluetooth connects. Routine presence,
+  roster refreshes and pod telemetry should stop after the current 500 ms slot;
+  incoming discovery must remain active. Audio profile setup should still start
+  on the Bluetooth-connected event, before control readiness.
+- Repeat with a failed attempt and with explicit Disconnect during an attempt.
+  Routine broadcasts must resume in retry backoff or after cancellation, then
+  defer again when a retry actually starts. No extra connection attempt should
+  be created by advertisement scheduling.
+- Repeat a fleet handoff. Routing packets, their authentication presence,
+  connector preference updates, enrollment and the complete three-copy roster
+  change burst must still air during connection attempts.
+- Compare Play-to-Bluetooth and Play-to-active-transport timings over repeated
+  case-open cycles. The 2026-11-01 XPS incident included a roughly five-second
+  failed first attempt and concurrent advertisement-registration failures.
+  Those logs do not prove radio contention caused the failure; improved success
+  rate and latency from this scheduling change still require hardware testing.
+
+Deployment smoke check on 2026-11-01: XPS and Gram ran the same release daemon
+binary, both services stayed active and answered status requests, and Gram
+re-established control while reporting XPS as the playing owner. The build passed
+380 unit tests, 33 acceptance scenarios and Clippy. This was not a repeated
+case-open timing test.
