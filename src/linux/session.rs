@@ -60,6 +60,10 @@ enum Job {
     StopListen,
     /// The daemon is not holding the link. Attach if the accessory is already connected.
     Follow,
+    /// The daemon selected a different accessory. Follow it.
+    Select {
+        address: Option<Address>,
+    },
     Stop,
 }
 
@@ -375,6 +379,10 @@ impl Session {
     fn perform_one(&mut self, effect: &Effect) {
         match effect {
             Effect::OpenLink { generation } => self.radio(Job::Open { generation: *generation }),
+            Effect::SelectAccessory { accessory } => {
+                store_configured_accessory(*accessory);
+                self.radio(Job::Select { address: *accessory });
+            }
             Effect::FollowLink => self.radio(Job::Follow),
             Effect::ShowMicrophone { address, rate, description } => {
                 self.park_microphone();
@@ -722,6 +730,7 @@ fn secret_thread(jobs: Receiver<SecretJob>, reports: Sender<Input>) {
 }
 
 fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Address>, wake: Wake) {
+    let mut configured = configured;
     let bus = match Bus::system() {
         Ok(bus) => bus,
         Err(err) => {
@@ -750,7 +759,7 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         expire_calls(&bus, &reports, &mut live);
         let mut stop = false;
         while let Ok(job) = jobs.try_recv() {
-            if !handle_job(&bus, &reports, configured, &mut live, job) {
+            if !handle_job(&bus, &reports, &mut configured, &mut live, job) {
                 stop = true;
                 break;
             }
@@ -868,6 +877,8 @@ struct Live {
     // above is the watcher's rate-limiter so `AttachAvailable` is
     // emitted once per ACL rather than on every notice.
     air: Air,
+    /// Other paired AirPods already reported to the daemon, by name.
+    known_reported: HashMap<Address, String>,
 }
 
 impl Default for Live {
@@ -892,6 +903,7 @@ impl Default for Live {
             bluez_back_pending: false,
             reported_profiles: None,
             air: Air::default(),
+            known_reported: HashMap::new(),
         }
     }
 }
@@ -1173,7 +1185,7 @@ fn wait(wake: &Wake, bus: &Bus, link: &ControlLink, timeout_ms: i32) -> (bool, b
 fn handle_job(
     bus: &Bus,
     reports: &Sender<Input>,
-    configured: Option<Address>,
+    configured: &mut Option<Address>,
     live: &mut Live,
     job: Job,
 ) -> bool {
@@ -1191,12 +1203,28 @@ fn handle_job(
             live.defer_attach = false;
             live.generation = generation;
             live.socket_for = None;
-            begin_open(bus, reports, configured, live);
+            begin_open(bus, reports, *configured, live);
             true
         }
         Job::Follow => {
             live.defer_attach = false;
-            sync(reports, configured, live);
+            sync(reports, *configured, live);
+            true
+        }
+        Job::Select { address } => {
+            if *configured != address {
+                *configured = address;
+                if live.accessory != address {
+                    // Drop the outgoing pair's control socket and forget
+                    // its bond snapshot; sync picks the new device up.
+                    close_control(live, reports);
+                    live.accessory = None;
+                    live.name.clear();
+                    live.bonded = None;
+                    live.defer_attach = false;
+                }
+                sync(reports, *configured, live);
+            }
             true
         }
         Job::ConnectTransport { address, id } => {
@@ -1931,7 +1959,24 @@ fn remember_inventory(
     }
 }
 
+fn report_known_accessories(reports: &Sender<Input>, live: &mut Live) {
+    for device in &live.devices {
+        if !device.has_pairing() || !bluez::looks_like_pods(device) {
+            continue;
+        }
+        if live.accessory == Some(device.address) {
+            continue;
+        }
+        if live.known_reported.get(&device.address) != Some(&device.name) {
+            live.known_reported.insert(device.address, device.name.clone());
+            let _ = reports
+                .send(Input::KnownAccessory { address: device.address, name: device.name.clone() });
+        }
+    }
+}
+
 fn sync(reports: &Sender<Input>, configured: Option<Address>, live: &mut Live) {
+    report_known_accessories(reports, live);
     if live.accessory.is_some_and(|address| live.devices.iter().any(|d| d.address == address)) {
         // The device is known again. Its Paired/Bonded values, including an
         // explicit loss of both, are authoritative even during restoration.
@@ -2493,7 +2538,7 @@ const ADVERTISEMENT_XML: &str = concat!(
     "</node>"
 );
 
-fn configured_accessory() -> Option<Address> {
+fn accessory_file() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -2502,8 +2547,32 @@ fn configured_accessory() -> Option<Address> {
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".config"))
         })?;
-    let text = fs::read_to_string(base.join("fleetpods/accessory")).ok()?;
+    Some(base.join("fleetpods/accessory"))
+}
+
+fn configured_accessory() -> Option<Address> {
+    let text = fs::read_to_string(accessory_file()?).ok()?;
     Address::parse(text.lines().next()?.trim())
+}
+
+/// Persist the daemon's selection so a restart keeps the active pair.
+fn store_configured_accessory(address: Option<Address>) {
+    let Some(path) = accessory_file() else {
+        return;
+    };
+    match address {
+        Some(address) => {
+            if let Some(parent) = path.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if let Err(err) = fs::write(&path, format!("{}\n", address.display())) {
+                eprintln!("fleetpodsd: could not save the selected accessory: {err}");
+            }
+        }
+        None => {
+            let _ = fs::remove_file(&path);
+        }
+    }
 }
 
 #[cfg(test)]

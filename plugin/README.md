@@ -65,5 +65,5 @@ poses. `AirPodsIcon.qml` owns their presentation lifecycle, including the
 250 ms last-departure confirmation and the empty-case hold. `Service.qml`
 forwards physical placement without scheduling artwork timers, and `SeatsView`
 reads the icon's connector positions without inspecting motion flags. Rendering
-checks in `tst_MeshArtwork.qml` capture the actual painted result; motion tests
+motion tests
 exercise placement changes through the icon.

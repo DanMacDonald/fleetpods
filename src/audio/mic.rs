@@ -112,11 +112,20 @@ impl Format {
     }
 }
 
-/// Pro 3 is the verified entry. Other SKUs stay hidden until they have one.
+/// Pro 3 is the verified entry. Pro 2 (A2698) uses the same constants,
+/// validated on hardware 2026-11-01 (tone at exactly 880 Hz decoded
+/// clean; see docs/multi-accessory.md). Other SKUs stay hidden.
 pub fn format_for_sku(sku: &str) -> Option<Format> {
     match sku {
         "A3063" | "A3064" | "A3065" => Some(Format {
             model: Model::AirPodsPro3,
+            audio_specific_config: [0xf8, 0xe6, 0x30, 0x00],
+            coding_hz: 48_000,
+            delivery_hz: 64_000,
+            samples_per_frame: 480,
+        }),
+        "A2698" => Some(Format {
+            model: Model::AirPodsPro2Lightning,
             audio_specific_config: [0xf8, 0xe6, 0x30, 0x00],
             coding_hz: 48_000,
             delivery_hz: 64_000,
@@ -295,6 +304,13 @@ mod tests {
         assert_eq!(format.samples_per_frame, 480);
         assert_eq!(format.audio_specific_config, [0xf8, 0xe6, 0x30, 0x00]);
         assert_eq!(format.prime_samples(), 12_800);
+        // Pro 2 (A2698) shares the verified constants.
+        let pro2 = format_for_sku("A2698").unwrap();
+        assert_eq!(pro2.model, Model::AirPodsPro2Lightning);
+        assert_eq!(pro2.coding_hz, 48_000);
+        assert_eq!(pro2.delivery_hz, 64_000);
+        assert_eq!(pro2.samples_per_frame, 480);
+        assert_eq!(pro2.audio_specific_config, [0xf8, 0xe6, 0x30, 0x00]);
         assert!(format_for_sku("A2084").is_none());
 
         let mut mic = Microphone::new();

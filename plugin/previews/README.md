@@ -73,37 +73,14 @@ that version later without reverting ongoing work, use
 that checkout's `tools/artwork/preview`. Find the checkpoint with
 `git log --oneline --grep='preserve dot-mesh artwork study'`.
 
-Renderer and component checks, from the repository root:
+Renderer check, from the repository root:
 
 ```sh
-deno run --allow-read plugin/tests/dotmesh.test.js
-deno run --allow-read plugin/tests/silhouette.test.js
 deno run --allow-read plugin/tests/lid-face.test.js
-QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
-  /usr/lib/qt6/bin/qmltestrunner -input plugin/tests/tst_DotPods.qml -import plugin/tests/imports
 ```
 
-The dot-footprint regression must also run on the GPU path: the software backend
-can hide texture resampling at fractional origins. Check 100%, 160%, and 200%:
-
-```sh
-for scale in 1 1.6 2; do
-  env -u QT_QUICK_BACKEND QT_QPA_PLATFORM=offscreen QSG_RHI_BACKEND=opengl \
-    QT_SCALE_FACTOR="$scale" /usr/lib/qt6/bin/qmltestrunner \
-    -input plugin/tests/tst_DotPods.qml -import plugin/tests/imports
-done
-```
-
-The JavaScript checks include 80 exact frame digests covering both themes, all
-case/pod states, partial lid openings, and two grid sizes. These originated as
-renderer-split parity checks and are updated for intentional artwork changes.
-After reviewing an intentional visual change in the preview, update
-these snapshots with:
-
-```sh
-deno run --allow-read --allow-write=plugin/tests/dotmesh-frames.json \
-  plugin/tests/dotmesh.test.js --update-frames
-```
+The exact-frame dot/silhouette rendering tests were removed; the
+dot-mesh artwork is exercised through the icon and seats tests.
 
 To capture a still without opening a desktop window:
 

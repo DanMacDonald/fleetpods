@@ -544,6 +544,9 @@ impl World {
     fn run_effect(&mut self, name: &str, effect: Effect) {
         match effect {
             Effect::OpenLink { generation } => self.run_open(name, generation),
+            // The simulated radio has no selection of its own; it follows
+            // the daemon's, which already changed.
+            Effect::SelectAccessory { .. } => {}
             // Send/Announce are observation effects. Production transmits the
             // paced Advertise frames, including the sender and fragment identity.
             Effect::Send { to, bytes } => {

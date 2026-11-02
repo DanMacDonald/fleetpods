@@ -45,7 +45,7 @@ Source audit: 2026-10-13. This report records implementation findings against th
 | AUD-8 | Partial | User reports volume controls working on hardware. The daemon's rounding and duck-save/restore helpers lack production callers; this does not establish a failure of system/accessory volume controls. Conversation ducking and restoration remain separately unverified |
 | MIC-1 | Partial | Source demand/mute wired; source is not explicitly hidden; normal-input integration requires separately installed hooks |
 | MIC-2 | Wired | Control-channel frame parsing, FFmpeg AAC-ELD decode, gain and queued local PCM; audible quality not established by tests |
-| MIC-3 | Wired | One format table for three Pro 3 SKUs; not evidence of hardware validation for every SKU |
+| MIC-3 | Wired | One format table for three Pro 3 SKUs plus Pro 2 A2698 (same constants, hardware-validated 2026-11-01 by tone decode); not evidence of hardware validation for every SKU |
 | MIC-4 | Wired | 65,536-sample queue, 200 ms reserve, whole-block drops and silence/re-prime on underrun |
 | MIC-5 | Partial | Packet/decode/queue counters exist; no complete end-to-end loss attribution |
 | MIC-6 | Wired | Capture leaves discovery running; daemon does not configure BlueZ scan defaults |

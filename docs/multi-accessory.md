@@ -1,8 +1,12 @@
 # Multiple AirPods accessories: design and phased plan
 
-Status: **design agreed 2026-11-01; Phase A implemented on this
-branch (417 unit tests + 33 acceptance tests green). Phases B–D not
-started.**
+Status: **design agreed 2026-11-01. Phase A implemented (`a3d7806`).
+Phases B–D implemented on top, uncommitted: radio selection follows
+the daemon at runtime, wear promotion with per-pair prefs, `select`
+IPC/CLI verb, and a panel pair switcher. The simultaneous-control-
+link question from Phase B was settled by the one-active-pair
+decision: only the selected pair holds a control link, so the Linux
+layer switches its single link instead of holding two.**
 Branch: `multi-accessory` (from `master` `7ae23dd`).
 
 ## Problem
@@ -76,16 +80,31 @@ arbiter decides which unit may claim the default sink and mic.
   status gains an `accessories[]` array while flat legacy fields
   keep projecting the selected accessory. Connection, lifecycle,
   seat, and Linux runtime stay single (the selected accessory).
-- **Phase B — Linux multi-runtime:** per-accessory `ControlLink` /
-  runtime map + poll set, `bluez::select` multi-device handling,
-  per-address persisted selection. Gate: hardware spike proving two
-  concurrent AAP control sockets on one adapter.
-- **Phase C — connection/seat per unit:** address-tagged
-  `Input`/`Effect`, per-unit lifecycle/seat/activity/pod-state,
-  active-audio arbiter, wear/play promotion with no-steal rule.
-- **Phase D — surface:** per-pair prefs in `Config`, status schema
-  completion, IPC/CLI optional accessory address, panel device
-  switcher with per-device batteries/settings and active marker.
+- **Phase B — Linux follows selection:** the radio worker's
+  configured accessory is mutable state; a new `Job::Select` (from
+  `Effect::SelectAccessory`) drops the outgoing pair's control
+  socket, forgets its bond snapshot, and syncs to the newly selected
+  device, which `bluez::select` already prefers when configured.
+  The selection is persisted to `~/.config/fleetpods/accessory`, so
+  a restart keeps the active pair. Simultaneous control links are
+  deliberately not held: with one active pair (see decisions), the
+  single link moves.
+- **Phase C — promotion:** `Daemon::activate_accessory` is the one
+  switch path (used by pairing, promotion, and the `select`
+  command): outgoing report+prefs are kept, incoming report+prefs
+  become live, the platform disconnects the outgoing pair and
+  follows the selection. A tracked pair that transitions to in-ear
+  is promoted unless the selected pair is worn, or local playback
+  is streaming through it (`maybe_promote`). Connection, lifecycle,
+  and seat remain the selected pair's, which is exactly the
+  one-active-pair model.
+- **Phase D — surface:** per-pair prefs in `Config` (`PairPrefs` +
+  `saved_prefs`; a never-configured pair starts from defaults, not
+  from the outgoing pair's choices), `fleetpods select <address>`
+  CLI / `select:<address>` socket verb, status `accessories[]`
+  (Phase A), `Model.accessories` parsing with address validation,
+  and a panel switcher listing known pairs with an Active marker
+  and a Use action.
 
 Each phase keeps the single-accessory test suite green before the
 next starts. New acceptance tests (from the mapping): two paired
@@ -105,3 +124,24 @@ the first returns.
   migrated to the configured accessory on first load.
 - Fleet interaction (roster, pod-state sharing, activity
   preference) remains scoped to the selected accessory in Phase A.
+
+## Hardware notes (2026-11-01)
+
+- Pairing a second pair from `bluetoothctl`/scripts can silently
+  take the LE path and time out: BlueZ pairs the device object it
+  discovered, and FleetPods discovery surfaces pairs over LE. Run a
+  classic inquiry first (`bluetoothctl scan bredr`) so the device
+  has a BR/EDR bearer, then pair. Symptoms otherwise: attempts hang
+  ~20 s, `org.bluez.Error.InProgress` if a wedged attempt lingers
+  (restart `bluetooth` to clear), and the device drops out of the
+  available list between tries.
+- A newly seen pair's PipeWire sink can start at 0-6% volume
+  (WirePlumber per-device restore), which looks exactly like a
+  routing failure. Check the *sink* volume, not just the stream.
+- Pro 2 (A2698) microphone validated: the Pro 3 ELD constants
+  (ASC `f8 e6 30 00`, 48 kHz coding, 480 samples/frame, 64 kHz
+  delivery) decode its mic stream correctly - an 880 Hz tone burst
+  recorded at exactly 880 Hz with clean playback. When
+  `fleetpods.hires-microphone` exists for an address, the
+  WirePlumber hook hides the duplicate `bluez_input.<address>`
+  source; pairs without a FleetPods mic keep the stock input.

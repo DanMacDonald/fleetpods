@@ -93,6 +93,7 @@ function defaultStatus() {
     caseLidState: LID_UNKNOWN,
     lidUpdatedMs: 0,
     devices: {},
+    accessories: [],
     fleetOutcome: null,
     fleetWaitingForKeyring: false,
     left: defaultPod(),
@@ -247,6 +248,32 @@ function boolOr(value, fallback) {
   return value === undefined ? fallback : value === true
 }
 
+// Known AirPods pairs from the daemon's accessories[] (multi-accessory
+// Phase A+). Older daemons omit it; absence means only the selected pair.
+function accessoriesList(raw) {
+  if (!Array.isArray(raw)) return []
+  var out = []
+  for (var i = 0; i < raw.length; i++) {
+    var entry = raw[i]
+    if (!entry || typeof entry !== "object") continue
+    var address = normalizeAddress(entry.address)
+    if (!/^([0-9A-F]{2}:){5}[0-9A-F]{2}$/.test(address)) continue
+    var caseRaw = podFrom(entry["case"])
+    out.push({
+      address: address,
+      deviceName: String(entry.device_name || ""),
+      modelName: String(entry.model_name || ""),
+      selected: entry.selected === true,
+      keysReady: entry.keys_ready === true,
+      lidState: intOr(entry.lid_state, LID_UNKNOWN),
+      left: podFrom(entry.left),
+      right: podFrom(entry.right),
+      caseBattery: { level: caseRaw.level, charging: caseRaw.charging }
+    })
+  }
+  return out
+}
+
 function podFrom(raw) {
   var pod = defaultPod()
   if (!raw || typeof raw !== "object") return pod
@@ -370,6 +397,7 @@ function parseStatus(raw) {
     ? { atMs: outcome.at_ms, result: String(outcome.result), peer: normalizeAddress(outcome.peer),
         retain: normalizeAddress(outcome.retain) } : null
   status.devices = devicesMap(parsed.devices)
+  status.accessories = accessoriesList(parsed.accessories)
   status.left = podFrom(parsed.left)
   status.right = podFrom(parsed.right)
   var caseRaw = podFrom(parsed["case"])

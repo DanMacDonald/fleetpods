@@ -109,6 +109,16 @@ check("fleet_outcome is parsed from status", Model.parseStatus(JSON.stringify({ 
   fleet_outcome: { at_ms: 1760140800000, result: "admitted", peer: "02:00:00:00:00:0a", retain: "02:00:00:00:00:04" } })).fleetOutcome,
   { atMs: 1760140800000, result: "admitted", peer: "02:00:00:00:00:0A", retain: "02:00:00:00:00:04" })
 check("an older daemon's status has no fleet outcome", Model.parseStatus('{"schema_version":1}').fleetOutcome, null)
+check("accessories are parsed per pair", Model.parseStatus(JSON.stringify({ schema_version: 1,
+  accessories: [
+    { address: "cc:22:fe:54:df:c7", device_name: "Pro 3", selected: true, keys_ready: true, lid_state: 0,
+      left: { available: true, charging: false, in_ear: true, level: 80 } },
+    { address: "10:B5:88:96:4D:AE", device_name: "Old Pro", selected: false, keys_ready: true, lid_state: 1,
+      "case": { available: true, charging: true, level: 55 } },
+    { address: "not-an-address", device_name: "Bogus", selected: false }
+  ] })).accessories.map(a => [a.address, a.selected, a.left.level, a.caseBattery.level]),
+  [["CC:22:FE:54:DF:C7", true, 80, -1], ["10:B5:88:96:4D:AE", false, -1, 55]])
+check("an older daemon's status has no accessories", Model.parseStatus('{"schema_version":1}').accessories, [])
 
 // Fixture with a curly apostrophe in the device name, which the panel must keep.
 const live = '{"adaptive_level_changes_total":0,"adaptive_noise_level":50,"ca_changes_total":0,"case":{"available":true,"charging":false,"level":100},"connect_calls_total":0,"connect_failures_total":0,"connected":true,"conversational_awareness":true,"device_name":"Owner’s AirPods Pro","disconnect_calls_total":0,"disconnect_failures_total":0,"ear_detection_behavior":0,"ear_detection_changes_total":0,"forget_calls_total":0,"is_pro_series":true,"left":{"available":true,"charging":false,"in_ear":false,"level":79},"lid_state":2,"model_int":11,"model_name":"AirPods Pro 3","model_number":"A3064","noise_control_changes_total":0,"noise_mode":1,"one_bud_anc_changes_total":0,"one_bud_anc_mode":true,"reconnect_attempts_total":0,"reconnect_failures_total":0,"reopen_calls_total":0,"right":{"available":true,"charging":true,"in_ear":false,"level":100},"schema_version":1,"supports_noise_off":false}'

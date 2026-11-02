@@ -64,6 +64,13 @@ pub enum Input {
     },
     /// This machine's Bluetooth adapter, from BlueZ rather than a fixed name.
     Controller(Address),
+    /// Another paired AirPods the platform knows about. Not selected;
+    /// the daemon tracks it so the user can select it (and so its keys
+    /// can be harvested on first connection).
+    KnownAccessory {
+        address: Address,
+        name: String,
+    },
     /// The paired accessory BlueZ reported.
     Paired {
         address: Address,
@@ -179,6 +186,11 @@ pub enum PodSlot {
 pub enum Effect {
     OpenLink {
         generation: Generation,
+    },
+    /// The selected accessory changed. The platform follows the new
+    /// selection for its device choice and persists it for restart.
+    SelectAccessory {
+        accessory: Option<Address>,
     },
     Send {
         to: Address,
@@ -343,25 +355,14 @@ impl Daemon {
                 self.set_local_address(Some(address));
                 None
             }
+            Input::KnownAccessory { address, name } => {
+                self.note_known_accessory(address, &name);
+                None
+            }
             Input::Paired { address, name } => {
                 let known = self.config.accessory == Some(address);
                 if !known {
-                    // Keep the outgoing accessory's report: it stays
-                    // tracked while the new one is selected.
-                    if let Some(old) = self.config.accessory {
-                        if old != address {
-                            let report = std::mem::take(&mut self.accessory);
-                            self.tracked.insert(old, report);
-                        }
-                    }
-                    if let Some(report) = self.tracked.remove(&address) {
-                        self.accessory = report;
-                    } else if let Some(report) =
-                        self.nearby_pods.report_for_pairing(address, now.mono)
-                    {
-                        self.accessory = report;
-                    }
-                    self.accessory.pairing_at = None;
+                    self.activate_accessory(address, now);
                 }
                 self.select_accessory(Some(address));
                 let sku = self.accessory.sku.clone();
@@ -832,6 +833,12 @@ impl Daemon {
             if let Some(fleet) = self.commit.fleet() {
                 effects.push(Effect::WriteKeyring(fleet));
             }
+        }
+        if let Some(accessory) = self.effects.disconnect_accessory.take() {
+            effects.push(Effect::Disconnect { accessory });
+        }
+        if let Some(accessory) = self.effects.select_accessory.take() {
+            effects.push(Effect::SelectAccessory { accessory });
         }
         let accessory = self.config.accessory;
         for (generation, bytes) in std::mem::take(&mut self.effects.control_out) {

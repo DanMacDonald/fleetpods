@@ -322,6 +322,12 @@ Item {
       (!view.bluetoothPaired || !view.pairingKeysReady), rememberedPlacement)
   }
 
+  // Make another known pair the selected one (multi-accessory switcher).
+  function selectAccessory(address) {
+    if (!address) return
+    _send("select:" + address)
+  }
+
   // The status log holds the optimistic claim and release from the send event.
   function claimOwnership() {
     _send("connect")

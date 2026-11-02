@@ -930,6 +930,20 @@ impl Daemon {
 
     pub(crate) fn claim_playback(&mut self, now: Clock) {
         self.activity_at = None;
+        // Play intent belongs to the pair in the user's ears. If a
+        // tracked pair is worn and the selected pair is not, switch to
+        // it first (its wear transition may have been missed, e.g. the
+        // buds went in before the daemon started).
+        let candidate = self
+            .tracked
+            .iter()
+            .find(|(address, report)| {
+                self.membership.accessory_keys_ready(**address) && super::worn(report)
+            })
+            .map(|(address, _)| *address);
+        if let Some(candidate) = candidate {
+            self.maybe_promote(candidate, now);
+        }
         if self.pairing_elsewhere(now.mono) {
             self.cancel_connection_attempt(ConnectionHold::Pairing);
             return;

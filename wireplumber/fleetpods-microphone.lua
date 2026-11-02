@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: MIT
+log = Log.open_topic ("s-fleetpods-microphone")
 local linking = require ("linking-utils")
 local managedAddresses = {}
 
@@ -58,6 +59,41 @@ SimpleEventHook {
   end,
 }:register ()
 
+-- The stock BlueZ input for a FleetPods-managed accessory is a second,
+-- identically named source in every audio panel. When the hi-res source
+-- exists for the same address, remove the BlueZ one; panels should offer
+-- exactly one microphone per pair. (Opening the BlueZ input would force
+-- the headset profile and drop playback to mono call quality, which is
+-- what the hi-res source exists to avoid.)
+local function hideDuplicateInput (source)
+  local nodes = source:call ("get-object-manager", "node")
+  for input in nodes:iterate {
+    Constraint { "node.name", "matches", "bluez_input.*", type = "pw" },
+  } do
+    local address = (input.properties["node.name"] or ""):match ("^bluez_input%.(.+)$")
+    if address then
+      local microphone = nodes:lookup {
+        Constraint { "node.name", "=", "fleetpods.hires-microphone", type = "pw" },
+        Constraint { "api.bluez5.address", "=", address, type = "pw" },
+      }
+      if microphone then
+        log:notice ("hiding duplicate BlueZ input for " .. address)
+        input:request_destroy ()
+      end
+    end
+  end
+end
+
+SimpleEventHook {
+  name = "fleetpods/hide-duplicate-input",
+  interests = {
+    EventInterest { Constraint { "event.type", "=", "node-added" } },
+  },
+  execute = function (event)
+    hideDuplicateInput (event:get_source ())
+  end,
+}:register ()
+
 local common = require ("common-utils")
 local function applyInputControls (source, device)
   local nodes = source:call ("get-object-manager", "node")
@@ -72,7 +108,6 @@ local function applyInputControls (source, device)
   local input = nodes:lookup {
     Constraint { "node.name", "=", "bluez_input." .. address, type = "pw" },
   }
-  if not input then return end
   for param in device:iterate_params ("Route") do
     local route = common.parseParam (param, "Route")
     if route and route.direction == "Input" and route.props then
@@ -81,13 +116,15 @@ local function applyInputControls (source, device)
       for _, volume in ipairs (props.channelVolumes or { 1.0 }) do
         table.insert (volumes, volume)
       end
-      -- BlueZ's hardware input route does not control audio arriving over AACP.
-      input:set_param ("Props", Pod.Object {
-        "Spa:Pod:Object:Param:Props", "Props",
-        mute = props.mute or false,
-        channelVolumes = Pod.Array (volumes),
-        params = Pod.Struct { "monitor.channel-volumes", true },
-      })
+      if input then
+        -- BlueZ's hardware input route does not control audio arriving over AACP.
+        input:set_param ("Props", Pod.Object {
+          "Spa:Pod:Object:Param:Props", "Props",
+          mute = props.mute or false,
+          channelVolumes = Pod.Array (volumes),
+          params = Pod.Struct { "monitor.channel-volumes", true },
+        })
+      end
       -- PipeWire volume on the decoded source. 1.5 is louder than unity and short of the 2.5 that was too much.
       microphone:set_param ("Props", Pod.Object {
         "Spa:Pod:Object:Param:Props", "Props",

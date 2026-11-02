@@ -39,6 +39,13 @@ use crate::types::{
 /// while the other pod is worn; the next frame, 0.27 s later, shows it worn.
 /// So that claim never docks a pod known to be in an ear. Otherwise a pod out
 /// of an ear has an unknown case placement, never an older one.
+/// Any bud freshly reported in an ear.
+fn worn(report: &Accessory) -> bool {
+    [&report.left_placement, &report.right_placement]
+        .into_iter()
+        .any(|placement| placement.as_fresh().is_some_and(|pod| pod.in_ear == Some(true)))
+}
+
 fn placement(
     sight: &crate::pods::air::Frame,
     right: bool,
@@ -81,6 +88,11 @@ pub(crate) struct PendingEffects {
     pub secret_out: Vec<(String, Vec<u8>)>,
     pub drop_link: bool,
     pub remove_device: Option<Address>,
+    /// Selection changed: the platform must follow (and persist) it.
+    pub select_accessory: Option<Option<Address>>,
+    /// Disconnect this specific accessory (the outgoing one on a switch),
+    /// distinct from `drop_link`, which means the selected accessory.
+    pub disconnect_accessory: Option<Address>,
     pub pause_players: Vec<String>,
     pub keyring_dirty: bool,
     pub follow_link: bool,
@@ -419,8 +431,44 @@ impl Daemon {
             self.activity_preference.select_accessory(address);
             self.pod_state.scope(None);
             self.outbound.clear_pod_state();
+            self.effects.select_accessory = Some(address);
         }
         self.config.accessory = address;
+    }
+
+    /// Make another known accessory the selected one: its tracked report
+    /// and saved prefs become live, the outgoing pair's report and prefs
+    /// are kept, and the platform is told to disconnect the outgoing pair
+    /// and follow the new selection.
+    pub(crate) fn activate_accessory(&mut self, address: Address, now: Clock) {
+        if self.config.accessory == Some(address) {
+            return;
+        }
+        let switched = self.config.accessory.is_some();
+        if let Some(old) = self.config.accessory {
+            let prefs = self.config.live_prefs();
+            self.config.saved_prefs.insert(old, prefs);
+            let report = std::mem::take(&mut self.accessory);
+            self.tracked.insert(old, report);
+            if self.connection.stage() != Stage::Idle && self.connection.stage() != Stage::Waiting {
+                self.effects.disconnect_accessory = Some(old);
+            }
+        }
+        if let Some(report) = self.tracked.remove(&address) {
+            self.accessory = report;
+        } else if let Some(report) = self.nearby_pods.report_for_pairing(address, now.mono) {
+            self.accessory = report;
+        }
+        match self.config.saved_prefs.remove(&address) {
+            Some(prefs) => self.config.apply_prefs(prefs),
+            // Switching between pairs: a pair never configured starts
+            // from defaults, not from the outgoing pair's choices.
+            // The first-ever selection keeps whatever was set before it.
+            None if switched => self.config.apply_prefs(crate::pods::prefs::PairPrefs::new()),
+            None => {}
+        }
+        self.accessory.pairing_at = None;
+        self.select_accessory(Some(address));
     }
 
     pub fn set_local_address(&mut self, address: Option<Address>) {
@@ -607,6 +655,18 @@ impl Daemon {
                 Response::line("ok")
             }
             Command::Forget => self.forget(now),
+            Command::Select(address) => {
+                if self.config.accessory == Some(address) {
+                    Response::line("ok")
+                } else if self.tracked.contains_key(&address)
+                    || self.membership.accessory_keys_ready(address)
+                {
+                    self.activate_accessory(address, now);
+                    Response::line("ok")
+                } else {
+                    Response::line("error: unknown accessory")
+                }
+            }
             Command::NoiseCycle => {
                 self.cycle_noise();
                 Response::none()
@@ -2505,7 +2565,12 @@ impl Daemon {
             return;
         };
         if Some(owner) != selected {
+            let was_worn = self.tracked.get(&owner).is_some_and(worn);
             self.track_other(owner, address, &sight, now);
+            let is_worn = self.tracked.get(&owner).is_some_and(worn);
+            if !was_worn && is_worn {
+                self.maybe_promote(owner, now);
+            }
             return;
         }
         let keys = self.selected_keys().cloned();
@@ -2614,6 +2679,27 @@ impl Daemon {
         if let Some(state) = sight.lid {
             self.note_lid(state == LidState::Open, now.mono);
         }
+    }
+
+    /// Wear promotion: a tracked pair that just went into an ear becomes
+    /// the selected pair, unless the selected pair is in use. Putting a
+    /// pair in is the user's switch gesture; a pair that is playing (or
+    /// being worn) is never taken over.
+    fn maybe_promote(&mut self, candidate: Address, now: Clock) {
+        if self.config.accessory == Some(candidate) {
+            return;
+        }
+        if !self.membership.accessory_keys_ready(candidate) {
+            return;
+        }
+        if worn(&self.accessory) {
+            return;
+        }
+        if self.audio.local_playing() && self.transport_active {
+            return;
+        }
+        eprintln!("fleetpodsd: tracked accessory {candidate} worn; making it the selected pair");
+        self.activate_accessory(candidate, now);
     }
 
     /// Track a non-selected known accessory from its advertisements.
@@ -3496,6 +3582,19 @@ impl Daemon {
         Response::line("ok")
     }
 
+    /// A paired AirPods the platform knows about but that is not
+    /// selected. Tracking it (even before its keys are harvested) makes
+    /// it visible in status and selectable in the panel.
+    pub(crate) fn note_known_accessory(&mut self, address: Address, name: &str) {
+        if self.config.accessory == Some(address) {
+            return;
+        }
+        let report = self.tracked.entry(address).or_default();
+        if !name.is_empty() && report.name != name {
+            report.name = name.to_string();
+        }
+    }
+
     pub(crate) fn unpaired(&mut self, address: Address, now: Clock) {
         if self.config.accessory != Some(address) {
             return;
@@ -3981,6 +4080,144 @@ mod tests {
         assert_eq!(entry(second)["lid_state"], 0);
         assert_eq!(entry(first)["selected"], false);
         assert_eq!(entry(first)["lid_state"], 1);
+    }
+
+    fn rpa_for(irk: &[u8; 16]) -> Address {
+        use aes::cipher::{BlockEncrypt, KeyInit};
+        let prand = [0x40u8, 0x22, 0x33];
+        let mut padded = [0u8; 16];
+        padded[0] = prand[2];
+        padded[1] = prand[1];
+        padded[2] = prand[0];
+        let mut secret = *irk;
+        secret.reverse();
+        let mut block = padded;
+        block.reverse();
+        let cipher = aes::Aes128::new(&secret.into());
+        let mut out = aes::cipher::generic_array::GenericArray::from(block);
+        cipher.encrypt_block(&mut out);
+        let mut hashed: [u8; 16] = out.into();
+        hashed.reverse();
+        Address::new([prand[0], prand[1], prand[2], hashed[2], hashed[1], hashed[0]]).unwrap()
+    }
+
+    fn worn_frame() -> Vec<u8> {
+        let mut frame = captured_case(0x31);
+        frame[5] = 0x2a; // primary left, both buds in ear, neither in case
+        frame
+    }
+
+    fn two_pair_daemon() -> (Daemon, Address, Address, [u8; 16]) {
+        let mut daemon = Daemon::new("xps");
+        let first = addr(3);
+        let second = addr(9);
+        daemon.select_accessory(Some(first));
+        daemon.set_accessory_keys(
+            first,
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
+        let second_irk: [u8; 16] = (16u8..32).collect::<Vec<_>>().try_into().unwrap();
+        daemon
+            .set_accessory_keys(second, AccessoryKeys { irk: second_irk, encryption: [0x33; 16] });
+        (daemon, first, second, second_irk)
+    }
+
+    #[test]
+    fn wearing_a_tracked_pair_promotes_it_and_keeps_both_pairs() {
+        use crate::step::{Effect, Input};
+        let (mut daemon, first, second, second_irk) = two_pair_daemon();
+        let now = clock();
+        daemon.config.noise = Some(NoiseMode::Anc);
+        // Selected pair sits docked in its case.
+        daemon.step(Input::Proximity { address: rpa(), payload: captured_case(0x39) }, now);
+        assert_eq!(daemon.config.accessory, Some(first));
+
+        // The tracked pair goes into the user's ears: it becomes selected.
+        let outcome = daemon
+            .step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
+        assert_eq!(daemon.config.accessory, Some(second));
+        assert!(daemon.tracked.contains_key(&first), "the first pair stays tracked");
+        assert!(worn(&daemon.accessory), "the promoted pair's report is live");
+        assert!(outcome.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SelectAccessory { accessory: Some(address) } if *address == second
+        )));
+        // Per-pair prefs: the first pair's Anc choice is saved, not inherited.
+        assert_eq!(daemon.config.noise, None);
+        assert_eq!(
+            daemon.config.saved_prefs.get(&first).and_then(|prefs| prefs.noise),
+            Some(NoiseMode::Anc)
+        );
+        // Selecting back restores the first pair and its prefs.
+        let back = daemon.step(Input::Command(Command::Select(first)), now);
+        assert_eq!(back.reply.as_deref(), Some("ok\n"));
+        assert_eq!(daemon.config.accessory, Some(first));
+        assert_eq!(daemon.config.noise, Some(NoiseMode::Anc));
+        assert!(daemon.tracked.contains_key(&second));
+    }
+
+    #[test]
+    fn a_reported_paired_accessory_is_named_and_selectable() {
+        use crate::step::Input;
+        let (mut daemon, first, second, _irk) = two_pair_daemon();
+        let now = clock();
+        daemon.step(Input::KnownAccessory { address: second, name: "AirPods Pro".into() }, now);
+        let status = daemon.status_value(now);
+        let accessories = status["accessories"].as_array().unwrap();
+        let entry = accessories
+            .iter()
+            .find(|entry| entry["address"] == second.display())
+            .expect("known pair listed");
+        assert_eq!(entry["device_name"], "AirPods Pro");
+        assert_eq!(entry["selected"], false);
+        assert_eq!(daemon.config.accessory, Some(first), "reporting does not select it");
+        // It is selectable so its keys can be harvested on connection.
+        let picked = daemon.step(Input::Command(Command::Select(second)), now);
+        assert_eq!(picked.reply.as_deref(), Some("ok\n"));
+        assert_eq!(daemon.config.accessory, Some(second));
+    }
+
+    #[test]
+    fn pressing_play_promotes_a_worn_tracked_pair() {
+        use crate::step::Input;
+        let (mut daemon, first, second, second_irk) = two_pair_daemon();
+        let now = clock();
+        // Selected pair worn first, so the tracked pair's wear cannot promote.
+        daemon.step(Input::Proximity { address: rpa(), payload: worn_frame() }, now);
+        daemon.step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
+        assert_eq!(daemon.config.accessory, Some(first));
+        // Both reports age out; only the tracked pair is then seen worn
+        // again (as after a daemon restart, where no transition fires).
+        let later = Clock::new(now.mono.0 + 121_000, now.unix.0 + 121_000);
+        daemon.step(Input::Tick, later);
+        assert!(!worn(&daemon.accessory));
+        daemon.tracked.get_mut(&second).unwrap().note_placement(
+            false,
+            Some(true),
+            Some(false),
+            later.mono,
+        );
+        daemon.claim_playback(later);
+        assert_eq!(daemon.config.accessory, Some(second));
+    }
+
+    #[test]
+    fn wearing_a_tracked_pair_does_not_steal_from_a_worn_selected_pair() {
+        use crate::step::Input;
+        let (mut daemon, first, second, second_irk) = two_pair_daemon();
+        let now = clock();
+        // Selected pair is in the user's ears.
+        daemon.step(Input::Proximity { address: rpa(), payload: worn_frame() }, now);
+        daemon.step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
+        assert_eq!(
+            daemon.config.accessory,
+            Some(first),
+            "no steal while the selected pair is worn"
+        );
+        assert!(daemon.tracked.contains_key(&second), "it is still tracked");
     }
 
     #[test]

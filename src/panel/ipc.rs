@@ -31,6 +31,8 @@ pub enum Command {
     Disconnect,
     ReconnectPeer,
     Forget,
+    /// Make this known accessory the selected pair.
+    Select(Address),
     Reopen,
     Noise(NoiseMode),
     NoiseCycle,
@@ -121,7 +123,9 @@ const SIMPLE: &[Verb] = &[
 
 /// `true` when the existing CLI blocks until a reply.
 pub fn cli_waits(command: &str) -> bool {
-    command == "fleet" || SIMPLE.iter().any(|verb| verb.wire == command && verb.waits)
+    command == "fleet"
+        || command.starts_with("select:")
+        || SIMPLE.iter().any(|verb| verb.wire == command && verb.waits)
 }
 
 pub fn push(bytes: &[u8]) -> Incoming {
@@ -163,6 +167,12 @@ fn parse_text(text: &str) -> Command {
     }
     if let Some(payload) = text.strip_prefix("priority:") {
         return Command::Priority(payload.trim().to_string());
+    }
+    if let Some(payload) = text.strip_prefix("select:") {
+        return match Address::parse(payload.trim()) {
+            Some(address) => Command::Select(address),
+            None => Command::Unknown,
+        };
     }
     match SIMPLE.iter().find(|verb| verb.wire == text) {
         Some(verb) => (verb.make)(),
@@ -309,6 +319,14 @@ mod tests {
         assert!(cli_waits("fleet"));
         assert!(!cli_waits("disconnect"));
         assert!(!cli_waits("nonsense"));
+    }
+
+    #[test]
+    fn select_parses_an_address_and_waits_for_a_reply() {
+        let address = Address::parse("10:B5:88:96:4D:AE").unwrap();
+        assert_eq!(push(b"select:10:B5:88:96:4D:AE"), Incoming::Ready(Command::Select(address)));
+        assert_eq!(push(b"select:nope"), Incoming::Ready(Command::Unknown));
+        assert!(cli_waits("select:10:B5:88:96:4D:AE"));
     }
 
     #[test]

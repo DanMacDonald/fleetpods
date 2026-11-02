@@ -41,10 +41,22 @@ fn main() {
     } else {
         None
     };
+    let select = if command == "select" {
+        let address = rest.first().and_then(|text| fleetpods::types::Address::parse(text));
+        if rest.len() != 1 || address.is_none() {
+            eprintln!("Usage: {name} select <Bluetooth address>");
+            std::process::exit(1);
+        }
+        address
+    } else {
+        None
+    };
     let command = if command == "fleet" && rest == ["reset"] {
         "fleet-reset".to_string()
     } else if command == "audio" && rest == ["reset"] {
         "audio-reset".to_string()
+    } else if let Some(address) = select {
+        format!("select:{}", address.display())
     } else if rest.is_empty() || remove.is_some() {
         command
     } else {
@@ -137,6 +149,7 @@ Commands:
   ear:both            Pause only when both buds are removed
   ca:on               Request conversation awareness on
   ca:off              Request conversation awareness off
+  select ADDR         Make the named known AirPods pair the selected pair
   connect             Request the local seat
   reconnect-peer      Request the Apple-device reconnect
   activity            Submit fresh desktop activity
