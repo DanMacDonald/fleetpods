@@ -290,6 +290,62 @@ install-time sudo, like every system package):
   one verb, and everything user-facing stays in the existing
   unprivileged daemon.
 
+### Risk assessment: what this opens, and what it does not
+
+The biggest risk of the helper route is that `fleetpods-paird`
+becomes a **Bluetooth impersonation oracle**. It does not receive
+full root: with the sandboxing above it cannot read user files or
+spawn a root shell. But inside Bluetooth's trust domain it is
+root-equivalent — it talks raw HCI and loads link keys. If its D-Bus
+authorization or input validation is wrong, local malware could ask
+it to silently authenticate to a provisioned headset: connection and
+audio access with no pairing mode and no password prompt. A sloppy
+implementation turns a media-daemon bug into silent headset
+impersonation; that, not the protocol, is the main thing the
+marketplace `security-review-required` label will (rightly) probe.
+
+This does not "punch a hole in systemd". systemd socket activation
+is a normal mechanism. What it adds is a new privileged system-bus
+endpoint that exists for as long as the package is installed and the
+socket enabled. That exposure is fully removable: disable
+`fleetpods-paird.socket`, remove the package/unit, and restart
+Bluetooth to clear derived keys from the kernel, and the local
+helper risk is gone.
+
+Two risks outlive removal, and both are about the fleet secrets, not
+the helper:
+
+- The pods keep the provisioned `magicAccKey`/`magicAccHint` until
+  they are overwritten by re-provisioning or factory-reset.
+- Anyone who copies the fleet master material (`MasterKey`/
+  `MasterHint`) can derive access to every provisioned accessory
+  from anywhere. Fleet-master compromise is therefore the
+  longer-lived risk. Revocation means rotating the masters and
+  re-provisioning the pods; there is no per-host revoke.
+
+Mitigations that are requirements, not nice-to-haves:
+
+- Accept calls only from the exact FleetPods daemon UID, verified by
+  D-Bus peer credentials — never "any local user", never broad polkit
+  access.
+- Bind requests to the enrolled/selected accessory; callers must not
+  be able to aim the helper at arbitrary Bluetooth addresses.
+- Socket-activate on demand and exit when idle; no always-running
+  listener beyond the activation socket.
+- Small, memory-safe implementation; strict packet length, state,
+  and timeout checks on everything the pods (or a rogue device
+  impersonating them) send back.
+- Rate-limit derivation attempts and audit every call (accessory,
+  adapter, result) without logging secrets.
+- Fleet master storage, backup, and rotation are first-class product
+  features. A master kept in a casual config file negates the rest
+  of this design.
+
+Net judgment: the helper is an acceptable risk only in the tight
+form above. The capability boundary is narrow, auditable, and
+removable; the fleet master material is the asset whose compromise
+actually hurts, and it exists with or without the helper.
+
 ### Daemon integration (single-accessory phase)
 
 The daemon today tracks exactly one selected accessory
