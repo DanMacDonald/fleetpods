@@ -346,6 +346,68 @@ form above. The capability boundary is narrow, auditable, and
 removable; the fleet master material is the asset whose compromise
 actually hurts, and it exists with or without the helper.
 
+### Rotating the fleet pairing keys
+
+Rotation has to happen in two places. Changing only the hosts does
+nothing: the pods trust the *derived* values provisioned into them,
+so every provisioned accessory must also be re-provisioned.
+
+1. One fleet host generates a new master pair, generation `N+1`,
+   using a CSPRNG.
+2. The new masters are distributed to all enrolled fleet hosts
+   through the existing fleet trust channel, and stored in the
+   Secret Service (where FleetPods already keeps the fleet record —
+   see `src/linux/keyring.rs`) as **staged**. Generation `N` stays
+   active. Master and hint get separate versioned items, e.g.
+   `fleet-pairing-master-key` / `fleet-pairing-master-hint` with a
+   generation stored alongside.
+3. When a provisioned accessory next connects to any fleet host
+   (normal bond, or a link key derived under generation `N`), that
+   host writes the generation-`N+1` derived `accKey`/`hint` with the
+   AACP `0x31` provisioning write.
+4. A *different* fleet host verifies: silent `DeriveAndLoad` under
+   generation `N+1`, BlueZ connect, audio sink up.
+5. Only after that verification do hosts activate generation `N+1`
+   for that accessory. Generation `N` masters are deleted once every
+   provisioned accessory reports migrated, or after an explicit
+   grace period with the leftovers named in the UI.
+
+Per-accessory state the daemon must track: accessory address,
+provisioned master generation, and migration state (`current`,
+`staged`, `provisioned`, `verified`).
+
+Constraints and failure modes:
+
+- **The pods appear to hold one MagicPairing account-key slot.** We
+  have not proven they can trust old and new derived keys at once,
+  so the provisioning write is probably the point of no return for
+  that accessory. That is why step 2 stages the new masters on every
+  host *before* any pod is written: after the write, any fleet host
+  must already be able to derive under `N+1`.
+- **Fleet-member removal must trigger rotation.** A removed host
+  keeps the old masters and can still derive access to any accessory
+  not yet re-provisioned. Until every accessory is migrated, removal
+  is administrative, not cryptographic revocation.
+- **Compromise is the same procedure, urgently.** Any accessory
+  that cannot be reached stays accessible under the compromised
+  masters; there is no remote revoke for pods you cannot connect
+  to. Unreachable accessories are factory-reset or re-provisioned
+  before being trusted again.
+- **Offline hosts converge or fail loudly.** A host that missed the
+  rotation will get MagicPairing Status `2` (Key Not Found) from
+  migrated pods. Treat that as "sync fleet state", never as a cue
+  to retry blindly or to fall back to pairing mode.
+- Session link keys need no rotation machinery: they are derived
+  fresh from per-session randoms (and the ratchet) on every
+  connection.
+
+**Unproven — must be tested on the sacrificial pods before this is
+a product claim:** that a second AACP `0x31` write cleanly
+overwrites the first provisioned account key; that the old derived
+key then fails with Status `2` while the new one succeeds from
+another host; and that an interrupted write cannot leave the pods
+half-provisioned. This rotation test gates productization.
+
 ### Daemon integration (single-accessory phase)
 
 The daemon today tracks exactly one selected accessory
