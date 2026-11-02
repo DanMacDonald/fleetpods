@@ -60,7 +60,7 @@ pub enum Input {
     /// The keyring was locked at start and has opened. `fleet` is `None` when it holds no fleet.
     KeyringUnlocked {
         fleet: Option<Fleet>,
-        keys: Option<crate::fleet::members::AccessoryKeys>,
+        keys: Option<std::collections::BTreeMap<Address, crate::fleet::members::AccessoryKeys>>,
     },
     /// This machine's Bluetooth adapter, from BlueZ rather than a fixed name.
     Controller(Address),
@@ -346,7 +346,19 @@ impl Daemon {
             Input::Paired { address, name } => {
                 let known = self.config.accessory == Some(address);
                 if !known {
-                    if let Some(report) = self.nearby_pods.report_for_pairing(address, now.mono) {
+                    // Keep the outgoing accessory's report: it stays
+                    // tracked while the new one is selected.
+                    if let Some(old) = self.config.accessory {
+                        if old != address {
+                            let report = std::mem::take(&mut self.accessory);
+                            self.tracked.insert(old, report);
+                        }
+                    }
+                    if let Some(report) = self.tracked.remove(&address) {
+                        self.accessory = report;
+                    } else if let Some(report) =
+                        self.nearby_pods.report_for_pairing(address, now.mono)
+                    {
                         self.accessory = report;
                     }
                     self.accessory.pairing_at = None;
@@ -630,12 +642,15 @@ impl Daemon {
                 }
             }
             Observation::Keys { irk, encryption } => {
-                // Every link reports the keys. Rewriting unchanged items on each connection
-                // only makes the keyring replace them, so write only what changed.
+                // Every link reports its own accessory's keys. Rewriting
+                // unchanged items on each connection only makes the keyring
+                // replace them, so write only what changed.
                 let keys = crate::fleet::members::AccessoryKeys { irk, encryption };
-                if self.membership.accessory_keys() != Some(&keys) {
-                    self.set_accessory_keys(keys);
-                    self.queue_accessory_keys();
+                if let Some(address) = self.config.accessory {
+                    if self.membership.accessory_keys(address) != Some(&keys) {
+                        self.set_accessory_keys(address, keys);
+                        self.queue_accessory_keys();
+                    }
                 }
             }
             Observation::PodPeers { peers, owner } => {

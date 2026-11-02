@@ -164,7 +164,9 @@ fn insert_link(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>, connect
     // The legacy bool has no unknown. Internal `None` stays `None` and is projected false.
     status.insert("bluez_connected".into(), json!(connection.bluez() == Some(true)));
     status.insert("ear_reported".into(), json!(snapshot.accessory.ear_reported));
-    status.insert("pairing_keys_ready".into(), json!(snapshot.membership.accessory_keys_ready()));
+    // Legacy flat field: saved keys exist for at least one known
+    // accessory, so setup can be restored after a forget.
+    status.insert("pairing_keys_ready".into(), json!(snapshot.membership.any_accessory_keys()));
     status.insert("bluetooth_paired".into(), json!(snapshot.config.accessory.is_some()));
     status.insert("bluetooth_bonded".into(), json!(snapshot.bluetooth_bonded));
     status.insert("handoff_ready".into(), json!(connected && connection.stage() == Stage::Ready));
@@ -199,6 +201,40 @@ fn insert_settings(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>) {
     status.insert("one_bud_anc_mode".into(), json!(accessory.one_bud.known() == Some(&true)));
     let ear = accessory.ear.known().copied().unwrap_or(snapshot.config.ear);
     status.insert("ear_detection_behavior".into(), json!(ear.wire()));
+}
+
+/// One entry of the status `accessories[]` array: the same telemetry
+/// shape as the flat legacy fields, for one known accessory.
+pub fn accessory_entry(
+    address: crate::types::Address,
+    accessory: &Accessory,
+    selected: bool,
+    keys_ready: bool,
+) -> Value {
+    let mut object = Map::new();
+    object.insert("address".into(), json!(address.display()));
+    object.insert("device_name".into(), json!(accessory.name));
+    object.insert("model_name".into(), json!(accessory.model.display_name()));
+    object.insert("model_int".into(), json!(accessory.model.wire()));
+    object.insert("model_number".into(), json!(accessory.sku));
+    object.insert("selected".into(), json!(selected));
+    object.insert("keys_ready".into(), json!(keys_ready));
+    object.insert("ble_connection_state".into(), json!(accessory.ble_connection.unwrap_or(255)));
+    let live = match &accessory.lid.latest {
+        Evidence::Fresh { value, .. } => value.wire(),
+        _ => 2,
+    };
+    object.insert("lid_state".into(), json!(live));
+    object.insert(
+        "last_known_lid_state".into(),
+        json!(accessory.lid.last_known.map(|state| state.wire()).unwrap_or(2)),
+    );
+    let mut batteries = Map::new();
+    insert_batteries(&mut batteries, accessory);
+    for (key, value) in batteries {
+        object.insert(key, value);
+    }
+    Value::Object(object)
 }
 
 fn insert_batteries(status: &mut Map<String, Value>, accessory: &Accessory) {

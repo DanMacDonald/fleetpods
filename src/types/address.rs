@@ -4,7 +4,7 @@
 use std::fmt;
 
 /// Six-byte Bluetooth address. Display form is uppercase `AA:BB:CC:DD:EE:FF`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Address([u8; 6]);
 
 impl Address {

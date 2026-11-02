@@ -252,9 +252,9 @@ impl Session {
             match input {
                 Input::KeyringStored | Input::KeyringFailed => continue,
                 Input::KeyringUnlocked { keys, .. } => {
-                    if !self.daemon.membership().accessory_keys_ready() {
+                    if !self.daemon.membership().any_accessory_keys() {
                         if let Some(keys) = keys {
-                            self.daemon.set_accessory_keys(keys);
+                            self.daemon.set_accessory_key_map(keys);
                         }
                     }
                     continue;
@@ -541,7 +541,7 @@ impl Drop for Session {
 fn remember_fleet(daemon: &mut Daemon) {
     restore_saved_fleet(daemon, keyring::load());
     if let Some(keys) = load_accessory_keys() {
-        daemon.set_accessory_keys(keys);
+        daemon.set_accessory_key_map(keys);
     }
 }
 
@@ -562,13 +562,28 @@ fn restore_saved_fleet(daemon: &mut Daemon, loaded: Result<Load, String>) {
     }
 }
 
-fn load_accessory_keys() -> Option<crate::fleet::members::AccessoryKeys> {
+fn load_accessory_keys(
+) -> Option<std::collections::BTreeMap<Address, crate::fleet::members::AccessoryKeys>> {
+    if let Some(bytes) = keyring::load_secret(keyring::KEYS_ITEM).ok().flatten() {
+        if let Some(map) = keyring::decode_keys(&bytes) {
+            if !map.is_empty() {
+                return Some(map);
+            }
+        }
+    }
+    // Legacy single-accessory items belong to the configured accessory.
+    let address = configured_accessory()?;
     let irk = keyring::load_secret(keyring::IRK_ITEM).ok().flatten()?;
     let encryption = keyring::load_secret(keyring::ENC_ITEM).ok().flatten()?;
-    Some(crate::fleet::members::AccessoryKeys {
-        irk: irk.as_slice().try_into().ok()?,
-        encryption: encryption.as_slice().try_into().ok()?,
-    })
+    let mut map = std::collections::BTreeMap::new();
+    map.insert(
+        address,
+        crate::fleet::members::AccessoryKeys {
+            irk: irk.as_slice().try_into().ok()?,
+            encryption: encryption.as_slice().try_into().ok()?,
+        },
+    );
+    Some(map)
 }
 
 enum SecretJob {
@@ -2636,7 +2651,9 @@ mod fleet_reset_tests {
             let local = Address::parse("02:00:00:00:00:02").unwrap();
             session.daemon.set_local_address(Some(local));
             let keys = AccessoryKeys { irk: [3; 16], encryption: [4; 16] };
-            session.daemon.set_accessory_keys(keys.clone());
+            session
+                .daemon
+                .set_accessory_keys(Address::parse("02:00:00:00:00:09").unwrap(), keys.clone());
             let old = session.daemon.saved_fleet();
             let thread = std::thread::spawn(move || {
                 let Ok(SecretJob::ResetFleet(reply)) = worker.recv() else {
@@ -2657,7 +2674,13 @@ mod fleet_reset_tests {
                 )
                 .unwrap();
             thread.join().unwrap();
-            assert_eq!(session.daemon.membership.accessory_keys(), Some(&keys));
+            assert_eq!(
+                session
+                    .daemon
+                    .membership
+                    .accessory_keys(Address::parse("02:00:00:00:00:09").unwrap()),
+                Some(&keys)
+            );
             if saved {
                 assert_eq!(reply, "ok\n");
                 assert!(session.daemon.saved_fleet().is_none());
@@ -2687,7 +2710,13 @@ mod fleet_reset_tests {
             reports.send(Input::KeyringStored).unwrap();
             assert!(matches!(worker.recv(), Ok(SecretJob::Reload)));
             reports
-                .send(Input::KeyringUnlocked { fleet: Some(fleet()), keys: Some(keys) })
+                .send(Input::KeyringUnlocked {
+                    fleet: Some(fleet()),
+                    keys: Some(std::collections::BTreeMap::from([(
+                        Address::parse("02:00:00:00:00:09").unwrap(),
+                        keys,
+                    )])),
+                })
                 .unwrap();
             let Ok(SecretJob::ResetFleet(reply)) = worker.recv() else {
                 panic!("expected reset after writes")
@@ -2704,7 +2733,13 @@ mod fleet_reset_tests {
             let reply = session.command(Command::FleetReset, now).unwrap();
             assert!(reply.starts_with("Fleet reset on this machine."));
             assert!(session.daemon.saved_fleet().is_none());
-            assert_eq!(session.daemon.membership().accessory_keys(), Some(&expected_keys));
+            assert_eq!(
+                session
+                    .daemon
+                    .membership()
+                    .accessory_keys(Address::parse("02:00:00:00:00:09").unwrap()),
+                Some(&expected_keys)
+            );
             assert!(session.keyring_retry_at.is_none());
         }
         thread.join().unwrap();
@@ -2753,7 +2788,9 @@ mod fleet_reset_tests {
         let (jobs, worker) = mpsc::channel();
         let mut session = removable_session(inbox, jobs.clone());
         let keys = AccessoryKeys { irk: [3; 16], encryption: [4; 16] };
-        session.daemon.set_accessory_keys(keys.clone());
+        session
+            .daemon
+            .set_accessory_keys(Address::parse("02:00:00:00:00:09").unwrap(), keys.clone());
         let previous = session.daemon.saved_fleet().unwrap();
         let mut expected = previous.clone();
         expected.members.remove(0);
@@ -2771,7 +2808,13 @@ mod fleet_reset_tests {
         let now = Clock::new(100, 100);
         assert!(session.command(remove_peer(), now).unwrap().starts_with("Removed "));
         assert_eq!(session.daemon.saved_fleet(), Some(expected));
-        assert_eq!(session.daemon.membership().accessory_keys(), Some(&keys));
+        assert_eq!(
+            session
+                .daemon
+                .membership()
+                .accessory_keys(Address::parse("02:00:00:00:00:09").unwrap()),
+            Some(&keys)
+        );
         assert!(session.command(remove_peer(), now).unwrap().starts_with("Device is not a member"));
         thread.join().unwrap();
     }

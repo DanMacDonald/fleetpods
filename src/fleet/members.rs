@@ -85,12 +85,14 @@ pub enum Reject {
 
 pub struct Membership {
     store: Store,
-    accessory_keys: Option<AccessoryKeys>,
+    /// Keys per accessory identity address. Each paired set has its own
+    /// IRK/encryption pair; one set's keys must never replace another's.
+    accessory_keys: std::collections::BTreeMap<Address, AccessoryKeys>,
 }
 
 impl Membership {
     pub fn new() -> Self {
-        Self { store: Store::Unloaded, accessory_keys: None }
+        Self { store: Store::Unloaded, accessory_keys: std::collections::BTreeMap::new() }
     }
 
     pub fn store(&self) -> &Store {
@@ -116,16 +118,36 @@ impl Membership {
         }
     }
 
-    pub fn accessory_keys_ready(&self) -> bool {
-        self.accessory_keys.is_some()
+    pub fn accessory_keys_ready(&self, address: Address) -> bool {
+        self.accessory_keys.contains_key(&address)
     }
 
-    pub fn accessory_keys(&self) -> Option<&AccessoryKeys> {
-        self.accessory_keys.as_ref()
+    pub fn any_accessory_keys(&self) -> bool {
+        !self.accessory_keys.is_empty()
     }
 
-    pub fn set_accessory_keys(&mut self, keys: AccessoryKeys) {
-        self.accessory_keys = Some(keys);
+    pub fn accessory_keys(&self, address: Address) -> Option<&AccessoryKeys> {
+        self.accessory_keys.get(&address)
+    }
+
+    pub fn accessory_key_map(&self) -> &std::collections::BTreeMap<Address, AccessoryKeys> {
+        &self.accessory_keys
+    }
+
+    pub fn set_accessory_keys(&mut self, address: Address, keys: AccessoryKeys) {
+        self.accessory_keys.insert(address, keys);
+    }
+
+    /// The accessory whose IRK resolves this advertiser, if any.
+    pub fn accessory_for_advertiser(
+        &self,
+        advertiser: Address,
+        resolves: impl Fn(&[u8; 16], Address) -> bool,
+    ) -> Option<Address> {
+        self.accessory_keys
+            .iter()
+            .find(|(_, keys)| resolves(&keys.irk, advertiser))
+            .map(|(address, _)| *address)
     }
 
     pub fn mark_unavailable(&mut self) {
@@ -285,6 +307,28 @@ mod tests {
         }
         let mut membership = Membership::new();
         assert_eq!(membership.apply(proposal(1, 1, members)).err(), Some(Reject::Oversized));
+    }
+
+    #[test]
+    fn accessory_keys_are_kept_per_accessory() {
+        let mut membership = Membership::new();
+        let first = AccessoryKeys { irk: [1; 16], encryption: [2; 16] };
+        let second = AccessoryKeys { irk: [3; 16], encryption: [4; 16] };
+        membership.set_accessory_keys(addr(1), first.clone());
+        membership.set_accessory_keys(addr(2), second.clone());
+        assert_eq!(membership.accessory_keys(addr(1)), Some(&first));
+        assert_eq!(membership.accessory_keys(addr(2)), Some(&second));
+        assert!(membership.accessory_keys_ready(addr(2)));
+        assert!(!membership.accessory_keys_ready(addr(3)));
+        // Replacing one set leaves the other untouched.
+        let rotated = AccessoryKeys { irk: [9; 16], encryption: [9; 16] };
+        membership.set_accessory_keys(addr(1), rotated.clone());
+        assert_eq!(membership.accessory_keys(addr(1)), Some(&rotated));
+        assert_eq!(membership.accessory_keys(addr(2)), Some(&second));
+        assert_eq!(
+            membership.accessory_for_advertiser(addr(7), |irk, _| *irk == [3; 16]),
+            Some(addr(2))
+        );
     }
 
     #[test]

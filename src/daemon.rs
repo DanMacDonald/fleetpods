@@ -97,6 +97,10 @@ pub struct Daemon {
     pub(crate) bluetooth_bonded: Option<bool>,
     pub(crate) connection: Connection,
     pub(crate) accessory: Accessory,
+    /// Reports for known accessories that are not the selected one.
+    /// They are tracked from advertisements only; connection, lifecycle,
+    /// and seat stay with the selected accessory until Phase B/C.
+    pub(crate) tracked: std::collections::BTreeMap<Address, Accessory>,
     pub(crate) nearby_pods: crate::pods::nearby::Nearby,
     pub(crate) audio: Audio,
     pub(crate) discovery: Discovery,
@@ -314,6 +318,7 @@ impl Daemon {
             bluetooth_bonded: None,
             connection: Connection::new(),
             accessory: Accessory::new(),
+            tracked: std::collections::BTreeMap::new(),
             nearby_pods: crate::pods::nearby::Nearby::default(),
             audio: Audio::new(),
             discovery: Discovery::new(),
@@ -519,6 +524,36 @@ impl Daemon {
         } else {
             0
         });
+        // Every known accessory, selected first in spirit: the selected
+        // entry carries `selected: true`; the flat fields above remain
+        // its legacy projection for existing consumers.
+        let mut accessories = Vec::new();
+        if let Some(address) = self.config.accessory {
+            accessories.push(status::accessory_entry(
+                address,
+                &self.accessory,
+                true,
+                self.membership.accessory_keys_ready(address),
+            ));
+        }
+        for (address, report) in &self.tracked {
+            accessories.push(status::accessory_entry(
+                *address,
+                report,
+                false,
+                self.membership.accessory_keys_ready(*address),
+            ));
+        }
+        // Accessories we hold keys for but have not heard from yet are
+        // still known: they appear with empty telemetry.
+        for address in self.membership.accessory_key_map().keys() {
+            let known =
+                self.config.accessory == Some(*address) || self.tracked.contains_key(address);
+            if !known {
+                accessories.push(status::accessory_entry(*address, &Accessory::new(), false, true));
+            }
+        }
+        value["accessories"] = serde_json::json!(accessories);
         value
     }
 
@@ -808,8 +843,7 @@ impl Daemon {
     }
 
     pub(crate) fn pairing_elsewhere(&self, now: MonoMs) -> bool {
-        self.config.accessory.is_some()
-            && self.membership.accessory_keys_ready()
+        self.config.accessory.is_some_and(|address| self.membership.accessory_keys_ready(address))
             && self.accessory.pairing_at.is_some_and(|at| now.saturating_since(at) < 3_000)
     }
 
@@ -2142,8 +2176,23 @@ impl Daemon {
         self.enrollment.note_confirmed(id)
     }
 
-    pub fn set_accessory_keys(&mut self, keys: AccessoryKeys) {
-        self.membership.set_accessory_keys(keys);
+    pub fn set_accessory_keys(&mut self, address: Address, keys: AccessoryKeys) {
+        self.membership.set_accessory_keys(address, keys);
+    }
+
+    /// Load the whole stored key map (startup / keyring unlock).
+    pub fn set_accessory_key_map(
+        &mut self,
+        keys: std::collections::BTreeMap<Address, AccessoryKeys>,
+    ) {
+        for (address, keys) in keys {
+            self.membership.set_accessory_keys(address, keys);
+        }
+    }
+
+    /// The selected accessory's keys, if it has any.
+    pub(crate) fn selected_keys(&self) -> Option<&AccessoryKeys> {
+        self.config.accessory.and_then(|address| self.membership.accessory_keys(address))
     }
 
     pub fn mark_secrets_unavailable(&mut self) {
@@ -2167,16 +2216,18 @@ impl Daemon {
     }
 
     pub(crate) fn queue_accessory_keys(&mut self) {
-        if let Some(keys) = self.membership.accessory_keys() {
-            let irk = keys.irk.to_vec();
-            let encryption = keys.encryption.to_vec();
-            self.effects.secret_out.push((crate::linux::keyring::IRK_ITEM.into(), irk));
-            self.effects.secret_out.push((crate::linux::keyring::ENC_ITEM.into(), encryption));
+        if self.membership.any_accessory_keys() {
+            let bytes = crate::linux::keyring::encode_keys(self.membership.accessory_key_map());
+            self.effects.secret_out.push((crate::linux::keyring::KEYS_ITEM.into(), bytes));
         }
     }
 
     /// The keyring opened after a locked start: load what it holds, and save keys learned meanwhile.
-    pub(crate) fn keyring_unlocked(&mut self, fleet: Option<Fleet>, keys: Option<AccessoryKeys>) {
+    pub(crate) fn keyring_unlocked(
+        &mut self,
+        fleet: Option<Fleet>,
+        keys: Option<std::collections::BTreeMap<Address, AccessoryKeys>>,
+    ) {
         if !self.keyring_locked {
             return;
         }
@@ -2187,9 +2238,7 @@ impl Daemon {
             self.restore_fleet(fleet);
         }
         match keys {
-            Some(keys) if self.membership.accessory_keys().is_none() => {
-                self.set_accessory_keys(keys)
-            }
+            Some(keys) if !self.membership.any_accessory_keys() => self.set_accessory_key_map(keys),
             Some(_) => {}
             None => self.queue_accessory_keys(),
         }
@@ -2414,27 +2463,55 @@ impl Daemon {
             }
             return;
         }
+        // Which known accessory is speaking? The selected one by its direct
+        // address, or any keyed accessory whose IRK resolves the advertiser,
+        // or a tracked accessory seen at its identity address.
+        let selected = self.config.accessory;
+        let owner = if selected == Some(address) {
+            selected
+        } else if let Some(found) =
+            self.membership.accessory_for_advertiser(address, crate::pods::air::resolves)
+        {
+            Some(found)
+        } else if self.tracked.contains_key(&address) {
+            Some(address)
+        } else {
+            None
+        };
         if crate::pods::air::pairing_model(payload).is_some() {
-            let ours = self.config.accessory == Some(address)
-                || self
-                    .membership
-                    .accessory_keys()
-                    .is_some_and(|keys| crate::pods::air::resolves(&keys.irk, address));
-            if ours && self.membership.accessory_keys_ready() {
-                if !self.pairing_elsewhere(now.mono) {
-                    eprintln!("fleetpodsd: known AirPods entered pairing mode; holding reconnects");
+            match owner {
+                Some(owner) if Some(owner) == selected => {
+                    if self.membership.accessory_keys_ready(owner) {
+                        if !self.pairing_elsewhere(now.mono) {
+                            eprintln!(
+                                "fleetpodsd: known AirPods entered pairing mode; holding reconnects"
+                            );
+                        }
+                        self.accessory.pairing_at = Some(now.mono);
+                        self.enforce_connection_admission(now.mono);
+                    }
                 }
-                self.accessory.pairing_at = Some(now.mono);
-                self.enforce_connection_admission(now.mono);
+                Some(owner) => {
+                    self.tracked.entry(owner).or_default().pairing_at = Some(now.mono);
+                }
+                None => {}
             }
             return;
         }
         let Some(sight) = crate::pods::air::parse(payload) else {
             return;
         };
-        let keys = self.membership.accessory_keys();
+        let Some(owner) = owner else {
+            return;
+        };
+        if Some(owner) != selected {
+            self.track_other(owner, address, &sight, now);
+            return;
+        }
+        let keys = self.selected_keys().cloned();
         let irk_known = keys.is_some();
-        let irk_match = keys.is_some_and(|keys| crate::pods::air::resolves(&keys.irk, address));
+        let irk_match =
+            keys.as_ref().is_some_and(|keys| crate::pods::air::resolves(&keys.irk, address));
         // The placement, lid, and case fields are plaintext. Until the
         // stored IRK can resolve the advertiser, only the configured
         // accessory's own address may speak for it — otherwise any nearby
@@ -2490,7 +2567,7 @@ impl Daemon {
             self.accessory.note_placement(true, right_ear, right_case, now.mono);
             self.note_ears(left_ear, right_ear, now.mono, now.mono);
             if decision.encrypted {
-                if let Some(keys) = self.membership.accessory_keys() {
+                if let Some(keys) = &keys {
                     let plain = crate::pods::air::open_block(&keys.encryption, &sight.encrypted);
                     let levels = crate::pods::air::levels(
                         &plain,
@@ -2517,7 +2594,7 @@ impl Daemon {
                 );
             }
         } else if !link_up && decision.encrypted {
-            if let Some(keys) = self.membership.accessory_keys() {
+            if let Some(keys) = &keys {
                 let plain = crate::pods::air::open_block(&keys.encryption, &sight.encrypted);
                 if let Some(cell) =
                     crate::pods::air::levels(&plain, sight.primary_left, sight.this_in_case, true)
@@ -2536,6 +2613,114 @@ impl Daemon {
         }
         if let Some(state) = sight.lid {
             self.note_lid(state == LidState::Open, now.mono);
+        }
+    }
+
+    /// Track a non-selected known accessory from its advertisements.
+    /// Telemetry only: it must not drive connection, seat, ears policy,
+    /// or fleet state, which stay with the selected accessory.
+    fn track_other(
+        &mut self,
+        owner: Address,
+        advertiser: Address,
+        sight: &crate::pods::air::Frame,
+        now: Clock,
+    ) {
+        let keys = self.membership.accessory_keys(owner).cloned();
+        let irk_match =
+            keys.as_ref().is_some_and(|keys| crate::pods::air::resolves(&keys.irk, advertiser));
+        let report = self.tracked.entry(owner).or_default();
+        let recognized = sight.model != Model::Unknown;
+        let model = if recognized { sight.model } else { report.model };
+        let Some(decision) =
+            crate::pods::air::decide(irk_match, recognized, model.is_headset(), keys.is_some())
+        else {
+            return;
+        };
+        if sight.lid == Some(LidState::Closed) {
+            report.pairing_at = None;
+        }
+        report.note_advertisement(now.mono, sight.connection);
+        if decision.adopt_model {
+            report.note_model(sight.model);
+        }
+        if !model.is_headset() {
+            let mut placements = [(None, None); 2];
+            for right in [false, true] {
+                let prior = if right {
+                    report.right_placement.known().copied()
+                } else {
+                    report.left_placement.known().copied()
+                };
+                placements[usize::from(right)] = placement(sight, right, prior);
+                let (in_ear, in_case) = placements[usize::from(right)];
+                report.note_placement(right, in_ear, in_case, now.mono);
+            }
+            if decision.encrypted {
+                if let Some(keys) = &keys {
+                    let plain = crate::pods::air::open_block(&keys.encryption, &sight.encrypted);
+                    let levels = crate::pods::air::levels(
+                        &plain,
+                        sight.primary_left,
+                        sight.this_in_case,
+                        false,
+                    );
+                    for (right, cell) in [(false, levels.left), (true, levels.right)] {
+                        let (in_ear, in_case) = placements[usize::from(right)];
+                        let prior = if right {
+                            report.right.as_fresh().copied()
+                        } else {
+                            report.left.as_fresh().copied()
+                        };
+                        let battery = match cell {
+                            Some(cell) => crate::types::Battery::new(cell.level, cell.charging),
+                            None => prior.map(|pod| pod.battery),
+                        };
+                        if let Some(battery) = battery {
+                            report.note_pod(
+                                right,
+                                Pod {
+                                    battery,
+                                    in_ear,
+                                    in_case: in_case.or_else(|| {
+                                        cell.filter(|cell| cell.charging && in_ear != Some(true))
+                                            .map(|_| true)
+                                    }),
+                                },
+                                now.mono,
+                            );
+                        }
+                    }
+                    if let Some(cell) = levels.case {
+                        if let Some(battery) = crate::types::Battery::new(cell.level, cell.charging)
+                        {
+                            report.note_case(battery, now.mono);
+                        }
+                    }
+                }
+            }
+        } else if decision.encrypted {
+            if let Some(keys) = &keys {
+                let plain = crate::pods::air::open_block(&keys.encryption, &sight.encrypted);
+                if let Some(cell) =
+                    crate::pods::air::levels(&plain, sight.primary_left, sight.this_in_case, true)
+                        .headset
+                {
+                    if let Some(battery) = crate::types::Battery::new(cell.level, cell.charging) {
+                        report.note_headset(battery, now.mono);
+                    }
+                }
+            }
+        }
+        if decision.case_battery {
+            if let Some(level) = sight.case_level {
+                if let Some(battery) = crate::types::Battery::new(level, sight.case_charging) {
+                    report.note_case(battery, now.mono);
+                }
+            }
+        }
+        if let Some(state) = sight.lid {
+            report.note_lid(state, now.mono);
         }
     }
 
@@ -3570,7 +3755,7 @@ mod tests {
         let stage = daemon.connection.stage();
         let generation = daemon.connection.generation();
         let keys = AccessoryKeys { irk: [1; 16], encryption: [2; 16] };
-        daemon.set_accessory_keys(keys.clone());
+        daemon.set_accessory_keys(addr(3), keys.clone());
         daemon.config.noise = Some(NoiseMode::Anc);
         daemon.output.claim();
         daemon.apple_labels.insert(addr(4), "Phone".into());
@@ -3611,7 +3796,7 @@ mod tests {
         assert_eq!(status["fleet"]["phase"], "idle");
         assert_eq!(status["fleet"]["error"], "");
         assert_eq!(status["pairing_keys_ready"], true);
-        assert_eq!(daemon.membership.accessory_keys(), Some(&keys));
+        assert_eq!(daemon.membership.accessory_keys(addr(3)), Some(&keys));
         assert_eq!(daemon.connection.stage(), stage);
         assert_eq!(daemon.connection.generation(), generation);
         assert_eq!(daemon.config.accessory, Some(addr(3)));
@@ -3679,16 +3864,20 @@ mod tests {
         assert_eq!(seen["last_advertisement_ms"], 1_700_000_000_000_u64);
         assert_eq!(seen["lid_updated_ms"], 1_700_000_000_000_u64);
 
-        daemon.set_accessory_keys(AccessoryKeys { irk: [0x11; 16], encryption: [0x22; 16] });
+        daemon
+            .set_accessory_keys(addr(3), AccessoryKeys { irk: [0x11; 16], encryption: [0x22; 16] });
         daemon.select_accessory(Some(addr(3)));
         daemon.step(Input::Proximity { address: rpa(), payload: captured_case(0x31) }, now);
         assert_eq!(daemon.status_value(now)["lid_state"], 1);
         assert_eq!(daemon.status_value(now)["last_advertisement_ms"], 1_700_000_000_000_u64);
 
-        daemon.set_accessory_keys(AccessoryKeys {
-            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-            encryption: [0x22; 16],
-        });
+        daemon.set_accessory_keys(
+            addr(3),
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
         daemon.step(Input::Proximity { address: rpa(), payload: encrypted_case() }, now);
         let decoded = daemon.status_value(now);
         assert_eq!(decoded["left"]["level"], 83);
@@ -3712,6 +3901,89 @@ mod tests {
     }
 
     #[test]
+    fn a_second_known_accessory_is_tracked_without_touching_the_selected_one() {
+        use crate::step::Input;
+
+        fn rpa_for(irk: &[u8; 16]) -> Address {
+            use aes::cipher::{BlockEncrypt, KeyInit};
+            let prand = [0x40u8, 0x22, 0x33];
+            let mut padded = [0u8; 16];
+            padded[0] = prand[2];
+            padded[1] = prand[1];
+            padded[2] = prand[0];
+            let mut secret = *irk;
+            secret.reverse();
+            let mut block = padded;
+            block.reverse();
+            let cipher = aes::Aes128::new(&secret.into());
+            let mut out = aes::cipher::generic_array::GenericArray::from(block);
+            cipher.encrypt_block(&mut out);
+            let mut hashed: [u8; 16] = out.into();
+            hashed.reverse();
+            Address::new([prand[0], prand[1], prand[2], hashed[2], hashed[1], hashed[0]]).unwrap()
+        }
+
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let first = addr(3);
+        let second = addr(9);
+        daemon.select_accessory(Some(first));
+        daemon.set_accessory_keys(
+            first,
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
+        let second_irk: [u8; 16] = (16u8..32).collect::<Vec<_>>().try_into().unwrap();
+        daemon
+            .set_accessory_keys(second, AccessoryKeys { irk: second_irk, encryption: [0x33; 16] });
+
+        daemon.step(Input::Proximity { address: rpa(), payload: captured_case(0x39) }, now);
+        daemon.step(
+            Input::Proximity { address: rpa_for(&second_irk), payload: captured_case(0x31) },
+            now,
+        );
+
+        let status = daemon.status_value(now);
+        assert_eq!(status["lid_state"], 1, "flat fields stay the selected pair");
+        let accessories = status["accessories"].as_array().unwrap();
+        assert_eq!(accessories.len(), 2);
+        let entry = |address: Address| {
+            accessories
+                .iter()
+                .find(|entry| entry["address"] == address.display())
+                .unwrap_or_else(|| panic!("no status entry for {address}"))
+        };
+        assert_eq!(entry(first)["selected"], true);
+        assert_eq!(entry(first)["lid_state"], 1);
+        assert_eq!(entry(second)["selected"], false);
+        assert_eq!(entry(second)["keys_ready"], true);
+        assert_eq!(entry(second)["lid_state"], 0);
+        assert_eq!(entry(second)["case"]["level"], 10);
+        assert_eq!(entry(second)["left"]["in_case"], true);
+        assert!(daemon.tracked.contains_key(&second));
+
+        // Selecting the second pair keeps the first pair's report tracked.
+        daemon.step(Input::Paired { address: second, name: "AirPods Pro".into() }, now);
+        assert_eq!(daemon.config.accessory, Some(second));
+        assert!(daemon.tracked.contains_key(&first));
+        let status = daemon.status_value(now);
+        let accessories = status["accessories"].as_array().unwrap();
+        assert_eq!(accessories.len(), 2);
+        let entry = |address: Address| {
+            accessories
+                .iter()
+                .find(|entry| entry["address"] == address.display())
+                .unwrap_or_else(|| panic!("no status entry for {address}"))
+        };
+        assert_eq!(entry(second)["selected"], true);
+        assert_eq!(entry(second)["lid_state"], 0);
+        assert_eq!(entry(first)["selected"], false);
+        assert_eq!(entry(first)["lid_state"], 1);
+    }
+
+    #[test]
     fn disconnected_advertisements_replace_old_control_placement() {
         use crate::step::{Effect, Input};
 
@@ -3722,10 +3994,13 @@ mod tests {
                 let mut daemon = Daemon::new(name);
                 let now = clock();
                 ready_link(&mut daemon, now);
-                daemon.set_accessory_keys(AccessoryKeys {
-                    irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-                    encryption: [0x22; 16],
-                });
+                daemon.set_accessory_keys(
+                    addr(3),
+                    AccessoryKeys {
+                        irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                        encryption: [0x22; 16],
+                    },
+                );
                 for right in [false, true] {
                     let docked = previously_docked[usize::from(right)];
                     daemon.note_pod(
@@ -3787,10 +4062,13 @@ mod tests {
         let mut daemon = Daemon::new("xps");
         let now = clock();
         ready_link(&mut daemon, now);
-        daemon.set_accessory_keys(AccessoryKeys {
-            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-            encryption: [0x22; 16],
-        });
+        daemon.set_accessory_keys(
+            addr(3),
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
         let generation = daemon.connection.generation();
         daemon.step(Input::ControlSocket { up: false, generation }, now);
         daemon.step(Input::Bluez(false), now);
@@ -3825,10 +4103,13 @@ mod tests {
         let mut daemon = Daemon::new("xps");
         let now = clock();
         ready_link(&mut daemon, now);
-        daemon.set_accessory_keys(AccessoryKeys {
-            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-            encryption: [0x22; 16],
-        });
+        daemon.set_accessory_keys(
+            addr(3),
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
         let generation = daemon.connection.generation();
         daemon.step(Input::ControlSocket { up: false, generation }, now);
         daemon.step(Input::Bluez(false), now);
@@ -3862,10 +4143,13 @@ mod tests {
         let mut daemon = Daemon::new("xps");
         let now = clock();
         ready_link(&mut daemon, now);
-        daemon.set_accessory_keys(AccessoryKeys {
-            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-            encryption: [0x22; 16],
-        });
+        daemon.set_accessory_keys(
+            addr(3),
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
         for right in [false, true] {
             daemon.note_pod(
                 right,
@@ -4031,7 +4315,7 @@ mod tests {
         daemon.hear_proximity(rpa(), &frame, Clock::new(4300, 4300));
         daemon.connection.note_bluez(true);
         assert_eq!(daemon.status_value(Clock::new(4300, 4300))["pairing_mode"], false);
-        daemon.set_accessory_keys(AccessoryKeys { irk: [1; 16], encryption: [2; 16] });
+        daemon.set_accessory_keys(addr(3), AccessoryKeys { irk: [1; 16], encryption: [2; 16] });
         daemon.hear_proximity(rpa(), &frame, Clock::new(4400, 4400));
         assert_eq!(daemon.status_value(Clock::new(4400, 4400))["pairing_mode"], false);
     }
@@ -4044,10 +4328,13 @@ mod tests {
             let mut daemon = Daemon::new("gram");
             let pods = addr(9);
             daemon.select_accessory(Some(pods));
-            daemon.set_accessory_keys(AccessoryKeys {
-                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-                encryption: [0x22; 16],
-            });
+            daemon.set_accessory_keys(
+                addr(9),
+                AccessoryKeys {
+                    irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                    encryption: [0x22; 16],
+                },
+            );
             daemon.connection.prepare();
             daemon.step(
                 Input::Proximity { address: rpa(), payload: captured_case(0x31) },
@@ -4112,10 +4399,13 @@ mod tests {
         pairing[2] = 7;
         let mut daemon = Daemon::new("gram");
         ready_link(&mut daemon, at);
-        daemon.set_accessory_keys(AccessoryKeys {
-            irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-            encryption: [0x22; 16],
-        });
+        daemon.set_accessory_keys(
+            addr(3),
+            AccessoryKeys {
+                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                encryption: [0x22; 16],
+            },
+        );
         daemon.step(Input::Proximity { address: addr(8), payload: pairing.clone() }, at);
         assert!(!daemon.pairing_elsewhere(at.mono), "another pair of the same model is unrelated");
         for address in [addr(3), rpa()] {
@@ -4244,14 +4534,14 @@ mod tests {
         let generation = daemon.connection().generation();
         let first =
             daemon.step(Input::Accessory { generation, packet: key_packet(0x11, 0x22) }, now);
-        assert_eq!(secret_writes(&first.effects), 2);
+        assert_eq!(secret_writes(&first.effects), 1, "one key-map item holds every accessory");
         // Every connection reports the keys; the keyring is not asked to replace the same items.
         let again =
             daemon.step(Input::Accessory { generation, packet: key_packet(0x11, 0x22) }, now);
         assert_eq!(secret_writes(&again.effects), 0);
         let changed =
             daemon.step(Input::Accessory { generation, packet: key_packet(0x33, 0x22) }, now);
-        assert_eq!(secret_writes(&changed.effects), 2);
+        assert_eq!(secret_writes(&changed.effects), 1);
     }
 
     #[test]
@@ -4282,7 +4572,7 @@ mod tests {
             daemon.step(Input::KeyringUnlocked { fleet: Some(fleet.clone()), keys: None }, now);
         assert!(!daemon.keyring_locked());
         assert_eq!(daemon.saved_fleet(), Some(fleet.clone()));
-        assert_eq!(secret_writes(&opened.effects), 2, "keys learned while locked are saved");
+        assert_eq!(secret_writes(&opened.effects), 1, "keys learned while locked are saved");
         // A late duplicate does nothing.
         let late = daemon.step(Input::KeyringUnlocked { fleet: Some(fleet), keys: None }, now);
         assert_eq!(secret_writes(&late.effects), 0);
@@ -4634,7 +4924,7 @@ mod tests {
             let now = Clock::new(1000, 1000);
             let pods = addr(3);
             let keys = AccessoryKeys { irk: [0x11; 16], encryption: [0x22; 16] };
-            daemon.set_accessory_keys(keys.clone());
+            daemon.set_accessory_keys(pods, keys.clone());
             if established {
                 ready_link(&mut daemon, now);
             } else {
@@ -4651,7 +4941,7 @@ mod tests {
             assert_eq!(daemon.config.accessory, Some(pods));
             let forgotten = daemon.step(Input::Unpaired { address: pods }, now);
             assert_eq!(daemon.config.accessory, None);
-            assert_eq!(daemon.membership.accessory_keys(), Some(&keys));
+            assert_eq!(daemon.membership.accessory_keys(pods), Some(&keys));
             assert!(!forgotten.effects.iter().any(|effect| matches!(
                 effect,
                 Effect::OpenLink { .. } | Effect::RemoveDevice { .. } | Effect::WriteSecret { .. }
@@ -6241,10 +6531,13 @@ mod tests {
             let mut daemon = Daemon::new("gram");
             let now = clock();
             daemon.select_accessory(Some(addr(9)));
-            daemon.set_accessory_keys(AccessoryKeys {
-                irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
-                encryption: [0x22; 16],
-            });
+            daemon.set_accessory_keys(
+                addr(9),
+                AccessoryKeys {
+                    irk: (0u8..16).collect::<Vec<_>>().try_into().unwrap(),
+                    encryption: [0x22; 16],
+                },
+            );
             daemon.step(Input::Command(Command::Activity), now);
             let mut open = encrypted_case();
             open[8] = 0;

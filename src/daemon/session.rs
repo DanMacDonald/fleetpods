@@ -188,6 +188,9 @@ impl Daemon {
             }
         }
         self.accessory.expire(now.mono, self.connection.stage() == Stage::Ready);
+        for report in self.tracked.values_mut() {
+            report.expire(now.mono, false);
+        }
         self.discovery.expire(now.unix);
         self.enrollment.on_tick(now.mono);
         self.advance_deferred_claim(now);

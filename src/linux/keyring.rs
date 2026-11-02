@@ -18,6 +18,9 @@ use crate::types::{Address, FleetId};
 const ITEM: &str = "fleet-v1";
 pub const IRK_ITEM: &str = "magic-acc-irk";
 pub const ENC_ITEM: &str = "magic-acc-enc-key";
+/// All accessories' keys in one item: address -> {irk, enc}, base64 values.
+/// The legacy single-accessory items above are read once for migration.
+pub const KEYS_ITEM: &str = "magic-acc-keys-v2";
 
 pub enum Load {
     Missing,
@@ -59,6 +62,42 @@ pub fn decode(bytes: &[u8]) -> Option<Fleet> {
         });
     }
     Some(Fleet { id, key: GroupKey::new(key), members })
+}
+
+pub fn encode_keys(
+    keys: &std::collections::BTreeMap<Address, crate::fleet::members::AccessoryKeys>,
+) -> Vec<u8> {
+    let entries: Vec<_> = keys
+        .iter()
+        .map(|(address, keys)| {
+            json!({
+                "address": address.display(),
+                "irk": base64_encode(&keys.irk),
+                "enc": base64_encode(&keys.encryption),
+            })
+        })
+        .collect();
+    serde_json::to_vec(&json!({ "keys": entries })).unwrap_or_default()
+}
+
+pub fn decode_keys(
+    bytes: &[u8],
+) -> Option<std::collections::BTreeMap<Address, crate::fleet::members::AccessoryKeys>> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let mut out = std::collections::BTreeMap::new();
+    for entry in value.get("keys")?.as_array()? {
+        let address = Address::parse(entry.get("address")?.as_str()?)?;
+        let irk = base64_decode(entry.get("irk")?.as_str()?)?;
+        let encryption = base64_decode(entry.get("enc")?.as_str()?)?;
+        out.insert(
+            address,
+            crate::fleet::members::AccessoryKeys {
+                irk: irk.as_slice().try_into().ok()?,
+                encryption: encryption.as_slice().try_into().ok()?,
+            },
+        );
+    }
+    Some(out)
 }
 
 type Secret = (Path<'static>, Vec<u8>, Vec<u8>, String);
@@ -291,10 +330,26 @@ mod tests {
         assert_eq!(fleet.get("application").map(String::as_str), Some(KEYRING_APP));
         assert_eq!(fleet.get("name").map(String::as_str), Some("fleet-v1"));
         assert_eq!(fleet.get("xdg:schema").map(String::as_str), Some(KEYRING_SCHEMA));
-        for name in [IRK_ITEM, ENC_ITEM] {
+        for name in [IRK_ITEM, ENC_ITEM, KEYS_ITEM] {
             let keys = attributes(name);
             assert!(!fleet.iter().all(|(key, value)| keys.get(key) == Some(value)));
         }
+    }
+
+    #[test]
+    fn accessory_keys_round_trip_per_address() {
+        let mut keys = std::collections::BTreeMap::new();
+        keys.insert(
+            Address::parse("10:B5:88:96:4D:AE").unwrap(),
+            crate::fleet::members::AccessoryKeys { irk: [1; 16], encryption: [2; 16] },
+        );
+        keys.insert(
+            Address::parse("CC:22:FE:54:DF:C7").unwrap(),
+            crate::fleet::members::AccessoryKeys { irk: [3; 16], encryption: [4; 16] },
+        );
+        assert_eq!(decode_keys(&encode_keys(&keys)), Some(keys));
+        assert!(decode_keys(b"{\"keys\":[]}").is_some_and(|map| map.is_empty()));
+        assert!(decode_keys(b"not json").is_none());
     }
 
     #[test]
