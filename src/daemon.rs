@@ -8721,6 +8721,71 @@ mod tests {
     }
 
     #[test]
+    fn a_stem_toggle_on_a_yielded_device_is_repaused_but_a_desktop_press_takes_over() {
+        use crate::step::{Effect, Input};
+        let local = addr(2);
+        let gram = addr(4);
+        let mut source = vec![4, 0, 4, 0, 0x0e, 0];
+        source.extend(gram.bytes().into_iter().rev());
+        source.push(2);
+        for desktop_press in [false, true] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_local_address(Some(local));
+            ready_link(&mut daemon, now);
+            let generation = daemon.connection.generation();
+            let service = "org.mpris.MediaPlayer2.brave";
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.note_pod_peers(vec![local, gram], now.unix);
+            daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+            assert!(daemon.output.wants_output());
+            daemon.step(Input::Accessory { generation, packet: source.clone() }, at(1));
+            let yielded = daemon.step(Input::Tick, at(301));
+            assert!(yielded.effects.iter().any(|effect| matches!(
+                effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+            )));
+            assert!(!daemon.output.wants_output());
+
+            // Long past the rebound window, a stem click toggles this
+            // laptop's paused player back to Playing. With no desktop
+            // input it is the pods' pause/resume key talking, not a
+            // takeover press: stay paused, twice in a row.
+            if desktop_press {
+                daemon.step(Input::Command(Command::Activity), at(60_000));
+            }
+            for toggle in 0..2 {
+                daemon.step(
+                    Input::Player { service: service.into(), playing: Some(false) },
+                    at(60_000 + toggle * 1_000),
+                );
+                let replayed = daemon.step(
+                    Input::Player { service: service.into(), playing: Some(true) },
+                    at(60_500 + toggle * 1_000),
+                );
+                if desktop_press {
+                    assert!(
+                        !replayed
+                            .effects
+                            .iter()
+                            .any(|effect| matches!(effect, Effect::PausePlayers(_))),
+                        "a desktop press is a takeover, not a stem toggle"
+                    );
+                    assert!(daemon.output.wants_output());
+                    break;
+                }
+                assert!(
+                    replayed.effects.iter().any(|effect| matches!(
+                        effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+                    )),
+                    "stem toggle {toggle} on a yielded device must be re-paused"
+                );
+                assert!(!daemon.output.wants_output(), "a stem toggle must not claim");
+            }
+        }
+    }
+
+    #[test]
     fn an_admission_for_a_peer_not_yet_on_the_pods_steps_the_holder_back() {
         use crate::fleet::members::{Fleet, Member};
         use crate::fleet::route_air::{Kind, Message};

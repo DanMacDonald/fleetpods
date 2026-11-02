@@ -37,6 +37,9 @@ pub(super) struct Session {
     pub(super) intent_until: Option<MonoMs>,
     /// Players paused by that speculative step-back.
     intent_paused: Vec<String>,
+    /// Players the last yield paused. Only these can be stem-toggled
+    /// back by the pods; a player that starts fresh is a local press.
+    yield_paused: Vec<String>,
     /// When the control link last became ready.
     link_ready_at: Option<MonoMs>,
 
@@ -972,11 +975,13 @@ impl Daemon {
         let players = std::mem::take(&mut self.session.intent_paused);
         if !players.is_empty() {
             eprintln!("fleetpodsd: fleet intent expired without a claim; resuming local players");
+            self.session.resumed_players.clone_from(&players);
             effects.push(Effect::ResumePlayers(players));
         }
     }
 
     pub(crate) fn step_back(&mut self, now: Clock) {
+        self.session.yield_pause_at = Some(now.mono);
         self.session.rejoin = None;
         self.session.background_requested = false;
         self.session.deferred_playback_claim = None;
@@ -1006,6 +1011,7 @@ impl Daemon {
         };
         let players = self.audio.yield_playback();
         if pause && !players.is_empty() {
+            self.session.yield_paused.clone_from(&players);
             self.effects.pause_players = players;
         }
     }
@@ -1517,6 +1523,10 @@ impl Daemon {
                 .map(|at| self.session.resumed_players.remove(at))
                 .is_some();
         if self.audio.update_player(&service, playing) && !resumed {
+            if self.stem_toggle_repause(&service) {
+                self.effects.announce_dirty = true;
+                return;
+            }
             if self.rebound_repause(&service, now) {
                 self.effects.announce_dirty = true;
                 return;
@@ -1527,6 +1537,32 @@ impl Daemon {
             self.effects.announce_dirty = true;
         }
     }
+    /// A stem click on the pods toggles the players of every laptop the
+    /// pods are connected to. On a laptop that yielded, the toggle is the
+    /// active device's pause/resume key, not a takeover press: with no
+    /// desktop input since the yield, keep the player paused and stay
+    /// out of the claim. Desktop input (a click, or space over the
+    /// media) after the yield is a real press and takes over normally.
+    fn stem_toggle_repause(&mut self, service: &str) -> bool {
+        let Some(yielded_at) = self.session.yield_pause_at else {
+            return false;
+        };
+        if !self.session.yield_paused.iter().any(|name| name == service) {
+            return false;
+        }
+        if self.accessory.ownership.as_fresh() == Some(&true) {
+            return false;
+        }
+        if self.session.last_input_at.is_some_and(|at| at > yielded_at) {
+            return false;
+        }
+        eprintln!(
+            "fleetpodsd: player {service:?} toggled by the pods while yielded; keeping it paused"
+        );
+        self.effects.pause_players.push(service.to_string());
+        true
+    }
+
     /// A player paused for a yield that reports Playing again within the
     /// rebound window, while the remote owner is playing, resumed by
     /// itself (an output-device change looks like an ended interruption),
