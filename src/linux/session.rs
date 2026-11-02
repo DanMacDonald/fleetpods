@@ -757,6 +757,7 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         let polled_socket = live.link.identity();
         let (dbus_ready, socket_ready) = wait(&wake, &bus, &live.link, timeout);
         expire_calls(&bus, &reports, &mut live);
+        expire_connect(&reports, &mut live);
         let mut stop = false;
         while let Ok(job) = jobs.try_recv() {
             if !handle_job(&bus, &reports, &mut configured, &mut live, job) {
@@ -1147,6 +1148,10 @@ impl Air {
 fn poll_timeout(live: &Live) -> i32 {
     let now = Instant::now();
     let mut timeout = (!live.calls.is_empty()).then_some(1_000);
+    if live.link.connecting() {
+        // Wake at least once a second so a hung connect meets its deadline.
+        timeout = Some(timeout.map_or(1_000, |current| current.min(1_000)));
+    }
     if live.air.want_scan && !live.air.reset_blocks_scan() {
         // A running scan is rechecked; see verify_scan. A scan that needs
         // a new session is retried on the one-second poll.
@@ -1587,6 +1592,21 @@ fn report_advertisement(
     }
 }
 
+/// BlueZ reports a profile held by the peer's other connection (the pods
+/// keep two) as a generic failure whose message is `br-connection-busy`;
+/// that is a retryable busy, not a failed profile.
+fn profile_reply(result: &CallResult, failed: bool) -> TransportReply {
+    match result {
+        CallResult::Failed { name, message }
+            if name.ends_with("InProgress") || message.contains("br-connection-busy") =>
+        {
+            TransportReply::Busy
+        }
+        _ if failed => TransportReply::Failed,
+        _ => TransportReply::Connected,
+    }
+}
+
 fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, result: CallResult) {
     let Some(index) = live.calls.iter().position(|call| call.serial == serial) else {
         return;
@@ -1718,13 +1738,7 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
             if let Some(err) = &failed {
                 eprintln!("fleetpodsd: bluetooth call failed: {err}");
             }
-            let reply = match &result {
-                CallResult::Failed { name, .. } if name.ends_with("InProgress") => {
-                    TransportReply::Busy
-                }
-                _ if failed.is_some() => TransportReply::Failed,
-                _ => TransportReply::Connected,
-            };
+            let reply = profile_reply(&result, failed.is_some());
             let _ = reports.send(Input::TransportReply { id, reply });
         }
         CallKind::Handsfree { id } => {
@@ -1751,6 +1765,17 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
             }
             settle_controller_reset(reports, live, up, ok);
         }
+    }
+}
+
+/// Abandon a connect that passed its deadline, exactly like a socket
+/// error: the daemon's retry loop starts the next attempt sooner than
+/// the kernel's page timeout would.
+fn expire_connect(reports: &Sender<Input>, live: &mut Live) {
+    if live.link.connect_expired(Instant::now()) {
+        eprintln!("fleetpodsd: control socket connect timed out; retrying");
+        drop_socket(live, reports);
+        let _ = reports.send(Input::LinkFailed { generation: live.generation, busy: false });
     }
 }
 
@@ -3547,6 +3572,37 @@ mod advertisement_tests {
         assert_eq!(props["Type"].0.as_str(), Some("broadcast"));
         let services = props["ServiceData"].0.as_iter().unwrap().collect::<Vec<_>>();
         assert!(!services.is_empty());
+    }
+
+    #[test]
+    fn a_connect_past_its_deadline_is_expired() {
+        let now = Instant::now();
+        let fresh = ControlLink::connecting_for_test(now - Duration::from_secs(7));
+        assert!(!fresh.connect_expired(now), "a young connect is still in flight");
+        let stale = ControlLink::connecting_for_test(now - Duration::from_secs(9));
+        assert!(stale.connect_expired(now), "a hung connect past 8s is given up");
+        let idle = ControlLink::new();
+        assert!(!idle.connect_expired(now), "no connect in flight, nothing expires");
+    }
+
+    #[test]
+    fn a_busy_profile_reply_is_retried_not_failed() {
+        let busy = CallResult::Failed {
+            name: "org.bluez.Error.Failed".into(),
+            message: "br-connection-busy".into(),
+        };
+        assert_eq!(profile_reply(&busy, true), TransportReply::Busy);
+        let in_progress = CallResult::Failed {
+            name: "org.bluez.Error.InProgress".into(),
+            message: String::new(),
+        };
+        assert_eq!(profile_reply(&in_progress, false), TransportReply::Busy);
+        let failed = CallResult::Failed {
+            name: "org.bluez.Error.Failed".into(),
+            message: "br-connection-profile-unavailable".into(),
+        };
+        assert_eq!(profile_reply(&failed, true), TransportReply::Failed);
+        assert_eq!(profile_reply(&CallResult::Done, false), TransportReply::Connected);
     }
 
     #[test]

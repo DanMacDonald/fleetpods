@@ -45,6 +45,7 @@ pub struct RosterReport {
     pub audio_source: Option<Address>,
     pub pending: bool,
     pub audio_idle: bool,
+    pub intent: bool,
     /// Air session, when this report came from a roster advertisement.
     pub wire_session: Option<[u8; 16]>,
     pub last_use: UnixMs,
@@ -288,6 +289,7 @@ mod tests {
             audio_source: None,
             pending: false,
             audio_idle: true,
+            intent: false,
             wire_session: None,
             last_use: UnixMs(0),
         }

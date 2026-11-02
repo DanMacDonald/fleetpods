@@ -373,6 +373,7 @@ mod tests {
             audio_source: source,
             pending: false,
             audio_idle: idle,
+            intent: false,
             wire_session: None,
             last_use: UnixMs(0),
         }

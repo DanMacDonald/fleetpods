@@ -267,6 +267,7 @@ struct PlannedRoster {
     audio_source: Option<Address>,
     pending: bool,
     audio_idle: bool,
+    intent: bool,
     air: crate::fleet::roster_air::Snapshot,
 }
 
@@ -468,6 +469,12 @@ impl Daemon {
             None => {}
         }
         self.accessory.pairing_at = None;
+        // The switch gesture supersedes holds earned against the previous
+        // pair and slot: the newly selected pair may pre-connect right
+        // away instead of waiting out the old pair's holds.
+        self.slot_hold_until = None;
+        self.reopen_wait = false;
+        self.reopen_hold_until = None;
         self.select_accessory(Some(address));
     }
 
@@ -1088,6 +1095,7 @@ impl Daemon {
             audio_source: snapshot.audio_source,
             pending: snapshot.pending,
             audio_idle: snapshot.audio_idle,
+            intent: snapshot.intent,
         };
         let assessment =
             self.roster_air.assess(&mark, now.mono, crate::fleet::presence::REFRESH_MS);
@@ -1117,7 +1125,11 @@ impl Daemon {
                 }
                 if changed && self.roster_air.has_mark() {
                     self.roster_change_queued = Some(now.mono);
-                    self.outbound.offer_roster_change(frame);
+                    if snapshot.intent {
+                        self.outbound.offer_roster_intent(frame);
+                    } else {
+                        self.outbound.offer_roster_change(frame);
+                    }
                 } else {
                     self.outbound.offer_roster(frame);
                 }
@@ -1150,6 +1162,10 @@ impl Daemon {
             }
         }
         let last_use = UnixMs(self.local_use.unwrap_or(UnixMs(0)).0.min(now.unix.0));
+        // Intent airs while this laptop wants the accessory's audio and the
+        // pods have not granted it: the current owner may step back before
+        // the claim itself can arrive on a control link.
+        let intent = self.roster_intent(now) && audio_source != Some(reporter);
         Some(PlannedRoster {
             fleet,
             session,
@@ -1158,6 +1174,7 @@ impl Daemon {
             audio_source,
             pending: false,
             audio_idle,
+            intent,
             air: crate::fleet::roster_air::Snapshot {
                 reporter,
                 session,
@@ -1169,6 +1186,7 @@ impl Daemon {
                 last_use,
                 pending: false,
                 audio_idle,
+                intent,
             },
         })
     }
@@ -1217,6 +1235,7 @@ impl Daemon {
                 audio_source: snapshot.audio_source,
                 pending: snapshot.pending,
                 audio_idle: snapshot.audio_idle,
+                intent: snapshot.intent,
                 wire_session: Some(snapshot.session),
                 last_use: snapshot.last_use,
             },
@@ -1245,6 +1264,12 @@ impl Daemon {
                 self.peers_seated.retain(|peer| *peer != snapshot.reporter);
             }
             self.probe_roster_conflict(snapshot.reporter, &remembered, snapshot.pending, now);
+            // Only a stored report acts: the ingest watermark has already
+            // dropped verbatim replays and stale sessions, so an intent
+            // frame cannot step this laptop back twice.
+            if snapshot.intent {
+                self.note_fleet_intent(snapshot.reporter, "fleet intent", now);
+            }
         }
         if outcome != Ingest::Replay {
             self.roster_dirty = true;
@@ -1979,6 +2004,16 @@ impl Daemon {
                 }
             }
         }
+        if take
+            && retain == self.local_address
+            && self.pod_peers_known
+            && !self.pod_peers.contains(&message.source)
+        {
+            // The requester still has to page the pods before it can
+            // claim. Free their radio by stepping back now; streaming on
+            // until the pods' grant would keep the page from landing.
+            self.note_fleet_intent(message.source, "fleet seat request", now);
+        }
         if self.reply_admission(&message, answer, retain, now) {
             self.remember_route(&message);
         }
@@ -2478,6 +2513,7 @@ impl Daemon {
             audio_source,
             pending: false,
             audio_idle,
+            intent: self.roster_intent(now),
             wire_session: None,
             last_use: UnixMs(0),
         })
@@ -4160,6 +4196,26 @@ mod tests {
     }
 
     #[test]
+    fn switching_pairs_releases_the_slot_and_reopen_holds() {
+        use crate::step::Input;
+        let (mut daemon, first, second, second_irk) = two_pair_daemon();
+        let now = clock();
+        daemon.step(Input::Proximity { address: rpa(), payload: captured_case(0x39) }, now);
+        assert_eq!(daemon.config.accessory, Some(first));
+        // A yielded slot and a pending owner-reconnect hold are in force.
+        daemon.slot_hold_until = Some(now.mono.saturating_add(60_000));
+        daemon.reopen_wait = true;
+        daemon.reopen_hold_until = Some(now.mono.saturating_add(60_000));
+        // Putting the tracked pair in is the switch gesture: the holds were
+        // earned against the previous pair and must not delay this one.
+        daemon.step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
+        assert_eq!(daemon.config.accessory, Some(second));
+        assert_eq!(daemon.slot_hold_until, None, "the switch supersedes the slot hold");
+        assert!(!daemon.reopen_wait, "the switch supersedes the reopen hold");
+        assert_eq!(daemon.reopen_hold_until, None);
+    }
+
+    #[test]
     fn a_reported_paired_accessory_is_named_and_selectable() {
         use crate::step::Input;
         let (mut daemon, first, second, _irk) = two_pair_daemon();
@@ -4201,6 +4257,29 @@ mod tests {
             later.mono,
         );
         daemon.claim_playback(later);
+        assert_eq!(daemon.config.accessory, Some(second));
+    }
+
+    #[test]
+    fn a_dropped_link_clears_the_transport_so_play_can_promote_the_worn_pair() {
+        use crate::step::Input;
+        let (mut daemon, first, second, second_irk) = two_pair_daemon();
+        let now = clock();
+        // Selected pair docked but still streaming to its sink: a worn
+        // tracked pair can promote neither on wear nor on play.
+        daemon.step(Input::Proximity { address: rpa(), payload: captured_case(0x39) }, now);
+        daemon.audio.set_local_playing_for_test(true);
+        daemon.step(Input::Transport { active: true }, now);
+        daemon.step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
+        assert_eq!(daemon.config.accessory, Some(first));
+        daemon.claim_playback(now);
+        assert_eq!(daemon.config.accessory, Some(first), "in use: no promotion");
+
+        // The selected pair's link drops. Its transport is gone with it;
+        // a stale active flag must not keep the promotion gate shut.
+        daemon.step(Input::Bluez(false), now);
+        assert!(!daemon.transport_active, "no link, no active transport");
+        daemon.claim_playback(now);
         assert_eq!(daemon.config.accessory, Some(second));
     }
 
@@ -5552,6 +5631,7 @@ mod tests {
             }
             assert_eq!(daemon.slot_hold_until, Some(until));
             assert_eq!(daemon.connection.generation(), generation);
+            // (The rebuild-on-silence count is asserted inside the grant arm above.)
         }
         let settled = Clock::new(until.0, now.unix.0 + DISPLACEMENT_HOLD_MS);
         let outcome = daemon.step(Input::Command(Command::Activity), settled);
@@ -5673,6 +5753,7 @@ mod tests {
                     last_use: UnixMs(0),
                     pending: false,
                     audio_idle: false,
+                    intent: false,
                 },
                 now,
             );
@@ -5758,6 +5839,7 @@ mod tests {
             last_use: UnixMs(0),
             pending: false,
             audio_idle: true,
+            intent: false,
         };
         let expected = serde_json::json!([xps.display(), gram.display()]);
 
@@ -5833,6 +5915,7 @@ mod tests {
                 last_use: UnixMs(0),
                 pending: false,
                 audio_idle: true,
+                intent: false,
             },
             now,
         );
@@ -5855,6 +5938,7 @@ mod tests {
                 last_use: UnixMs(0),
                 pending: false,
                 audio_idle: true,
+                intent: false,
             },
             Clock::new(now.mono.0 + 1_000, now.unix.0 + 1_000),
         );
@@ -5953,6 +6037,7 @@ mod tests {
                     last_use: now.unix,
                     pending: false,
                     audio_idle: !phone_playing,
+                    intent: false,
                 },
                 now,
             );
@@ -5980,6 +6065,7 @@ mod tests {
             last_use: at.unix,
             pending: false,
             audio_idle: false,
+            intent: false,
         }
     }
 
@@ -6105,6 +6191,7 @@ mod tests {
             last_use: UnixMs(0),
             pending: false,
             audio_idle: true,
+            intent: false,
         };
         daemon.hear_roster(report(1, vec![gram]), now);
         daemon.peers_seated.push(gram);
@@ -6162,6 +6249,7 @@ mod tests {
             audio_source: Some(addr(4)),
             pending: false,
             audio_idle: false,
+            intent: false,
             wire_session: None,
             last_use: UnixMs(0),
         });
@@ -6558,6 +6646,7 @@ mod tests {
                     audio_source: None,
                     pending: false,
                     audio_idle: false,
+                    intent: false,
                     wire_session: Some([4; 16]),
                     last_use: UnixMs(0),
                 });
@@ -7661,6 +7750,7 @@ mod tests {
             assert_eq!(daemon.routing.phase(), Phase::Idle);
             assert_eq!(daemon.routing.intent(), crate::fleet::route::Intent::Release);
             assert_eq!(daemon.connection.generation(), generation);
+            // (The rebuild-on-silence count is asserted inside the grant arm above.)
             assert!(!daemon.output.wants_output());
         }
     }
@@ -7882,6 +7972,137 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_report_during_setup_settle_is_decided_when_the_window_closes() {
+        use crate::audio::play::PlayerSeen;
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let paused =
+            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::PausePlayers(_)));
+        let resumed =
+            |effects: &[Effect]| effects.iter().any(|e| matches!(e, Effect::ResumePlayers(_)));
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.select_accessory(Some(addr(3)));
+        daemon.audio.startup_players(&[PlayerSeen {
+            service: "org.mpris.MediaPlayer2.brave".into(),
+            playing: false,
+        }]);
+        daemon.step(Input::Command(Command::Connect), now);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::ControlSocket { up: true, generation }, now);
+        daemon.step(
+            Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
+            at(10),
+        );
+        let feed = |daemon: &mut Daemon, packet: Vec<u8>, ms: u64| {
+            daemon.step(Input::Accessory { generation, packet }, at(ms))
+        };
+        feed(&mut daemon, vec![0x01, 0x00, 0x04, 0x00, 0x01], 20);
+        feed(&mut daemon, vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01], 30);
+        feed(
+            &mut daemon,
+            vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00],
+            40,
+        );
+        let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
+        battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
+        battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
+        battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
+        feed(&mut daemon, battery, 50);
+        feed(&mut daemon, vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02], 60);
+        assert!(daemon.output.wants_output());
+
+        // One remote report lands inside the setup-settle window and no
+        // duplicate arrives after it. It must be deferred, not dropped.
+        let remote = Observation::Source { local: false, kind: 2, remote: Some(addr(9)) };
+        let deferred = daemon.step(Input::Observation(remote), at(100));
+        assert!(!paused(&deferred.effects));
+        assert!(daemon.output.wants_output());
+        daemon.queue_resume(vec!["org.mpris.MediaPlayer2.brave".into()]);
+        let settling = daemon.step(Input::Tick, at(1_000));
+        assert!(!paused(&settling.effects));
+        assert!(!resumed(&settling.effects), "a deferred report fences queued resumes");
+        assert!(daemon.output.wants_output());
+
+        let decided = daemon.step(Input::Tick, at(1_600));
+        assert!(paused(&decided.effects), "the deferred remote report must yield at settle");
+        assert!(!resumed(&decided.effects));
+        assert!(!daemon.output.wants_output());
+        assert!(daemon.audio.yielded());
+    }
+
+    #[test]
+    fn a_takeover_timeout_while_the_link_connects_defers_the_play_until_it_lands() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::step::{Effect, Input};
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.select_accessory(Some(addr(3)));
+        daemon.audio.startup_players(&[PlayerSeen {
+            service: "org.mpris.MediaPlayer2.brave".into(),
+            playing: false,
+        }]);
+        daemon.step(Input::Command(Command::Connect), now);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::ControlSocket { up: true, generation }, now);
+        let feed = |daemon: &mut Daemon, packet: Vec<u8>, ms: u64| {
+            daemon.step(Input::Accessory { generation, packet }, at(ms))
+        };
+        feed(&mut daemon, vec![0x01, 0x00, 0x04, 0x00, 0x01], 20);
+        feed(&mut daemon, vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01], 30);
+        feed(
+            &mut daemon,
+            vec![0x04, 0x00, 0x04, 0x00, 0x09, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00],
+            40,
+        );
+        let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
+        battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
+        battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
+        battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
+        feed(&mut daemon, battery.clone(), 50);
+        let graph = Graph {
+            default_sink: "speakers".into(),
+            sinks: vec![Sink { name: "speakers".into(), address: None, profile: None }],
+            cards: Vec::new(),
+            streams: vec![LiveStream {
+                id: 1,
+                generation: 10,
+                sink: "speakers".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 1.0,
+                corked: false,
+            }],
+        };
+        daemon.step(Input::Audio(graph.clone()), at(60));
+        daemon.step(
+            Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
+            at(70),
+        );
+        assert!(daemon.output.wants_output(), "the play claims while the link opens");
+        // The socket attempt hangs past the takeover hold: the speakers get
+        // their stream back instead of staying muted forever.
+        feed(&mut daemon, battery, 11_900);
+        let expired = daemon.step(Input::Audio(graph.clone()), at(12_100));
+        assert!(
+            expired.effects.iter().any(|e| matches!(e, Effect::Restore(_))),
+            "the expired hold restores the speakers"
+        );
+        assert!(!daemon.output.wants_output());
+        // The link lands moments later; the still-playing stream must be
+        // claimed then, not left on the speakers until the next play edge.
+        feed(&mut daemon, vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02], 12_200);
+        let landed = daemon.step(Input::Tick, at(12_300));
+        assert!(daemon.output.wants_output(), "the landed link claims the waiting play");
+        assert!(landed.effects.iter().any(|e| matches!(e,
+            Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true))));
+    }
+
+    #[test]
     fn remote_takeover_mutes_streams_only_until_paused_players_drain() {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -7992,6 +8213,10 @@ mod tests {
                 assert!(daemon.audio.yielded());
             }
         }
+        // The loop above left fresh desktop input on record, so the next
+        // Play is a press at this keyboard, not the player resuming itself:
+        // it takes over even inside the rebound window. (A play with no
+        // input before it is re-paused; see the reclaim test.)
         let play = daemon.step(
             Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
             Clock::new(now.mono.0 + 4_100, now.unix.0 + 4_100),
@@ -8057,6 +8282,9 @@ mod tests {
             );
             daemon
                 .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
+            daemon.audio.set_local_playing_for_test(true);
+            daemon.step(Input::Tick, Clock::new(now.mono.0 + 100, now.unix.0 + 100));
+            daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_600, now.unix.0 + 2_600));
             let mut muted = graph;
             muted.streams[0].mute = true;
             let reset = daemon.step(Input::Audio(muted), now);
@@ -8134,11 +8362,12 @@ mod tests {
         }
         let grant = daemon
             .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
-        assert!(grant.effects.iter().any(|effect| matches!(effect, Effect::MuteStreams(_))));
         assert!(!grant.effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. })));
         assert!(!grant.effects.iter().any(|effect| matches!(effect, Effect::MoveStreams(_))));
         let mut muted = graph;
         muted.streams[0].mute = true;
+        daemon.step(Input::Tick, Clock::new(now.mono.0 + 100, now.unix.0 + 100));
+        daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_600, now.unix.0 + 2_600));
         let reset = daemon.step(Input::Audio(muted), now);
         assert!(reset.effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. })));
         assert!(!daemon.output.held_streams()[0].mute, "save the speaker stream before muting it");
@@ -8214,21 +8443,67 @@ mod tests {
                 Input::Accessory { generation, packet: vec![4, 0, 4, 0, 9, 0, 6, 1, 0, 0, 0] },
                 now,
             );
-            assert_eq!(
-                granted
+            assert!(
+                !granted
                     .effects
                     .iter()
-                    .filter(|effect| matches!(effect,
-                        Effect::RestartOutput { name, .. } if name == "pods"
-                    ))
-                    .count(),
-                usize::from(completion == "grant")
+                    .any(|effect| matches!(effect, Effect::RestartOutput { .. })),
+                "a grant now routes directly; the restart waits for a silent transport"
             );
+            if completion == "grant" {
+                daemon.audio.set_local_playing_for_test(true);
+                let parked = Graph {
+                    default_sink: "pods".into(),
+                    sinks: vec![
+                        Sink {
+                            name: "pods".into(),
+                            address: Some(addr(3)),
+                            profile: Some("a2dp-sink".into()),
+                        },
+                        Sink { name: "speakers".into(), address: None, profile: None },
+                    ],
+                    cards: Vec::new(),
+                    streams: vec![crate::audio::route::LiveStream {
+                        id: 1,
+                        generation: 10,
+                        sink: "speakers".into(),
+                        role: String::new(),
+                        node: "Brave".into(),
+                        mute: true,
+                        volume: 1.0,
+                        corked: false,
+                    }],
+                };
+                // Two snapshots: the first lets the rebuilt output observe
+                // the parked stream, the second starts it.
+                let tick_fx =
+                    daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_650, now.unix.0 + 2_650));
+                let rebuilt_at = |fx: &[Effect]| {
+                    fx.iter().filter(|e| matches!(e, Effect::RestartOutput { .. })).count()
+                };
+                let rebuilt = daemon.step(
+                    Input::Audio(parked.clone()),
+                    Clock::new(now.mono.0 + 2_700, now.unix.0 + 2_700),
+                );
+
+                let rebuilt2 = daemon.step(
+                    Input::Audio(parked.clone()),
+                    Clock::new(now.mono.0 + 2_800, now.unix.0 + 2_800),
+                );
+                let rebuilt3 = daemon
+                    .step(Input::Audio(parked), Clock::new(now.mono.0 + 2_900, now.unix.0 + 2_900));
+                let restarts = rebuilt_at(&tick_fx.effects)
+                    + rebuilt_at(&rebuilt.effects)
+                    + rebuilt_at(&rebuilt2.effects)
+                    + rebuilt_at(&rebuilt3.effects);
+                assert_eq!(restarts, 1, "a silent transport after the grant rebuilds once");
+            }
             assert!(!granted.effects.iter().any(|effect| matches!(
                 effect,
                 Effect::OpenLink { .. } | Effect::Disconnect { .. } | Effect::SelectProfile { .. }
             )));
             assert_eq!(daemon.connection.generation(), generation);
+            // (The rebuild-on-silence count is asserted inside the grant arm above.)
             let repeated = daemon
                 .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
             assert!(!repeated
@@ -8280,6 +8555,7 @@ mod tests {
             let generation = daemon.connection.generation();
             let service = "org.mpris.MediaPlayer2.brave";
             daemon.step(Input::Players(Vec::new()), now);
+            daemon.note_pod_peers(vec![local, gram], now.unix);
             daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
             assert!(daemon.output.wants_output());
             let remote_at = Clock::new(now.mono.0 + 1, now.unix.0 + 1);
@@ -8304,19 +8580,226 @@ mod tests {
             );
             assert_eq!(daemon.connection.stage(), Stage::Ready);
             assert_eq!(daemon.connection.generation(), generation);
+            // (The rebuild-on-silence count is asserted inside the grant arm above.)
 
-            let duplicate = daemon.step(Input::Accessory { generation, packet }, remote_at);
+            let duplicate =
+                daemon.step(Input::Accessory { generation, packet: packet.clone() }, remote_at);
             assert!(!duplicate
                 .effects
                 .iter()
                 .any(|effect| matches!(effect, Effect::PausePlayers(_))));
             daemon.step(Input::Player { service: service.into(), playing: Some(true) }, remote_at);
             assert!(!daemon.output.wants_output(), "buffered playing feedback must not reclaim");
+            // A play that returns right after the yield, while the remote
+            // source is playing, is a rebound rather than intent: re-pause
+            // it once instead of starting a claim war.
             daemon.step(Input::Player { service: service.into(), playing: Some(false) }, remote_at);
-            daemon.step(Input::Player { service: service.into(), playing: Some(true) }, remote_at);
-            assert!(daemon.output.wants_output(), "a later play action can take audio back");
+            daemon.step(
+                Input::Accessory { generation, packet: peer_media(gram, local, true) },
+                remote_at,
+            );
+            let rebound = daemon.step(
+                Input::Player { service: service.into(), playing: Some(true) },
+                Clock::new(remote_at.mono.0 + 2_000, remote_at.unix.0 + 2_000),
+            );
+            assert!(
+                rebound.effects.iter().any(|effect| matches!(
+                    effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+                )),
+                "a rebound right after a yield must be re-paused"
+            );
+            assert!(!daemon.output.wants_output(), "a rebound must not reclaim");
+            // Brave can rebound more than once after a yield; every replay
+            // inside the window is re-paused, not just the first.
+            daemon.step(Input::Player { service: service.into(), playing: Some(false) }, remote_at);
+            let rebound2 = daemon.step(
+                Input::Player { service: service.into(), playing: Some(true) },
+                Clock::new(remote_at.mono.0 + 4_000, remote_at.unix.0 + 4_000),
+            );
+            assert!(
+                rebound2.effects.iter().any(|effect| matches!(
+                    effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+                )),
+                "a second rebound inside the window must be re-paused too"
+            );
+            assert!(!daemon.output.wants_output(), "a second rebound must not reclaim");
+            // A press preceded by fresh desktop input is intent even inside
+            // the window: the shell reports the input before the key press
+            // reaches the player, so no mouse click is needed to take over.
+            daemon.step(Input::Player { service: service.into(), playing: Some(false) }, remote_at);
+            daemon.step(
+                Input::Command(crate::panel::ipc::Command::Activity),
+                Clock::new(remote_at.mono.0 + 5_000, remote_at.unix.0 + 5_000),
+            );
+            let press = daemon.step(
+                Input::Player { service: service.into(), playing: Some(true) },
+                Clock::new(remote_at.mono.0 + 6_000, remote_at.unix.0 + 6_000),
+            );
+            assert!(
+                !press.effects.iter().any(|effect| matches!(effect, Effect::PausePlayers(_))),
+                "a play after desktop input must not be re-paused"
+            );
+            assert!(daemon.output.wants_output(), "a play after desktop input takes audio back");
             assert!(!daemon.audio.yielded());
         }
+    }
+
+    #[test]
+    fn a_fresh_fleet_intent_pauses_local_players_ahead_of_the_claim_and_a_replay_cannot_repeat_it()
+    {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::fleet::roster_air::Snapshot;
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let local = addr(2);
+        let gram = addr(4);
+        let pods = addr(3);
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![
+                Member { address: local, label: "xps".into() },
+                Member { address: gram, label: "gram".into() },
+            ],
+        });
+        ready_link(&mut daemon, now);
+        let service = "org.mpris.MediaPlayer2.brave";
+        daemon.step(Input::Players(Vec::new()), now);
+        daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+        daemon.step(Input::Observation(Observation::Ownership(true)), now);
+        assert!(daemon.output.wants_output());
+        daemon.observe_nearby(host_id(Some(gram)), gram, "lg-gram", now.unix, true, Some([7; 16]));
+        let intent = |sequence: u64, sent: UnixMs| Snapshot {
+            reporter: gram,
+            session: [7; 16],
+            sequence,
+            sent,
+            accessory: pods,
+            peers: vec![gram, local],
+            audio_source: Some(local),
+            last_use: UnixMs(0),
+            pending: false,
+            audio_idle: false,
+            intent: true,
+        };
+        daemon.hear_roster(intent(1, now.unix), now);
+        let yielded = daemon.step(Input::Tick, at(10));
+        assert!(
+            yielded.effects.iter().any(|effect| matches!(
+                effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+            )),
+            "a fresh intent must pause local players ahead of the claim"
+        );
+        assert!(!daemon.output.wants_output());
+        let hold_until = daemon.session.intent_until;
+        assert!(hold_until.is_some(), "the speculative yield must be bounded");
+
+        // The same sealed frame replayed verbatim is not a new intent: it
+        // must neither pause again nor extend the hold.
+        daemon.hear_roster(intent(1, now.unix), at(20));
+        let replayed = daemon.step(Input::Tick, at(30));
+        assert!(!replayed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::PausePlayers(_) | Effect::ResumePlayers(_))));
+        assert_eq!(daemon.session.intent_until, hold_until);
+
+        // No grant lands inside the hold: the paused player resumes and the
+        // seat is this laptop's again.
+        let resumed = daemon.step(Input::Tick, at(12_100));
+        assert!(
+            resumed.effects.iter().any(|effect| matches!(
+                effect, Effect::ResumePlayers(names) if names == &[service.to_string()]
+            )),
+            "an intent that never becomes a claim must give playback back"
+        );
+        assert_eq!(daemon.session.intent_until, None);
+    }
+
+    #[test]
+    fn an_admission_for_a_peer_not_yet_on_the_pods_steps_the_holder_back() {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::fleet::route_air::{Kind, Message};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for peer_on_pods in [false, true] {
+            let local = addr(2);
+            let gram = addr(1);
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_local_address(Some(local));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "xps".into() },
+                    Member { address: gram, label: "gram".into() },
+                ],
+            });
+            ready_link(&mut daemon, now);
+            let service = "org.mpris.MediaPlayer2.brave";
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+            daemon.step(Input::Observation(Observation::Ownership(true)), now);
+            assert!(daemon.output.wants_output());
+            daemon.note_pod_peers(
+                if peer_on_pods { vec![local, gram] } else { vec![local] },
+                now.unix,
+            );
+            daemon.hear_request(
+                Message {
+                    kind: Kind::Request,
+                    result: crate::fleet::route_air::Answer::Ok,
+                    source: gram,
+                    target: local,
+                    source_session: [9; 16],
+                    target_session: [0; 16],
+                    sequence: 1,
+                    transaction: [7; 8],
+                    sent: now.unix,
+                    accessory: addr(3),
+                    retain: None,
+                },
+                now,
+            );
+            let stepped = daemon.step(Input::Tick, at(10));
+            if peer_on_pods {
+                assert!(
+                    !stepped.effects.iter().any(|effect| matches!(effect, Effect::PausePlayers(_))),
+                    "a peer already on the pods claims over its own link; no step-back"
+                );
+                assert_eq!(daemon.session.intent_until, None);
+            } else {
+                assert!(
+                    stepped.effects.iter().any(|effect| matches!(
+                        effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+                    )),
+                    "the holder must free the pods' radio for a peer that still has to connect"
+                );
+                assert!(daemon.session.intent_until.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn a_deferred_claim_still_airs_intent_while_it_waits_for_the_link() {
+        use crate::step::Input;
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        daemon.set_local_address(Some(addr(2)));
+        daemon.select_accessory(Some(addr(3)));
+        // No link and no fresh sighting: the claim defers instead of
+        // claiming, but the intent is already worth airing.
+        daemon.step(Input::Bluez(false), now);
+        daemon.claim_playback(now);
+        assert!(daemon.roster_intent(now), "intent while the claim waits");
+        let later = Clock::new(now.mono.0 + 16_000, now.unix.0 + 16_000);
+        assert!(!daemon.roster_intent(later), "intent does not outlive the wait");
     }
 
     #[test]
@@ -9260,6 +9743,7 @@ mod tests {
             last_use: now.unix,
             pending: false,
             audio_idle: true,
+            intent: false,
         };
         let packet = roster_air::advertise(&snapshot, &keys).unwrap();
         let stored = daemon.step(Input::Advertisement(packet.clone()), now);
@@ -9325,6 +9809,7 @@ mod tests {
             audio_source: Some(addr(2)),
             pending: false,
             audio_idle: false,
+            intent: false,
             wire_session: None,
             last_use: UnixMs(0),
         };
@@ -9416,6 +9901,7 @@ mod tests {
             last_use: UnixMs(now.unix.0 - 1),
             pending: false,
             audio_idle: false,
+            intent: false,
         };
         listener.step(Input::Advertisement(roster_air::advertise(&learned, &keys).unwrap()), now);
         let learned_status = listener.status_value(now);
@@ -9918,6 +10404,91 @@ mod tests {
     }
 
     #[test]
+    fn a_play_during_admission_holds_streams_off_a_present_sink_until_the_grant() {
+        use crate::audio::play::PlayerSeen;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::fleet::route::Start;
+        use crate::pods::link::{reach_stage, Claim, Stage};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let moved = |effects: &[Effect]| {
+            effects.iter().any(|e| matches!(e, Effect::MoveStreams(m) if m.sink == "pods"))
+        };
+        let released = |effects: &[Effect]| {
+            moved(effects)
+                || effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::Restore(snaps) if snaps.iter().any(|s| s.id == 1)))
+        };
+        let mut daemon = Daemon::new("gram");
+        daemon.select_accessory(Some(addr(9)));
+        daemon.audio.startup_players(&[PlayerSeen {
+            service: "org.mpris.MediaPlayer2.brave".into(),
+            playing: false,
+        }]);
+        // The pods are already connected beside this laptop (dual link), so
+        // their sink exists before this laptop owns the audio.
+        let graph = Graph {
+            default_sink: "speakers".into(),
+            sinks: vec![
+                Sink { name: "speakers".into(), address: None, profile: None },
+                Sink {
+                    name: "pods".into(),
+                    address: Some(addr(9)),
+                    profile: Some("a2dp-sink".into()),
+                },
+            ],
+            cards: Vec::new(),
+            streams: vec![LiveStream {
+                id: 1,
+                generation: 10,
+                sink: "speakers".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 1.0,
+                corked: false,
+            }],
+        };
+        daemon.step(Input::Audio(graph.clone()), now);
+        let Start::Sent { .. } = daemon.start_route(addr(2)) else { panic!("route") };
+        let play = daemon.step(
+            Input::Player { service: "org.mpris.MediaPlayer2.brave".into(), playing: Some(true) },
+            now,
+        );
+        assert!(daemon.output.wants_output());
+        assert!(!moved(&play.effects), "admission must not route before the grant");
+        // WirePlumber switches the default to the pods and links the
+        // stream there; FleetPods may only hold it muted until this
+        // laptop owns the audio, never move or release it early.
+        let mut switched = graph.clone();
+        switched.default_sink = "pods".into();
+        switched.streams[0].sink = "pods".into();
+        let held = daemon.step(Input::Audio(switched.clone()), at(100));
+        assert!(!released(&held.effects), "a present sink is not ownership");
+        // Admission opens the link; the claim goes out when it is ready.
+        let Claim::Started(generation) = daemon.connection.claim(now.mono) else { panic!("claim") };
+        daemon.note_socket(true, generation, now.mono);
+        assert!(reach_stage(&mut daemon.connection, Stage::Notifications, generation, now.mono));
+        let ready = daemon.step(Input::Observation(Observation::Ready), at(5_000));
+        assert!(ready.effects.iter().any(|e| matches!(e,
+            Effect::WriteControl { bytes, .. } if *bytes == crate::pods::setup::ownership(true))));
+        // The pods answer the claim: local source, then the ownership grant.
+        daemon.step(
+            Input::Observation(Observation::Source { local: true, kind: 2, remote: None }),
+            at(5_100),
+        );
+        daemon.step(Input::Observation(Observation::Ownership(true)), at(5_150));
+        // Held streams were saved as muted/quieted: with the grant in hand
+        // the router no longer holds, and routing reports the stream routed
+        // onto the pods instead of moving or re-releasing it pre-grant.
+        assert!(daemon.audio.routed());
+        assert!(daemon.output.wants_output());
+    }
+
+    #[test]
     fn an_empty_accessory_does_not_invent_who_stays() {
         use crate::fleet::members::{Fleet, GroupKey, Member};
         use crate::fleet::presence::FleetKeys;
@@ -10098,6 +10669,7 @@ mod tests {
             let activity = daemon.step(Input::Command(Command::Activity), now);
             assert_eq!(claims(&activity), usize::from(!playing));
             assert_eq!(daemon.connection.generation(), generation);
+            // (The rebuild-on-silence count is asserted inside the grant arm above.)
             assert!(!daemon.output.wants_output(), "input alone must not move media");
             assert!(!activity.effects.iter().any(|e| matches!(
                 e,
@@ -10361,6 +10933,7 @@ mod tests {
                         last_use: UnixMs(0),
                         pending: scenario == "pending",
                         audio_idle: scenario != "playing",
+                        intent: false,
                     },
                     now,
                 );
@@ -10384,6 +10957,7 @@ mod tests {
                 )).count();
                 assert_eq!(claims, usize::from(scenario == "idle"), "{name}: {scenario}");
                 assert_eq!(daemon.connection.generation(), generation);
+                // (The rebuild-on-silence count is asserted inside the grant arm above.)
                 assert!(
                     !outcome.effects.iter().any(|e| matches!(
                         e,
@@ -10585,6 +11159,7 @@ mod tests {
                     | Effect::WriteControl { .. }
             )));
             assert_eq!(daemon.connection.generation(), generation);
+            // (The rebuild-on-silence count is asserted inside the grant arm above.)
         }
     }
     mod preferred_connection {

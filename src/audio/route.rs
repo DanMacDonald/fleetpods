@@ -197,6 +197,31 @@ impl RouteState {
         }
     }
 
+    /// Route onto the existing sink and start it once streams settle:
+    /// the direct path after an ownership grant. A sink suspended by the
+    /// previous owner's step-back will not acquire its transport merely
+    /// because a stream landed on it, so the start is not optional.
+    pub fn begin_direct(
+        &mut self,
+        id: u64,
+        accessory: Address,
+        graph: &Graph,
+        now: MonoMs,
+    ) -> bool {
+        if self.recovering() || !self.want {
+            return false;
+        }
+        let Some(sink) = sink_for(graph, accessory) else {
+            return false;
+        };
+        self.recovery = Recovery::Settling {
+            output: Restart { id, name: sink.name.clone() },
+            since: now,
+            until: now.saturating_add(5_000),
+        };
+        true
+    }
+
     /// Detach held streams before resetting the sink, then let normal routing
     /// relink them and restore their original volume and mute state.
     pub fn begin_recovery(
@@ -452,6 +477,25 @@ impl Router {
                 .any(|held| held.id == saved.id && held.generation == saved.generation)
         });
         true
+    }
+
+    /// Start the existing output for a direct route: no parking, no sink
+    /// restart, only the relink/settle/start phases that wake the node.
+    pub fn begin_direct(
+        &mut self,
+        id: u64,
+        accessory: Address,
+        graph: &Graph,
+        now: MonoMs,
+    ) -> bool {
+        self.state.begin_direct(id, accessory, graph, now)
+    }
+
+    /// Abandon a direct route's start phases so a rebuild can own the
+    /// recovery. Only the verification layer decides this, when its
+    /// direct attempt gives up.
+    pub fn cancel_recovery(&mut self) {
+        self.state.recovery = Recovery::Idle;
     }
 
     pub fn finish_recovery(&mut self, id: u64, ok: bool) -> bool {

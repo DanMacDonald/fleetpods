@@ -63,6 +63,7 @@ pub struct RosterMark {
     pub audio_source: Option<Address>,
     pub pending: bool,
     pub audio_idle: bool,
+    pub intent: bool,
 }
 
 /// How a planned roster compares to the one that last aired.

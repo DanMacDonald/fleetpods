@@ -75,6 +75,7 @@ fn a30_roster_and_route_run_both_directions() {
             last_use: UnixMs(heard_at.unix.0 - 1),
             pending: false,
             audio_idle: true,
+            intent: false,
         };
         requester
             .step(Input::Advertisement(roster_air::advertise(&roster, &keys).unwrap()), heard_at);

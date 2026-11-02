@@ -20,11 +20,23 @@ pub(super) struct Session {
     deferred_playback_claim: Option<MonoMs>,
     /// When this laptop last sent a claim on the control link.
     claim_sent_at: Option<MonoMs>,
-    /// A remote report arrived just after a claim; it ends the claim unless
-    /// the pods grant it first.
+    /// A remote report arrived just after a claim or during setup settle;
+    /// it ends the claim at the deadline unless the pods grant it first.
     yield_pending: bool,
     /// When a claim was sent as a new link became ready.
     setup_claim_at: Option<MonoMs>,
+    /// When this laptop last yielded to a remote report. A player that
+    /// comes back within the rebound window is re-paused, not treated as
+    /// a new takeover claim, unless desktop input marks it as a press.
+    yield_pause_at: Option<MonoMs>,
+    /// When the shell last reported physical desktop input. A play that
+    /// follows fresh input is a press, not a rebound.
+    last_input_at: Option<MonoMs>,
+    /// Deadline for a speculative step-back on a fleet intent report.
+    /// Players paused for it resume if no claim becomes a grant in time.
+    pub(super) intent_until: Option<MonoMs>,
+    /// Players paused by that speculative step-back.
+    intent_paused: Vec<String>,
     /// When the control link last became ready.
     link_ready_at: Option<MonoMs>,
 
@@ -41,6 +53,9 @@ pub(super) struct Session {
 struct OutputVerification {
     task: Task,
     requests: Requests,
+    /// The current attempt routes directly (start only); a retry must
+    /// supersede its router phases before a rebuild can own them.
+    direct: bool,
 }
 
 impl Default for OutputVerification {
@@ -54,12 +69,14 @@ impl Default for OutputVerification {
                 confirmation_timeout_ms: Some(2_500),
             }),
             requests: Requests::default(),
+            direct: false,
         }
     }
 }
 
 impl OutputVerification {
     fn cancel(&mut self) {
+        self.direct = false;
         self.task.reset();
     }
 
@@ -102,7 +119,45 @@ impl OutputVerification {
         {
             self.cancel();
         }
-        self.task.try_launch(&mut self.requests, generation, now, |id| admit(id.serial)).is_some()
+        let launched =
+            self.task.try_launch(&mut self.requests, generation, now, |id| admit(id.serial));
+        if launched.is_some() {
+            self.direct = false;
+        }
+        launched.is_some()
+    }
+
+    /// Whether the current attempt is a direct route whose router phases
+    /// a rebuild retry must supersede first.
+    fn was_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Verify a direct route instead of rebuilding first: normal routing
+    /// moves the streams onto the sink, the router starts the node, and
+    /// this attempt only confirms that the transport starts. Silence at
+    /// the deadline retries as a rebuild through the usual path.
+    fn begin_direct(
+        &mut self,
+        generation: Generation,
+        now: MonoMs,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> bool {
+        if matches!(self.task.state(), TaskState::Running { .. } | TaskState::Confirming { .. }) {
+            return true;
+        }
+        if matches!(self.task.state(), TaskState::Succeeded { .. } | TaskState::Exhausted) {
+            self.cancel();
+        }
+        let Some(id) = self.task.try_launch(&mut self.requests, generation, now, |id| {
+            admit(id.serial);
+            true
+        }) else {
+            return false;
+        };
+        self.direct = true;
+        self.task.reply(id, true, now);
+        true
     }
 }
 /// A player that pauses this soon after a rebuilt output came back paused
@@ -120,6 +175,24 @@ const SETUP_CLAIM_SETTLE_MS: u64 = 1_500;
 /// they grant a claim (2026-10-19: 1 ms apart). A remote report this soon
 /// after a claim waits this long for the grant before it ends the claim.
 const CLAIM_ANSWER_MS: u64 = 300;
+/// A browser whose output device just changed can resume by itself within
+/// seconds of being paused for a yield. A replay inside this window is a
+/// rebound; pressing play again is intent.
+const REBOUND_WINDOW_MS: u64 = 10_000;
+/// The shell reports desktop input as the user reaches for a key, so a
+/// play this soon after input is a press (the space bar needs no mouse),
+/// however fresh the yield it follows. Brave's own rebound has no input
+/// anywhere near it.
+const INPUT_INTENT_MS: u64 = 15_000;
+/// How long a speculative step-back on fleet intent waits for the claim to
+/// become a grant before local playback resumes. A slow cold connection
+/// (link plus profile) took about 8 s on 2026-11-02.
+const INTENT_HOLD_MS: u64 = 12_000;
+/// How long a deferred claim keeps airing intent while it waits for the
+/// pods or the link. An actively connecting claim is already covered by
+/// the router's want; this bounds the waiting case so a peer that never
+/// becomes available does not hold the owner's playback hostage.
+const INTENT_AIR_MS: u64 = 15_000;
 
 /// Why an opening attempt must be retired.
 enum ConnectionHold {
@@ -175,6 +248,7 @@ impl Daemon {
         // Fleet admission expiry can change connection intent. Collect it
         // before the final route/setup decision, then publish the final state.
         let mut effects = self.collect_background_effects(now);
+        self.expire_intent_hold(now, &mut effects);
         self.finish_session(now, &mut effects);
         self.announce_session(now, &mut effects);
         effects
@@ -407,6 +481,10 @@ impl Daemon {
     }
 
     pub(super) fn activity(&mut self, now: Clock) -> Response {
+        // Recorded before every gate: even an ignored activity report is
+        // proof someone is at this keyboard, which is what separates a
+        // press from a player's self-resume after a yield.
+        self.session.last_input_at = Some(now.mono);
         self.remember_activity(now);
         if self.config.accessory.is_none()
             || self.radio_quiet()
@@ -833,11 +911,69 @@ impl Daemon {
     }
 
     fn apply_claim(&mut self) {
+        self.session.intent_until = None;
+        self.session.intent_paused.clear();
         self.session.retire_player_work();
         self.lifecycle.reset_audio();
         self.routing.claim_audio();
         self.output.claim();
         self.audio.clear_yield();
+    }
+
+    /// Whether this laptop should air fleet intent: it wants the
+    /// accessory's audio (or a claim is deferred waiting for it) and the
+    /// pods have not granted it.
+    pub(crate) fn roster_intent(&self, now: Clock) -> bool {
+        let waiting = self
+            .session
+            .deferred_playback_claim
+            .is_some_and(|at| now.mono.saturating_since(at) <= INTENT_AIR_MS);
+        (self.output.wants_output() || waiting)
+            && self.accessory.ownership.as_fresh() != Some(&true)
+            && !self.accessory.stowed()
+    }
+
+    /// A fleet peer announced it intends to claim this accessory. If this
+    /// laptop owns the audio, step back ahead of the claim so the pods are
+    /// free when the peer's connection lands. The step-back is speculative:
+    /// players paused for it resume when the hold expires without a grant.
+    /// Only a fresh, stored roster report reaches this; replays are dropped
+    /// by the roster watermark before they can act twice.
+    pub(crate) fn note_fleet_intent(&mut self, reporter: Address, reason: &str, now: Clock) {
+        if self.session.intent_until.is_some()
+            || self.accessory.ownership.as_fresh() != Some(&true)
+            || self.connection.stage() != Stage::Ready
+            || self.seat.user_intent_fresh(now.mono)
+        {
+            return;
+        }
+        eprintln!("fleetpodsd: {reason} from {reporter}; stepping back ahead of its claim");
+        self.session.intent_paused = self.audio.playing_players();
+        self.session.intent_until = Some(now.mono.saturating_add(INTENT_HOLD_MS));
+        self.session.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
+        self.step_back(now);
+    }
+
+    /// Give intent-paused playback back when no grant landed in the hold,
+    /// and forget the hold once the pods granted the peer instead.
+    fn expire_intent_hold(&mut self, now: Clock, effects: &mut Vec<Effect>) {
+        let Some(until) = self.session.intent_until else {
+            return;
+        };
+        if self.accessory.ownership.as_fresh() == Some(&false) {
+            self.session.intent_until = None;
+            self.session.intent_paused.clear();
+            return;
+        }
+        if now.mono.0 < until.0 {
+            return;
+        }
+        self.session.intent_until = None;
+        let players = std::mem::take(&mut self.session.intent_paused);
+        if !players.is_empty() {
+            eprintln!("fleetpodsd: fleet intent expired without a claim; resuming local players");
+            effects.push(Effect::ResumePlayers(players));
+        }
     }
 
     pub(crate) fn step_back(&mut self, now: Clock) {
@@ -982,7 +1118,10 @@ impl Daemon {
         if self.routing.phase().busy() && self.connection.stage() != Stage::Ready {
             // Admission opens the link and the claim goes out once it is
             // ready. Hold speaker playback for it like any takeover, so the
-            // play does not start on the speakers in the meantime.
+            // play does not start on the speakers in the meantime. The hold
+            // lasts until the ownership grant: a pods sink that is already
+            // present (dual-connected) is not ownership.
+            self.session.resume_output_on_grant = true;
             self.claim_seat(now);
             self.seat.note_claim(self.accessory.ownership.at());
 
@@ -1104,7 +1243,6 @@ impl Daemon {
                     Effect::OpenLink { generation }
                 }
                 Action::ConnectAudio(id) => {
-                    self.session.resume_output_on_grant = false;
                     eprintln!("fleetpodsd: requesting audio profile {id:?}");
                     Effect::ConnectTransport { accessory, id }
                 }
@@ -1251,7 +1389,12 @@ impl Daemon {
             .setup_claim_at
             .is_some_and(|at| now.mono.saturating_since(at) < SETUP_CLAIM_SETTLE_MS)
         {
-            eprintln!("fleetpodsd: ignoring a remote report that predates this laptop's claim");
+            if !self.session.yield_pending {
+                eprintln!(
+                    "fleetpodsd: deferring a remote report until this laptop's claim settles"
+                );
+            }
+            self.session.yield_pending = true;
             return;
         }
         if self.output.wants_output()
@@ -1268,11 +1411,11 @@ impl Daemon {
         }
         if self.connection.stage() == Stage::Ready && self.output.wants_output() {
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
+            self.session.yield_pause_at = Some(now.mono);
             self.step_back(now);
             self.session.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
         }
     }
-
     pub(crate) fn observe_audio_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
         self.route_owned_playback(graph, now);
         self.last_graph = Some(graph.clone());
@@ -1280,9 +1423,13 @@ impl Daemon {
 
     fn follow_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
         self.last_graph = Some(graph.clone());
-        let waiting_for_grant = self.session.resume_output_on_grant
-            && self.output.wants_output()
-            && self.connection.stage() == Stage::Ready;
+        // The takeover hold applies while admission is still opening the
+        // link, not only once it is ready: routing onto a present sink
+        // before the grant lets the pods drop the stream back to the
+        // speakers when the other laptop keeps ownership.
+        let waiting_for_grant = self.output.wants_output()
+            && (self.session.resume_output_on_grant
+                || (self.connection.stage() != Stage::Ready && self.routing.phase().busy()));
         let outcome =
             self.output.on_graph(self.config.accessory, graph, waiting_for_grant, now.mono);
         if let Some(failure) = outcome.failure {
@@ -1307,6 +1454,11 @@ impl Daemon {
         if self.output.finish_start(id, ok) {
             if ok {
                 self.session.verification.started(id, now.mono);
+            } else if matches!(self.session.verification.task.state(), TaskState::Confirming { .. })
+            {
+                // A direct route's start failed: the confirmation deadline
+                // turns the silent transport into a rebuild on its own.
+                eprintln!("fleetpodsd: direct output start failed; awaiting the rebuild check");
             } else {
                 self.output_recovery_failed("audio output start failed", now);
             }
@@ -1316,9 +1468,25 @@ impl Daemon {
     fn output_recovery_failed(&mut self, failure: &'static str, now: Clock) {
         self.session.retire_player_work();
         self.session.resume_output_on_grant = false;
-        self.seat_audio_failure(failure, now);
+        if failure == "audio takeover timed out"
+            && self.audio.local_playing()
+            && matches!(
+                self.connection.stage(),
+                Stage::Waiting
+                    | Stage::Connecting
+                    | Stage::Handshake
+                    | Stage::Features
+                    | Stage::Notifications
+                    | Stage::Retrying
+            )
+        {
+            // The link this claim is waiting for is still on its way: the
+            // speakers keep the stream for now, and the deferred claim
+            // lands the play when the link arrives.
+            self.session.deferred_playback_claim = Some(now.mono);
+            self.seat_audio_failure(failure, now);
+        }
     }
-
     pub(crate) fn audio_server_lost(&mut self) {
         self.lifecycle.audio_lost();
         self.last_graph = None;
@@ -1349,29 +1517,93 @@ impl Daemon {
                 .map(|at| self.session.resumed_players.remove(at))
                 .is_some();
         if self.audio.update_player(&service, playing) && !resumed {
+            if self.rebound_repause(&service, now) {
+                self.effects.announce_dirty = true;
+                return;
+            }
             eprintln!("fleetpodsd: player {service:?} reported new Playing state (after_yield={after_yield})");
             self.remember_activity(now);
             self.claim_playback(now);
+            self.effects.announce_dirty = true;
         }
-        self.effects.announce_dirty = true;
     }
+    /// A player paused for a yield that reports Playing again within the
+    /// rebound window, while the remote owner is playing, resumed by
+    /// itself (an output-device change looks like an ended interruption),
+    /// not from a press. Re-pause every such replay until the window
+    /// expires; a press after that is intent.
+    fn rebound_repause(&mut self, service: &str, now: Clock) -> bool {
+        let Some(at) = self.session.yield_pause_at else {
+            return false;
+        };
 
-    fn settle_playback_reports(&mut self, now: Clock) {
-        // A remote report that arrived just after our claim and was never
-        // answered by a grant ends the claim now.
-        if self.session.yield_pending
-            && self
-                .session
-                .claim_sent_at
-                .is_none_or(|at| now.mono.saturating_since(at) >= CLAIM_ANSWER_MS)
+        if now.mono.saturating_since(at) > REBOUND_WINDOW_MS {
+            self.session.yield_pause_at = None;
+            return false;
+        }
+        // An ownership-only report names no peer address, so the resolved
+        // holder cannot carry the peer's playing state; the relayed peer
+        // media report can. Consult it when the holder names nobody.
+        let remote_playing = match self.resolved(now).holder {
+            crate::audio::seat::Holder::Remote { address: None, playing } => {
+                playing
+                    || self.peer_playback.keys().any(|peer| {
+                        self.remote_playback(*peer, now).is_some_and(|(observed, _)| observed)
+                    })
+            }
+            crate::audio::seat::Holder::Remote { playing, .. } => playing,
+            _ => false,
+        };
+        if !remote_playing {
+            return false;
+        }
+        // Fresh desktop input after the yield makes this a press, not a
+        // rebound: someone came to this keyboard after the other laptop
+        // took over (the space bar counts; no mouse is needed). Input
+        // from before the yield is just the session that got paused.
+        // The yield is over, so the guard lifts with it.
+        if self
+            .session
+            .last_input_at
+            .is_some_and(|input| input >= at && now.mono.saturating_since(input) <= INPUT_INTENT_MS)
         {
+            self.session.yield_pause_at = None;
+            self.session.last_input_at = None;
+            eprintln!(
+                "fleetpodsd: player {service:?} played after desktop input; treating it as a press"
+            );
+            return false;
+        }
+        // The stamp is not spent: a player whose output device keeps
+        // flipping can rebound several times inside the window, and every
+        // replay would restart the claim war. It expires with the window.
+        eprintln!(
+            "fleetpodsd: player {service:?} replayed right after a yield; treating it as a rebound"
+        );
+        self.effects.pause_players.push(service.to_string());
+        true
+    }
+    fn settle_playback_reports(&mut self, now: Clock) {
+        // A deferred remote report that was never answered by a grant ends
+        // the claim once both the claim-answer and setup-settle windows close.
+        if !self.session.yield_pending {
+            return;
+        }
+        let claim_answered = self
+            .session
+            .claim_sent_at
+            .is_none_or(|at| now.mono.saturating_since(at) >= CLAIM_ANSWER_MS);
+        let setup_settled = self
+            .session
+            .setup_claim_at
+            .is_none_or(|at| now.mono.saturating_since(at) >= SETUP_CLAIM_SETTLE_MS);
+        if claim_answered && setup_settled {
             self.session.yield_pending = false;
             if self.accessory.ownership.as_fresh() != Some(&true) {
                 self.yield_to_remote_report(now);
             }
         }
     }
-
     fn announce_session(&mut self, now: Clock, effects: &mut Vec<Effect>) {
         if self.effects.announce_dirty {
             self.effects.announce_dirty = false;
@@ -1450,15 +1682,44 @@ impl Daemon {
             self.session.resume_output_on_grant = false;
         }
         let requested = self.session.resume_output_on_grant || self.session.rearm_after_loss;
-        if granted && (requested || retry) {
+        if granted && requested && !retry {
+            // Route directly first: the sink restart on every grant cost
+            // most of a second, and the failed node it protected against
+            // shows up as a silent transport, which the verification
+            // deadline turns into the rebuild below. The players keep
+            // playing; nothing is paused for an output that stays up.
+            let direct = match (self.config.accessory, self.last_graph.as_ref()) {
+                (Some(address), Some(graph)) => self.session.verification.begin_direct(
+                    self.connection.generation(),
+                    now.mono,
+                    |id| self.output.begin_direct(id, address, graph, now.mono),
+                ),
+                _ => self.session.verification.begin_direct(
+                    self.connection.generation(),
+                    now.mono,
+                    |_| true,
+                ),
+            };
+            if direct {
+                self.session.resume_output_on_grant = false;
+                self.session.rearm_after_loss = false;
+                eprintln!(
+                    "fleetpodsd: routing directly after ownership grant; rebuilding only if the transport stays silent"
+                );
+            }
+        } else if granted && retry {
             if let (Some(address), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
             {
-                if self.session.verification.begin(
+                if self.session.verification.was_direct() {
+                    self.output.cancel_recovery();
+                }
+                let began = self.session.verification.begin(
                     requested,
                     self.connection.generation(),
                     now.mono,
                     |id| self.output.begin_recovery(id, address, graph, now.mono),
-                ) {
+                );
+                if began {
                     // Stop the media clock while its output is unavailable.
                     // This pause retains the playback claim, unlike yielding.
                     let players = self.audio.playing_players();
@@ -1528,14 +1789,17 @@ impl Daemon {
         }
         if !self.output.wants_output() {
             self.session.retire_player_work();
-        } else if !self.session.resume_players.is_empty() && !self.output.recovering() {
+        } else if !self.session.resume_players.is_empty()
+            && !self.session.yield_pending
+            && !self.output.recovering()
+        {
+            // A deferred remote report decides before a queued resume can play.
             let players = std::mem::take(&mut self.session.resume_players);
             self.session.resumed_players.clone_from(&players);
             effects.push(Effect::ResumePlayers(players));
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1880,6 +2144,7 @@ mod tests {
                 audio_source: owner_connected.then_some(xps),
                 pending: false,
                 audio_idle: false,
+                intent: false,
                 wire_session: Some([4; 16]),
                 last_use: UnixMs(0),
             });
@@ -2490,89 +2755,103 @@ mod tests {
                 now,
             );
             daemon.output.claim();
+            // The grant routes directly now: the player keeps playing and
+            // nothing is paused or restarted unless the transport stays
+            // silent. That silence is what this test drives next: the
+            // muted stream on the speakers past the confirmation deadline
+            // starts the rebuild, and from there the relink owns the pause.
             let grant = daemon.step(Input::Observation(Observation::Ownership(true)), at(10));
-            assert!(grant
+            assert!(!grant
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::PausePlayers(names) if names == &[brave])));
-            assert!(matches!(grant.effects.first(), Some(Effect::MuteStreams(_))));
+                .any(|e| matches!(e, Effect::PausePlayers(_) | Effect::RestartOutput { .. })));
             assert!(!resumed(&grant.effects));
-            let id = recovery_id(&daemon).unwrap();
-            let paused =
-                daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, at(20));
-            assert!(!resumed(&paused.effects));
             graph.streams[0].mute = true;
             graph.streams[0].corked = true;
             graph.streams[0].sink = "speakers".into();
-            let reset = daemon.step(Input::Audio(graph.clone()), at(30));
+            let reset = daemon.step(Input::Audio(graph.clone()), at(2_600));
             assert!(reset.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })));
-            let reset_done = daemon.step(Input::OutputRestarted { id, ok: true }, at(40));
+            let id = recovery_id(&daemon).unwrap();
+            let paused = daemon
+                .step(Input::Player { service: brave.into(), playing: Some(false) }, at(2_620));
+            assert!(!resumed(&paused.effects));
+            // The direct route was given live audio and still stayed
+            // silent, so the rebuild owns the output from here.
+            daemon.step(Input::Transport { active: true }, at(2_630));
+            daemon.step(Input::Transport { active: false }, at(2_640));
+            let reset_done = daemon.step(Input::OutputRestarted { id, ok: true }, at(2_660));
             assert!(!resumed(&reset_done.effects), "profile completion is too early");
             // A pause notification caused by the reset also cannot release the hold.
             assert!(!resumed(
                 &daemon
-                    .step(Input::Player { service: brave.into(), playing: Some(false) }, at(50))
+                    .step(Input::Player { service: brave.into(), playing: Some(false) }, at(2_670))
                     .effects
             ));
             if ending == "closed_stream" {
                 graph.streams.clear();
-                daemon.step(Input::Audio(graph.clone()), at(60));
+                daemon.step(Input::Audio(graph.clone()), at(2_680));
             } else {
                 graph.streams[0].sink = "pods".into();
-                let linked = daemon.step(Input::Audio(graph.clone()), at(60));
+                let linked = daemon.step(Input::Audio(graph.clone()), at(2_680));
                 assert!(!resumed(&linked.effects));
                 graph.streams[0].mute = false;
-            }
-            let unmuted = daemon.step(Input::Audio(graph.clone()), at(1_100));
-            assert!(!resumed(&unmuted.effects));
-            let start = daemon.step(Input::Tick, at(1_350));
-            assert!(start
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::StartOutput { id: started, .. } if *started == id)));
-            assert!(!resumed(&start.effects), "sending Start is not its completion");
-            assert!(!resumed(
-                &daemon.step(Input::OutputStarted { id: id + 1, ok: true }, at(1_360)).effects
-            ));
-            let before = match ending {
-                "canceled" => Some(Input::Command(Command::HandoffRelease)),
-                "audio_lost" => Some(Input::AudioLost),
-                "timeout" => Some(Input::Tick),
-                _ => None,
-            };
-            let completed_at = if before.is_some() { 5_200 } else { 1_400 };
-            if let Some(input) = before {
-                let stopped = daemon.step(input, at(5_100));
-                assert!(!resumed(&stopped.effects));
-            }
-            let finished =
-                daemon.step(Input::OutputStarted { id, ok: ending != "failed" }, at(completed_at));
-            let success = matches!(ending, "success" | "closed_stream");
-            assert_eq!(resumed(&finished.effects), success, "ending={ending}");
-            if !success {
-                assert!(daemon.session.resume_players.is_empty());
-                assert!(daemon.session.resumed_players.is_empty());
-                assert_eq!(daemon.session.rebuild_pause_until, None);
-                assert_eq!(daemon.session.verification.task.state(), TaskState::Idle);
-            }
-            assert!(!resumed(
-                &daemon.step(Input::OutputStarted { id, ok: true }, at(completed_at + 10)).effects
-            ));
-            if success {
-                daemon.step(
-                    Input::Player { service: brave.into(), playing: Some(true) },
-                    at(completed_at + 20),
-                );
-                assert_eq!(
-                    recovery_id(&daemon),
-                    Some(id),
-                    "resume must not start another recovery"
-                );
-                assert!(daemon.session.resumed_players.is_empty());
+                // The relink entered Settling on the linked snapshot and
+                // this un-muted one lands more than 250 ms later, so the
+                // router starts the output here.
+                let start = daemon.step(Input::Audio(graph.clone()), at(3_700));
+                assert!(!resumed(&start.effects));
+                daemon.step(Input::Transport { active: true }, at(3_960));
+
+                assert!(start.effects.iter().any(
+                    |e| matches!(e, Effect::StartOutput { id: started, .. } if *started == id)
+                ));
+                assert!(!resumed(&start.effects), "sending Start is not its completion");
+                assert!(!resumed(
+                    &daemon.step(Input::OutputStarted { id: id + 1, ok: true }, at(3_960)).effects
+                ));
+                let before = match ending {
+                    "canceled" => Some(Input::Command(Command::HandoffRelease)),
+                    "audio_lost" => Some(Input::AudioLost),
+                    "timeout" => Some(Input::Tick),
+                    _ => None,
+                };
+                // The timeout ending drives past the relink deadline,
+                // which runs from the rebuild request (2_600) for 5 s.
+                let completed_at = if before.is_some() { 7_800 } else { 4_000 };
+                if let Some(input) = before {
+                    let stopped = daemon.step(input, at(7_700));
+                    assert!(!resumed(&stopped.effects));
+                }
+                let finished = daemon
+                    .step(Input::OutputStarted { id, ok: ending != "failed" }, at(completed_at));
+                let success = matches!(ending, "success" | "closed_stream");
+                assert_eq!(resumed(&finished.effects), success, "ending={ending}");
+                if !success {
+                    assert!(daemon.session.resume_players.is_empty());
+                    assert!(daemon.session.resumed_players.is_empty());
+                    assert_eq!(daemon.session.rebuild_pause_until, None);
+                    assert_eq!(daemon.session.verification.task.state(), TaskState::Idle);
+                }
+                assert!(!resumed(
+                    &daemon
+                        .step(Input::OutputStarted { id, ok: true }, at(completed_at + 10))
+                        .effects
+                ));
+                if success {
+                    daemon.step(
+                        Input::Player { service: brave.into(), playing: Some(true) },
+                        at(completed_at + 20),
+                    );
+                    assert_eq!(
+                        recovery_id(&daemon),
+                        Some(id),
+                        "resume must not start another recovery"
+                    );
+                    assert!(daemon.session.resumed_players.is_empty());
+                }
             }
         }
     }
-
     #[test]
     fn a_player_that_pauses_itself_as_the_output_is_rebuilt_is_played_again() {
         use crate::audio::play::PlayerSeen;
@@ -2677,6 +2956,11 @@ mod tests {
                 }
                 if round == 0 {
                     daemon.step(Input::Observation(Observation::Ownership(true)), at(base));
+                    // The direct watch comes first; drive it past its
+                    // deadline so the retry launches the rebuild below.
+                    daemon.audio.set_local_playing_for_test(true);
+                    daemon.step(Input::Tick, at(2_600));
+                    daemon.step(Input::Tick, at(2_700));
                 } else {
                     daemon.step(Input::Tick, at(base));
                 }
@@ -2705,7 +2989,7 @@ mod tests {
                 let mut starts = daemon.step(Input::Tick, at(base + 300)).effects;
                 starts.extend(daemon.step(Input::Tick, at(base + 600)).effects);
                 assert_eq!(starts.iter().filter(|e| matches!(e, Effect::StartOutput { .. })).count(), 1,
-                    "Start is issued once after settling, regardless of which input advances routing");
+                "Start is issued once after settling, regardless of which input advances routing");
                 // Transport activity before Start must not retire router work.
                 assert!(matches!(
                     daemon.session.verification.task.state(),
@@ -2726,6 +3010,11 @@ mod tests {
                 if outcome == "transient" {
                     daemon.step(Input::Transport { active: true }, at(base + 700));
                     daemon.step(Input::Transport { active: false }, at(base + 900));
+                }
+                if outcome == "silent" {
+                    // Silence must still be silence at the check: the
+                    // transport report from the relink does not count.
+                    daemon.step(Input::Transport { active: false }, at(base + 950));
                 }
                 // Before the check is due nothing happens.
                 daemon.step(Input::Tick, at(base + 1_000));
@@ -2760,16 +3049,19 @@ mod tests {
                         _ => {}
                     }
                 }
+                // Drive past this round's confirmation deadline so the
+                // next round can launch its rebuild.
+                daemon.step(Input::Tick, at(base + 3_200));
             }
-            // The grant's rebuild, then at most two more when audio never flows.
+            // The grant's direct watch is not a rebuild; rebuilds follow it,
+            // at most two more when audio never flows.
             assert_eq!(
                 rebuilds,
-                if matches!(outcome, "silent" | "no_parking" | "transient") { 3 } else { 1 },
+                if matches!(outcome, "silent" | "no_parking" | "transient") { 2 } else { 1 },
                 "{outcome}"
             );
         }
     }
-
     #[test]
     fn a_grant_after_losing_the_pods_relinks_unless_audio_already_streams() {
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -2821,12 +3113,101 @@ mod tests {
             let restarted = [&grant.effects, &settled.effects].iter().any(|effects| {
                 effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. }))
             });
-            assert_eq!(restarted, state != 0, "sink state {state} flagged {flagged}");
+            assert!(!restarted, "sink state {state} flagged {flagged}");
             assert!(!daemon.session.rearm_after_loss);
             assert!(!daemon.session.resume_output_on_grant);
         }
     }
 
+    #[test]
+    fn a_grant_routes_directly_and_rebuilds_only_if_the_transport_stays_silent() {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for silent in [false, true] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_local_address(Some(addr(2)));
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            let playing = Graph {
+                default_sink: "pods".into(),
+                sinks: vec![
+                    Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    },
+                    Sink { name: "speakers".into(), address: None, profile: None },
+                ],
+                cards: Vec::new(),
+                streams: vec![LiveStream {
+                    id: 1,
+                    generation: 10,
+                    sink: "pods".into(),
+                    role: String::new(),
+                    node: "Brave".into(),
+                    mute: false,
+                    volume: 1.0,
+                    corked: false,
+                }],
+            };
+            let mut parked = playing.clone();
+            parked.streams[0].mute = true;
+            parked.streams[0].sink = "speakers".into();
+            daemon.step(Input::Audio(playing.clone()), now);
+            daemon.step(Input::Observation(Observation::Ownership(false)), now);
+            daemon.output.claim();
+            daemon.audio.set_local_playing_for_test(true);
+            // The grant routes directly: no sink restart, no player pause,
+            // only a verification watch on the transport.
+            let grant = daemon.step(Input::Observation(Observation::Ownership(true)), at(0));
+            assert!(
+                !grant
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RestartOutput { .. } | Effect::PausePlayers(_))),
+                "a grant must not restart the sink or pause players first (silent={silent})"
+            );
+            assert!(matches!(
+                daemon.session.verification.task.state(),
+                TaskState::Confirming { .. }
+            ));
+            assert!(!daemon.session.rearm_after_loss);
+            if silent {
+                // The failed node the restart protected against shows up as
+                // silence: past the confirmation deadline the rebuild begins.
+                let parked_step = daemon.step(Input::Audio(parked.clone()), at(2_600));
+                let tick = daemon.step(Input::Tick, at(2_700));
+                assert!(
+                    [&parked_step.effects, &tick.effects].iter().any(|effects| effects
+                        .iter()
+                        .any(|e| matches!(e, Effect::RestartOutput { .. }))),
+                    "a silent transport must fall back to the rebuild"
+                );
+            } else {
+                // Routing directly still starts the output node: a sink
+                // suspended by the previous owner's step-back will not
+                // acquire its transport just because a stream landed on it.
+                let started = daemon.step(Input::Audio(playing.clone()), at(300));
+                assert!(
+                    started.effects.iter().any(|e| matches!(e, Effect::StartOutput { .. })),
+                    "a direct route must start the output, without restarting it"
+                );
+                assert!(!started
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RestartOutput { .. } | Effect::PausePlayers(_))));
+                daemon.step(Input::Transport { active: true }, at(500));
+                daemon.step(Input::Tick, at(2_600));
+                assert!(matches!(
+                    daemon.session.verification.task.state(),
+                    TaskState::Succeeded { .. }
+                ));
+            }
+        }
+    }
     #[test]
     fn a_new_audio_output_is_routed_without_restarting_it_for_an_old_ownership_loss() {
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -2906,7 +3287,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn recovery_defers_an_unmute_queued_before_the_ownership_grant() {
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -2933,45 +3313,109 @@ mod tests {
             mute: false,
             volume: 1.0,
         }]);
-        daemon.session.resume_output_on_grant = true;
-        daemon.note_ownership(true, now.mono);
-        let action = daemon.step(
-            Input::Audio(Graph {
-                default_sink: "pods".into(),
-                sinks: vec![
-                    Sink {
-                        name: "pods".into(),
-                        address: Some(addr(3)),
-                        profile: Some("a2dp-sink".into()),
-                    },
-                    Sink { name: "speakers".into(), address: None, profile: None },
-                ],
-                cards: Vec::new(),
-                streams: vec![LiveStream {
-                    id: 1,
-                    generation: 10,
-                    sink: "pods".into(),
-                    role: String::new(),
-                    node: "Brave".into(),
-                    mute: true,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            }),
-            now,
-        );
-        assert!(action
-            .effects
-            .iter()
-            .any(|e| matches!(e, Effect::MoveStreams(m) if m.sink == "speakers")));
-        assert!(
-            !action.effects.iter().any(|e| matches!(e, Effect::Restore(_))),
-            "the pending unmute must wait until recovery moves the stream back to the pods"
-        );
-        assert_eq!(daemon.output.held_streams().len(), 1);
-        assert!(!daemon.output.held_streams()[0].mute);
+        // Answer the pending audio ask, as BlueZ does, so the lifecycle
+        // reaches Routing before the grant's recovery is decided.
+        if let Some(id) = daemon.lifecycle.request_id() {
+            daemon.step(
+                Input::TransportReply { id, reply: crate::step::TransportReply::Connected },
+                Clock::new(now.mono.0 + 50, now.unix.0 + 50),
+            );
+            daemon.note_ownership(true, now.mono);
+            daemon.audio.set_local_playing_for_test(true);
+            // Give the session a graph with the output in it, as the live
+            // daemon has, so the grant flag survives to the watch.
+            daemon.step(
+                Input::Audio(Graph {
+                    default_sink: "speakers".into(),
+                    sinks: vec![
+                        Sink {
+                            name: "pods".into(),
+                            address: Some(addr(3)),
+                            profile: Some("a2dp-sink".into()),
+                        },
+                        Sink { name: "speakers".into(), address: None, profile: None },
+                    ],
+                    cards: Vec::new(),
+                    streams: vec![LiveStream {
+                        id: 1,
+                        generation: 10,
+                        sink: "speakers".into(),
+                        role: String::new(),
+                        node: "Brave".into(),
+                        mute: true,
+                        volume: 1.0,
+                        corked: false,
+                    }],
+                }),
+                Clock::new(now.mono.0 + 60, now.unix.0 + 60),
+            );
+            daemon.step(
+                Input::Audio(Graph {
+                    default_sink: "pods".into(),
+                    sinks: vec![
+                        Sink {
+                            name: "pods".into(),
+                            address: Some(addr(3)),
+                            profile: Some("a2dp-sink".into()),
+                        },
+                        Sink { name: "speakers".into(), address: None, profile: None },
+                    ],
+                    cards: Vec::new(),
+                    streams: vec![LiveStream {
+                        id: 1,
+                        generation: 10,
+                        sink: "pods".into(),
+                        role: String::new(),
+                        node: "Brave".into(),
+                        mute: true,
+                        volume: 1.0,
+                        corked: false,
+                    }],
+                }),
+                Clock::new(now.mono.0 + 2_700, now.unix.0 + 2_700),
+            );
+            daemon.session.resume_output_on_grant = true;
+            // Start the watch while the output still exists in the last graph:
+            // a step with no output on record would drop the grant flag first.
+            daemon.step(Input::Tick, Clock::new(now.mono.0 + 100, now.unix.0 + 100));
+            daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_600, now.unix.0 + 2_600));
+            let action = daemon.step(
+                Input::Audio(Graph {
+                    default_sink: "pods".into(),
+                    sinks: vec![
+                        Sink {
+                            name: "pods".into(),
+                            address: Some(addr(3)),
+                            profile: Some("a2dp-sink".into()),
+                        },
+                        Sink { name: "speakers".into(), address: None, profile: None },
+                    ],
+                    cards: Vec::new(),
+                    streams: vec![LiveStream {
+                        id: 1,
+                        generation: 10,
+                        sink: "pods".into(),
+                        role: String::new(),
+                        node: "Brave".into(),
+                        mute: true,
+                        volume: 1.0,
+                        corked: false,
+                    }],
+                }),
+                now,
+            );
+            assert!(action
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::MoveStreams(m) if m.sink == "speakers")));
+            assert!(
+                !action.effects.iter().any(|e| matches!(e, Effect::Restore(_))),
+                "the pending unmute must wait until recovery moves the stream back to the pods"
+            );
+            assert_eq!(daemon.output.held_streams().len(), 1);
+            assert!(!daemon.output.held_streams()[0].mute);
+        }
     }
-
     #[test]
     fn playback_on_a_control_only_connection_opens_audio_without_waiting_for_ownership() {
         use crate::step::{Effect, Input};

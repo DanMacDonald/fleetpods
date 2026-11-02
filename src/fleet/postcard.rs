@@ -76,6 +76,7 @@ fn roster_json(report: &RosterReport) -> Value {
         "audio_source": report.audio_source.map(|address| address.display()),
         "pending": report.pending,
         "audio_idle": report.audio_idle,
+        "intent": report.intent,
     })
 }
 
@@ -100,6 +101,7 @@ fn decode_roster(value: &Value) -> Option<RosterReport> {
         audio_source,
         pending: value.get("pending")?.as_bool()?,
         audio_idle: value.get("audio_idle")?.as_bool()?,
+        intent: value.get("intent").and_then(|item| item.as_bool()).unwrap_or(false),
         wire_session: None,
         last_use: UnixMs(value.get("last_use").and_then(|item| item.as_u64()).unwrap_or(0)),
     })
@@ -188,6 +190,7 @@ mod tests {
             audio_source: Some(xps()),
             pending: false,
             audio_idle: false,
+            intent: false,
             wire_session: None,
             last_use: UnixMs(0),
         };

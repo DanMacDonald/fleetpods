@@ -263,7 +263,13 @@ impl Lifecycle {
         // An existing sink may still be hands-free: start A2DP when needed.
         // Once acquisition has started, an output satisfies its join even if
         // the method reply failed or has not arrived yet.
-        if !output || self.audio.task.state() == TaskState::Idle {
+        // A failed ask is still retried on its backoff while the transport
+        // stays inactive, even when a dual-connected sink already exists:
+        // that output satisfies the join, but only a successful profile ask
+        // starts the transport.
+        let retry_failed =
+            matches!(self.audio.task.state(), TaskState::Backoff { .. }) && !f.transport_active;
+        if !output || self.audio.task.state() == TaskState::Idle || retry_failed {
             self.open_audio(f, now, audio_present, &mut actions);
         }
         // Codec work starts here and continues once per step in later phases.
@@ -304,7 +310,12 @@ impl Lifecycle {
     }
 
     fn open_audio(&mut self, f: &Facts<'_>, now: MonoMs, present: bool, actions: &mut Vec<Action>) {
-        if present {
+        // A present A2DP profile needs no ask, unless a previous ask failed
+        // and the transport never started (a busy dual-connected peer): the
+        // backoff retry is then the only way to start it.
+        if present
+            && (f.transport_active || !matches!(self.audio.task.state(), TaskState::Backoff { .. }))
+        {
             return;
         }
         if self.audio.task.state() == TaskState::Exhausted
@@ -474,6 +485,30 @@ mod tests {
                 assert_eq!(l.progress().state, State::Streaming);
             }
         }
+    }
+
+    #[test]
+    fn a_busy_audio_profile_is_retried_while_the_transport_stays_inactive() {
+        let mut l = Lifecycle::default();
+        let mut f = facts();
+        let first = start(&mut l, &mut f);
+        assert!(l.note_audio(first, TransportReply::Busy, MonoMs(2)));
+        // The pods are dual-connected: a sink already exists on this host,
+        // but its transport never started while the peer holds the profile.
+        let g = graph(&f);
+        f.graph = Some(&g);
+        f.control = Stage::Ready;
+        f.routed = true;
+        assert!(l.advance(&f, MonoMs(3)).is_empty());
+        assert_eq!(l.progress().state, State::Routing);
+        assert_eq!(l.progress().waiting_for, "transport_active");
+        let retry = l.advance(&f, MonoMs(2_002));
+        let [Action::ConnectAudio(second)] = retry.as_slice() else { panic!("{retry:?}") };
+        assert_ne!(*second, first);
+        assert!(l.note_audio(*second, TransportReply::Connected, MonoMs(2_003)));
+        f.transport_active = true;
+        assert!(l.advance(&f, MonoMs(2_004)).is_empty());
+        assert_eq!(l.progress().state, State::Streaming);
     }
 
     #[test]

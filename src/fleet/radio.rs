@@ -176,6 +176,9 @@ pub struct Schedule {
     roster_urgent: bool,
     /// All three copies of a seat change remain coordination traffic.
     roster_changed: bool,
+    /// An intent-bearing roster takes the next slot even ahead of route
+    /// traffic: its whole value is arriving before the claim it announces.
+    roster_priority: bool,
     /// Spare the controller routine announcements while opening a Bluetooth link.
     defer_routine: bool,
     /// After presence, the next free slot belongs to a waiting roster.
@@ -208,6 +211,7 @@ impl Schedule {
             roster_remaining: 0,
             roster_urgent: false,
             roster_changed: false,
+            roster_priority: false,
             defer_routine: false,
             roster_next: false,
             route: None,
@@ -264,6 +268,7 @@ impl Schedule {
         self.roster_remaining = 1;
         self.roster_urgent = false;
         self.roster_changed = false;
+        self.roster_priority = false;
     }
 
     /// A seat change takes the next non-pairing slot, then repeats twice in
@@ -275,11 +280,20 @@ impl Schedule {
         self.roster_changed = true;
     }
 
+    /// A roster announcing intent to claim takes the very next slot,
+    /// ahead of route traffic and any deferral: it is only useful if it
+    /// lands before the claim it precedes.
+    pub fn offer_roster_intent(&mut self, frame: Vec<u8>) {
+        self.offer_roster_change(frame);
+        self.roster_priority = true;
+    }
+
     pub fn clear_roster(&mut self) {
         self.roster = None;
         self.roster_remaining = 0;
         self.roster_urgent = false;
         self.roster_changed = false;
+        self.roster_priority = false;
     }
 
     pub fn has_roster(&self) -> bool {
@@ -422,6 +436,9 @@ impl Schedule {
         if self.aired_at.is_some_and(|at| now.saturating_since(at) < AIR_MS) {
             return None;
         }
+        if self.roster_priority {
+            return self.take_roster(now);
+        }
         // Start each handshake phase promptly. Re-offering the same packet
         // does not rearm this priority, so roster/presence slots still run.
         if self.route_urgent {
@@ -518,6 +535,7 @@ impl Schedule {
             self.roster_changed = false;
         }
         self.roster_urgent = false;
+        self.roster_priority = false;
         self.roster_next = false;
         self.mark_aired(now);
         Some(Item::Roster(bytes))
@@ -582,6 +600,16 @@ mod tests {
         assert_eq!(schedule.due(MonoMs(5_500)), Duty::Publish(Item::Presence(vec![5])));
         assert_eq!(schedule.due(MonoMs(6_000)), Duty::Publish(Item::Roster(vec![6])));
         assert_eq!(schedule.due(MonoMs(6_500)), Duty::Release);
+    }
+
+    #[test]
+    fn an_intent_roster_takes_the_slot_ahead_of_route_traffic_while_connecting() {
+        let mut schedule = Schedule::new();
+        schedule.defer_routine(true);
+        schedule.offer_route(vec![9], MonoMs(10_000));
+        schedule.offer_roster_intent(vec![7]);
+        assert_eq!(schedule.due(MonoMs(0)), Duty::Publish(Item::Roster(vec![7])));
+        assert_eq!(schedule.due(MonoMs(500)), Duty::Publish(Item::Route(vec![9])));
     }
 
     #[test]

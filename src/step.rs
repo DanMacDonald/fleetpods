@@ -393,6 +393,12 @@ impl Daemon {
                 None
             }
             Input::Bluez(up) => {
+                if !up {
+                    // No ACL, no A2DP transport: a disconnected accessory
+                    // cannot still be streaming, whatever the last transport
+                    // report said.
+                    self.transport_active = false;
+                }
                 self.note_acl(up, now.unix);
                 self.note_bluez(up);
                 None
@@ -505,6 +511,7 @@ impl Daemon {
                 None
             }
             Input::BluezLost => {
+                self.transport_active = false;
                 self.interrupt("bluez", now);
                 None
             }

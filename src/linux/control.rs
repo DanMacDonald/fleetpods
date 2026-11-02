@@ -3,6 +3,7 @@
 
 use std::io;
 use std::os::fd::RawFd;
+use std::time::{Duration, Instant};
 
 use crate::types::Address;
 
@@ -29,10 +30,16 @@ struct SockAddrL2 {
     bdaddr_type: u8,
 }
 
+/// A page the pods never answer otherwise blocks for the kernel's whole
+/// timeout (~22s observed); a connect still in flight past this deadline
+/// is abandoned so the caller's retry loop can try again sooner.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(8);
+
 #[derive(Default)]
 pub struct ControlLink {
     fd: Option<RawFd>,
     connecting: bool,
+    connecting_since: Option<Instant>,
     serial: u64,
 }
 
@@ -50,6 +57,19 @@ impl ControlLink {
     pub(super) fn from_test_fd(fd: std::os::fd::OwnedFd) -> Self {
         use std::os::fd::IntoRawFd;
         Self { fd: Some(fd.into_raw_fd()), ..Self::default() }
+    }
+
+    #[cfg(test)]
+    pub(super) fn connecting_for_test(since: Instant) -> Self {
+        Self { connecting: true, connecting_since: Some(since), ..Self::default() }
+    }
+
+    /// True when the in-flight connect has passed [`CONNECT_DEADLINE`].
+    pub fn connect_expired(&self, now: Instant) -> bool {
+        self.connecting
+            && self
+                .connecting_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= CONNECT_DEADLINE)
     }
 
     pub fn is_open(&self) -> bool {
@@ -74,6 +94,7 @@ impl ControlLink {
             unsafe { libc::close(fd) };
         }
         self.connecting = false;
+        self.connecting_since = None;
     }
 
     /// Bind any local address and start a non-blocking connect.
@@ -104,6 +125,7 @@ impl ControlLink {
             {
                 self.fd = Some(fd);
                 self.connecting = true;
+                self.connecting_since = Some(Instant::now());
                 Ok(Attach::Connecting)
             }
             Err(err) => {
@@ -124,6 +146,7 @@ impl ControlLink {
         let err = socket_error(fd)?;
         if err == 0 {
             self.connecting = false;
+            self.connecting_since = None;
             Ok(true)
         } else if err == libc::EINPROGRESS || err == libc::EALREADY {
             Ok(false)

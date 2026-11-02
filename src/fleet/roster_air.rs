@@ -1,8 +1,10 @@
 //! Sealed roster advertisement.
 //!
 //! Version 7 is the plain snapshot. Version 8 adds one flag byte: `1` while a
-//! pair is pending, `2` when the audio source is only the idle owner. Version 6
-//! is the older snapshot without a last-use time. The seal is the fleet key.
+//! pair is pending, `2` when the audio source is only the idle owner, `3` while
+//! the reporter intends to claim the accessory and the owner may step back
+//! early. Version 6 is the older snapshot without a last-use time. The seal is
+//! the fleet key.
 
 use super::crypto::{open_fleet, seal_fleet};
 use super::presence::{FleetKeys, SKEW_MS};
@@ -18,6 +20,7 @@ const WITH_FLAG: usize = 101;
 const LEGACY_LEN: usize = 92;
 const PENDING: u8 = 1;
 const IDLE: u8 = 2;
+const INTENT: u8 = 3;
 
 pub struct Snapshot {
     pub reporter: Address,
@@ -30,12 +33,14 @@ pub struct Snapshot {
     pub last_use: UnixMs,
     pub pending: bool,
     pub audio_idle: bool,
+    pub intent: bool,
 }
 
 pub fn advertise(snapshot: &Snapshot, keys: &FleetKeys) -> Option<Vec<u8>> {
     let body = encode_body(snapshot)?;
     let sealed = seal_fleet(ROSTER_DOMAIN, &keys.id, &keys.key, &body)?;
-    let version = if snapshot.pending || snapshot.audio_idle { FLAGGED } else { VERSION };
+    let version =
+        if snapshot.pending || snapshot.audio_idle || snapshot.intent { FLAGGED } else { VERSION };
     let mut frame = Vec::with_capacity(1 + sealed.len());
     frame.push(version);
     frame.extend(sealed);
@@ -54,7 +59,7 @@ pub fn read(packet: &[u8], keys: &FleetKeys) -> Option<Snapshot> {
         return None;
     }
     let flag = if flagged { body.get(71).copied() } else { None };
-    if flagged && flag != Some(PENDING) && flag != Some(IDLE) {
+    if flagged && flag != Some(PENDING) && flag != Some(IDLE) && flag != Some(INTENT) {
         return None;
     }
     let snapshot = Snapshot {
@@ -72,6 +77,7 @@ pub fn read(packet: &[u8], keys: &FleetKeys) -> Option<Snapshot> {
         },
         pending: flag == Some(PENDING),
         audio_idle: flag == Some(IDLE),
+        intent: flag == Some(INTENT),
     };
     valid(&snapshot).then_some(snapshot)
 }
@@ -109,6 +115,8 @@ fn encode_body(snapshot: &Snapshot) -> Option<Vec<u8>> {
         body.push(PENDING);
     } else if snapshot.audio_idle {
         body.push(IDLE);
+    } else if snapshot.intent {
+        body.push(INTENT);
     }
     Some(body)
 }
@@ -118,6 +126,9 @@ fn valid(snapshot: &Snapshot) -> bool {
         return false;
     }
     if snapshot.audio_idle && (snapshot.pending || snapshot.audio_source.is_none()) {
+        return false;
+    }
+    if snapshot.intent && (snapshot.pending || snapshot.audio_source == Some(snapshot.reporter)) {
         return false;
     }
     if snapshot.reporter == snapshot.accessory || snapshot.sequence == 0 || snapshot.sent.0 == 0 {
@@ -189,6 +200,7 @@ mod tests {
             last_use: UnixMs(1_700_000_000_000),
             pending,
             audio_idle: idle && !pending,
+            intent: false,
         }
     }
 
@@ -215,6 +227,23 @@ mod tests {
         let got = read(&pending, &keys).unwrap();
         assert!(got.pending);
         assert_eq!(got.peers.len(), 2);
+    }
+
+    #[test]
+    fn an_intent_roster_round_trips_and_the_source_cannot_claim_intent() {
+        let keys = FleetKeys { id: [3; 16], key: [0x11; 32] };
+        let mut snap = sample(false, false);
+        snap.peers = vec![addr(1), addr(2)];
+        snap.audio_source = Some(addr(2));
+        snap.intent = true;
+        let frame = advertise(&snap, &keys).unwrap();
+        assert_eq!(frame[0], FLAGGED);
+        let got = read(&frame, &keys).unwrap();
+        assert!(got.intent);
+        assert!(!got.pending && !got.audio_idle);
+
+        snap.audio_source = Some(addr(1));
+        assert!(advertise(&snap, &keys).is_none());
     }
 
     #[test]
