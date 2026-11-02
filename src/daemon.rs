@@ -1561,7 +1561,7 @@ impl Daemon {
         self.pod_peers_at = Some(now);
     }
 
-    pub(crate) fn note_peer_playback(&mut self, peer: Address, playing: bool, now: MonoMs) {
+    pub(crate) fn note_peer_playback(&mut self, peer: Address, playing: bool, now: Clock) {
         if self.local_address == Some(peer) {
             return;
         }
@@ -1573,7 +1573,8 @@ impl Daemon {
             eprintln!("fleetpodsd: peer {} media playing={playing}", peer.display());
             self.idle_claimed = None;
         }
-        self.peer_playback.insert(peer, (playing, now));
+        self.peer_playback.insert(peer, (playing, now.mono));
+        self.contest_started_outside_playback(peer, playing, now);
         self.effects.announce_dirty = true;
     }
 
@@ -7456,7 +7457,7 @@ mod tests {
                     now,
                 );
                 daemon.step(Input::Observation(Observation::Ownership(false)), now);
-                daemon.note_peer_playback(phone, owner == "playing phone", at(1).mono);
+                daemon.note_peer_playback(phone, owner == "playing phone", at(1));
             }
             if owner != "already worn" {
                 daemon.step(Input::Accessory { generation, packet: ears(0x02, 0x02) }, at(10));
@@ -8199,7 +8200,7 @@ mod tests {
             }),
             now,
         );
-        daemon.note_peer_playback(peer, true, now.mono);
+        daemon.note_peer_playback(peer, true, now);
         for elapsed in [100, 1_000, 4_000] {
             let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
             for input in
@@ -8781,6 +8782,111 @@ mod tests {
                     "stem toggle {toggle} on a yielded device must be re-paused"
                 );
                 assert!(!daemon.output.wants_output(), "a stem toggle must not claim");
+            }
+        }
+    }
+
+    #[test]
+    fn an_outside_started_session_is_contested_but_a_fleet_takeover_is_not() {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+
+        for (scenario, fleet_peer) in [("outside phone", false), ("fleet peer", true)] {
+            let local = addr(2);
+            let peer = addr(7);
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_local_address(Some(local));
+            if fleet_peer {
+                daemon.restore_fleet(Fleet {
+                    id: FleetId::new([3; 16]),
+                    key: GroupKey::new([0x11; 32]),
+                    members: vec![
+                        Member { address: local, label: "xps".into() },
+                        Member { address: peer, label: "gram".into() },
+                    ],
+                });
+            }
+            ready_link(&mut daemon, now);
+            let service = "org.mpris.MediaPlayer2.brave";
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.note_pod_peers(vec![local, peer], now.unix);
+            daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+            daemon.step(Input::Observation(Observation::Ownership(true)), at(10));
+            let yielded = daemon.step(
+                Input::Observation(Observation::PodPeers {
+                    peers: vec![local, peer],
+                    owner: Some(peer),
+                }),
+                at(2_000),
+            );
+            let paused_for_yield = |effects: &[Effect]| {
+                effects.iter().any(|effect| {
+                    matches!(effect, Effect::PausePlayers(names) if names == &[service.to_string()])
+                })
+            };
+            let claims_in = |effects: &[Effect]| {
+                effects
+                    .iter()
+                    .filter(|effect| {
+                        matches!(effect,
+                            Effect::WriteControl { bytes, .. }
+                                if *bytes == crate::pods::setup::ownership(true))
+                    })
+                    .count()
+            };
+            assert!(paused_for_yield(&yielded.effects), "{scenario}: local playback pauses");
+            assert_eq!(
+                claims_in(&yielded.effects),
+                0,
+                "{scenario}: no claim before the peer starts"
+            );
+            assert!(
+                !yielded.effects.iter().any(|effect| matches!(effect, Effect::ResumePlayers(_))),
+                "{scenario}: contesting ownership must not resume the paused local player"
+            );
+            assert!(!daemon.output.wants_output(), "{scenario}: the seat yields first");
+
+            daemon.step(Input::Player { service: service.into(), playing: Some(false) }, at(2_050));
+            let started = daemon.step(
+                Input::Observation(Observation::PeerPlaying { address: peer, playing: true }),
+                at(2_800),
+            );
+            assert_eq!(
+                claims_in(&started.effects),
+                usize::from(!fleet_peer),
+                "{scenario}: only a started outside session is contested"
+            );
+            assert!(
+                !daemon.output.wants_output(),
+                "{scenario}: ownership contest does not reclaim the output"
+            );
+
+            if !fleet_peer {
+                // The pods grant the contest, then the phone insists once.
+                // Answer that started session too, but stop after the window.
+                daemon.step(Input::Observation(Observation::Ownership(true)), at(2_900));
+                daemon.step(
+                    Input::Observation(Observation::PeerPlaying { address: peer, playing: false }),
+                    at(3_000),
+                );
+                let insisted = daemon.step(
+                    Input::Observation(Observation::PeerPlaying { address: peer, playing: true }),
+                    at(3_100),
+                );
+                assert_eq!(
+                    claims_in(&insisted.effects),
+                    1,
+                    "insisting started session is contested"
+                );
+                daemon.step(Input::Observation(Observation::Ownership(true)), at(3_200));
+                let late = daemon.step(
+                    Input::Observation(Observation::PeerPlaying { address: peer, playing: true }),
+                    at(8_000),
+                );
+                assert_eq!(claims_in(&late.effects), 0, "contest window must expire");
             }
         }
     }
@@ -10782,7 +10888,7 @@ mod tests {
             now,
         );
         now.mono.0 += 10;
-        daemon.note_peer_playback(phone, true, now.mono);
+        daemon.note_peer_playback(phone, true, now);
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], true);
         // The pods report playback when it changes. A song that keeps playing sends nothing more.
         let elapsed = crate::pods::reports::REPORT_TTL_MS + 60_000;
@@ -10793,7 +10899,7 @@ mod tests {
         assert_eq!(status["audio_owner"]["playing"], true);
         assert_eq!(status["remote_playing"], true);
         // A pause is reported, and it stands too.
-        daemon.note_peer_playback(phone, false, now.mono);
+        daemon.note_peer_playback(phone, false, now);
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], false);
     }
 
@@ -10841,7 +10947,7 @@ mod tests {
         daemon.set_local_address(Some(local));
         ready_link(&mut daemon, now);
         daemon.note_pod_peers(vec![local, gram], now.unix);
-        daemon.note_peer_playback(gram, false, now.mono);
+        daemon.note_peer_playback(gram, false, now);
         now.mono.0 += 10;
         daemon.step(
             Input::Observation(crate::pods::observe::Observation::Source {
@@ -10856,10 +10962,10 @@ mod tests {
             true,
             "old idle cannot silence a new source"
         );
-        daemon.note_peer_playback(addr(6), false, now.mono);
+        daemon.note_peer_playback(addr(6), false, now);
         assert!(!daemon.peer_playback.contains_key(&addr(6)));
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], true);
-        daemon.note_peer_playback(gram, false, now.mono);
+        daemon.note_peer_playback(gram, false, now);
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], false);
         daemon.note_pod_peers(vec![local], now.unix);
         assert!(daemon.peer_playback.is_empty());
@@ -10884,7 +10990,7 @@ mod tests {
                 now,
             );
         }
-        gram.note_peer_playback(local, false, now.mono);
+        gram.note_peer_playback(local, false, now);
         now.mono.0 += 100;
         now.unix.0 += 100;
         let source = xps.step(
@@ -11069,7 +11175,7 @@ mod tests {
                 now,
             );
             let generation = daemon.connection.generation();
-            daemon.note_peer_playback(gram, true, now.mono);
+            daemon.note_peer_playback(gram, true, now);
             let activity = daemon.step(Input::Command(Command::Activity), now);
             let claimed = |outcome: &crate::step::StepOutcome| {
                 outcome.effects.iter().any(|effect| {
@@ -11126,7 +11232,7 @@ mod tests {
         assert_eq!(daemon.status_value(now)["audio_owner"]["holder"], "local");
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], false);
         assert_eq!(daemon.audio_roster(now).unwrap().audio_source, Some(local));
-        daemon.note_peer_playback(peer, false, now.mono);
+        daemon.note_peer_playback(peer, false, now);
         assert!(!claims(&daemon.step(Input::Command(Command::Activity), now)));
         // Gram claims one second later: old XPS activity must not steal it back.
         now.mono.0 += 1_000;

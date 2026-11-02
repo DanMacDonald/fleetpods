@@ -6,6 +6,19 @@ use crate::pods::setup;
 use crate::retry::{Delay, Limit, Policy, Requests, State as TaskState, Task};
 use crate::step::Effect;
 
+/// A local play waiting to become, or having become, a pods claim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PlaybackClaim {
+    #[default]
+    Idle,
+    /// Pressed without evidence the pods can play; waits for pods or a
+    /// link so the speakers are not held for a takeover that may never
+    /// happen.
+    Deferred(MonoMs),
+    /// Applied to the router and the seat; the grant is still due.
+    Active,
+}
+
 #[derive(Default)]
 pub(super) struct Session {
     /// The pods reset this laptop's link mid-playback with no fleet laptop
@@ -14,10 +27,10 @@ pub(super) struct Session {
     rejoin: Option<Rejoin>,
     rejoined_at: Option<MonoMs>,
     background_requested: bool,
-    /// A play pressed without evidence the pods can play. The
-    /// claim waits until they are available or connect, so the speakers are not
-    /// soft-muted for a takeover that may never happen.
-    deferred_playback_claim: Option<MonoMs>,
+    /// The one representation of a pending playback claim: deferred
+    /// claims wait for pods or a link without holding speaker playback;
+    /// an active claim has been applied to the router and the seat.
+    claim: PlaybackClaim,
     /// When this laptop last sent a claim on the control link.
     claim_sent_at: Option<MonoMs>,
     /// A remote report arrived just after a claim or during setup settle;
@@ -50,15 +63,19 @@ pub(super) struct Session {
     resume_players: Vec<String>,
     resumed_players: Vec<String>,
     release_output_until: Option<MonoMs>,
+    /// When actively playing local audio last lost ownership.
+    ownership_loss_at: Option<MonoMs>,
+    /// A stem-toggled outside session can insist for a few seconds.
+    /// Its started reports get bounded ownership contests.
+    stem_loss_at: Option<MonoMs>,
+    stem_peer: Option<Address>,
+    stem_claims_sent: u8,
 }
 
 /// The router owns each rebuild; this task owns verification and repeats.
 struct OutputVerification {
     task: Task,
     requests: Requests,
-    /// The current attempt routes directly (start only); a retry must
-    /// supersede its router phases before a rebuild can own them.
-    direct: bool,
 }
 
 impl Default for OutputVerification {
@@ -72,14 +89,12 @@ impl Default for OutputVerification {
                 confirmation_timeout_ms: Some(2_500),
             }),
             requests: Requests::default(),
-            direct: false,
         }
     }
 }
 
 impl OutputVerification {
     fn cancel(&mut self) {
-        self.direct = false;
         self.task.reset();
     }
 
@@ -110,57 +125,41 @@ impl OutputVerification {
         matches!(self.task.state(), TaskState::Backoff { .. }) && playing
     }
 
-    fn begin(
+    /// Launch one verification attempt for a grant. A direct attempt
+    /// starts its confirmation deadline at once (the router only starts
+    /// the existing node); a rebuild attempt confirms only after its
+    /// start lands. Silence at the deadline retries as a rebuild.
+    fn begin_claim(
         &mut self,
         requested: bool,
         generation: Generation,
         now: MonoMs,
+        direct: bool,
         admit: impl FnOnce(u64) -> bool,
     ) -> bool {
+        if direct {
+            if matches!(self.task.state(), TaskState::Running { .. } | TaskState::Confirming { .. })
+            {
+                return true;
+            }
+            if matches!(self.task.state(), TaskState::Succeeded { .. } | TaskState::Exhausted) {
+                self.cancel();
+            }
+            let Some(id) = self.task.try_launch(&mut self.requests, generation, now, |id| {
+                admit(id.serial);
+                true
+            }) else {
+                return false;
+            };
+            self.task.reply(id, true, now);
+            return true;
+        }
         if requested
             && matches!(self.task.state(), TaskState::Succeeded { .. } | TaskState::Exhausted)
         {
             self.cancel();
         }
-        let launched =
-            self.task.try_launch(&mut self.requests, generation, now, |id| admit(id.serial));
-        if launched.is_some() {
-            self.direct = false;
-        }
-        launched.is_some()
-    }
-
-    /// Whether the current attempt is a direct route whose router phases
-    /// a rebuild retry must supersede first.
-    fn was_direct(&self) -> bool {
-        self.direct
-    }
-
-    /// Verify a direct route instead of rebuilding first: normal routing
-    /// moves the streams onto the sink, the router starts the node, and
-    /// this attempt only confirms that the transport starts. Silence at
-    /// the deadline retries as a rebuild through the usual path.
-    fn begin_direct(
-        &mut self,
-        generation: Generation,
-        now: MonoMs,
-        admit: impl FnOnce(u64) -> bool,
-    ) -> bool {
-        if matches!(self.task.state(), TaskState::Running { .. } | TaskState::Confirming { .. }) {
-            return true;
-        }
-        if matches!(self.task.state(), TaskState::Succeeded { .. } | TaskState::Exhausted) {
-            self.cancel();
-        }
-        let Some(id) = self.task.try_launch(&mut self.requests, generation, now, |id| {
-            admit(id.serial);
-            true
-        }) else {
-            return false;
-        };
-        self.direct = true;
-        self.task.reply(id, true, now);
-        true
+        self.task.try_launch(&mut self.requests, generation, now, |id| admit(id.serial)).is_some()
     }
 }
 /// A player that pauses this soon after a rebuilt output came back paused
@@ -196,6 +195,10 @@ const INTENT_HOLD_MS: u64 = 12_000;
 /// the router's want; this bounds the waiting case so a peer that never
 /// becomes available does not hold the owner's playback hostage.
 const INTENT_AIR_MS: u64 = 15_000;
+/// The outside host's toggled session can insist for a few seconds;
+/// answer its started reports with bounded ownership contests.
+const STEM_CONTEST_WINDOW_MS: u64 = 5_000;
+const STEM_CONTEST_MAX_CLAIMS: u8 = 3;
 
 /// Why an opening attempt must be retired.
 enum ConnectionHold {
@@ -441,7 +444,7 @@ impl Daemon {
             && !self.connection.apple_reconnect()
         {
             self.cancel_connection_attempt(ConnectionHold::Superseded);
-            self.session.deferred_playback_claim = None;
+            self.session.claim = PlaybackClaim::Idle;
             if self.output.wants_output() {
                 // A superseded pending connection must not leave speaker
                 // playback muted while waiting for a link it cannot open.
@@ -623,9 +626,9 @@ impl Daemon {
     }
 
     fn advance_deferred_claim(&mut self, now: Clock) {
-        if let Some(at) = self.session.deferred_playback_claim {
+        if let PlaybackClaim::Deferred(at) = self.session.claim {
             if now.mono.saturating_since(at) > 30_000 || !self.audio.local_playing() {
-                self.session.deferred_playback_claim = None;
+                self.session.claim = PlaybackClaim::Idle;
             } else if !self.accessory.stowed()
                 && !self.accessory.both_docked()
                 && self.preferred_connection_allowed()
@@ -633,7 +636,7 @@ impl Daemon {
                 // That says nothing about whether a docked bud has come out.
                 && self.accessory.playback_available(now.mono)
             {
-                self.session.deferred_playback_claim = None;
+                self.session.claim = PlaybackClaim::Idle;
                 self.claim_playback(now);
                 // This play predates the link, so its opening reports do too.
                 if self.output.wants_output()
@@ -914,6 +917,7 @@ impl Daemon {
     }
 
     fn apply_claim(&mut self) {
+        self.session.claim = PlaybackClaim::Active;
         self.session.intent_until = None;
         self.session.intent_paused.clear();
         self.session.retire_player_work();
@@ -927,13 +931,12 @@ impl Daemon {
     /// accessory's audio (or a claim is deferred waiting for it) and the
     /// pods have not granted it.
     pub(crate) fn roster_intent(&self, now: Clock) -> bool {
-        let waiting = self
-            .session
-            .deferred_playback_claim
-            .is_some_and(|at| now.mono.saturating_since(at) <= INTENT_AIR_MS);
-        (self.output.wants_output() || waiting)
-            && self.accessory.ownership.as_fresh() != Some(&true)
-            && !self.accessory.stowed()
+        let pending = match self.session.claim {
+            PlaybackClaim::Active => true,
+            PlaybackClaim::Deferred(at) => now.mono.saturating_since(at) <= INTENT_AIR_MS,
+            PlaybackClaim::Idle => false,
+        };
+        pending && self.accessory.ownership.as_fresh() != Some(&true) && !self.accessory.stowed()
     }
 
     /// A fleet peer announced it intends to claim this accessory. If this
@@ -984,7 +987,7 @@ impl Daemon {
         self.session.yield_pause_at = Some(now.mono);
         self.session.rejoin = None;
         self.session.background_requested = false;
-        self.session.deferred_playback_claim = None;
+        self.session.claim = PlaybackClaim::Idle;
         self.release_playback(Release::Handoff, now);
     }
 
@@ -1072,6 +1075,9 @@ impl Daemon {
 
     pub(crate) fn claim_playback(&mut self, now: Clock) {
         self.activity_at = None;
+        self.session.stem_loss_at = None;
+        self.session.stem_peer = None;
+        self.session.stem_claims_sent = 0;
         // Play intent belongs to the pair in the user's ears. If a
         // tracked pair is worn and the selected pair is not, switch to
         // it first (its wear transition may have been missed, e.g. the
@@ -1095,7 +1101,7 @@ impl Daemon {
         // streams for the whole takeover hold while nothing can arrive, so
         // local playback would sit silent for seconds before falling back.
         if self.accessory.stowed() || self.accessory.both_docked() {
-            self.session.deferred_playback_claim = Some(now.mono);
+            self.session.claim = PlaybackClaim::Deferred(now.mono);
             self.return_to_speakers(now);
 
             return;
@@ -1110,12 +1116,12 @@ impl Daemon {
             // Advertisements alone make a bud available, and tick then
             // claims independently of control readiness. No seat yield:
             // playback stays local so the deferred claim can still fire.
-            self.session.deferred_playback_claim = Some(now.mono);
+            self.session.claim = PlaybackClaim::Deferred(now.mono);
             self.release_playback(Release::AwaitAvailability, now);
 
             return;
         }
-        self.session.deferred_playback_claim = None;
+        self.session.claim = PlaybackClaim::Idle;
         // Fleet admission only blocks opening a new link. A ready local link
         // can route a genuine play immediately, even before admission completes.
         if self.config.accessory.is_none() {
@@ -1152,6 +1158,10 @@ impl Daemon {
         self.roster_probe = None;
         self.roster_probe_after = None;
         self.session.resume_output_on_grant = false;
+        self.session.ownership_loss_at = None;
+        self.session.stem_loss_at = None;
+        self.session.stem_peer = None;
+        self.session.stem_claims_sent = 0;
         self.end_capture();
         self.microphone.set_control_ready(false);
         self.accessory.drop_owner();
@@ -1345,8 +1355,13 @@ impl Daemon {
             "fleetpodsd: media event source=airpods ownership_local={local} mono_ms={}",
             now.mono.0
         );
+        let was_local = self.accessory.ownership.as_fresh() == Some(&true);
+        if !local && was_local && self.audio.local_playing() && self.output.wants_output() {
+            self.session.ownership_loss_at = Some(now.mono);
+        }
         self.note_ownership(local, now.mono);
         if local {
+            self.session.ownership_loss_at = None;
             self.session.setup_claim_at = None;
             self.session.yield_pending = false;
         }
@@ -1357,6 +1372,64 @@ impl Daemon {
             self.yield_to_remote_report(now);
         }
         self.effects.announce_dirty = true;
+    }
+
+    fn outside_owner(&self, now: Clock) -> Option<Address> {
+        let peer = match self.resolved(now).holder {
+            crate::audio::seat::Holder::Remote { address: Some(peer), .. } => Some(peer),
+            crate::audio::seat::Holder::Remote { address: None, .. } => {
+                self.accessory.remote_address.as_fresh().copied()
+            }
+            _ => None,
+        }?;
+        (self.local_address != Some(peer) && !self.membership.contains(peer)).then_some(peer)
+    }
+
+    /// Remember an outside takeover from active local playback. Its
+    /// started session is contested below without reclaiming the
+    /// output, which would restart the pods' routing competition.
+    fn note_stem_context(&mut self, peer: Address, now: Clock) {
+        self.session.stem_loss_at = Some(now.mono);
+        self.session.stem_peer = Some(peer);
+        self.session.stem_claims_sent = 0;
+    }
+
+    /// A stem click aimed at this laptop's active playback is delivered
+    /// to the outside host. Once that session actually starts, answer
+    /// it with ownership only; bounded repeats cover its insistence.
+    pub(crate) fn contest_started_outside_playback(
+        &mut self,
+        peer: Address,
+        playing: bool,
+        now: Clock,
+    ) {
+        if !playing
+            || self.session.stem_peer != Some(peer)
+            || self.session.stem_claims_sent >= STEM_CONTEST_MAX_CLAIMS
+        {
+            return;
+        }
+        let Some(loss_at) = self.session.stem_loss_at else {
+            return;
+        };
+        if now.mono.saturating_since(loss_at) > STEM_CONTEST_WINDOW_MS {
+            self.session.stem_loss_at = None;
+            self.session.stem_peer = None;
+            self.session.stem_claims_sent = 0;
+            return;
+        }
+        if self.connection.stage() != Stage::Ready || self.audio.local_playing() {
+            return;
+        }
+        self.session.stem_claims_sent += 1;
+        eprintln!(
+            "fleetpodsd: outside peer {} started {} ms after ownership moved; contesting ownership ({}/{})",
+            peer.display(),
+            now.mono.saturating_since(loss_at),
+            self.session.stem_claims_sent,
+            STEM_CONTEST_MAX_CLAIMS
+        );
+        self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
     }
 
     pub(crate) fn observe_source(
@@ -1416,10 +1489,20 @@ impl Daemon {
             return;
         }
         if self.connection.stage() == Stage::Ready && self.output.wants_output() {
+            let stem_peer =
+                if self.audio.local_playing() && self.session.ownership_loss_at.is_some() {
+                    self.outside_owner(now)
+                } else {
+                    None
+                };
+            self.session.ownership_loss_at = None;
             eprintln!("fleetpodsd: AirPods audio moved remotely; pausing local players");
             self.session.yield_pause_at = Some(now.mono);
             self.step_back(now);
             self.session.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
+            if let Some(peer) = stem_peer {
+                self.note_stem_context(peer, now);
+            }
         }
     }
     pub(crate) fn observe_audio_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
@@ -1489,8 +1572,10 @@ impl Daemon {
             // The link this claim is waiting for is still on its way: the
             // speakers keep the stream for now, and the deferred claim
             // lands the play when the link arrives.
-            self.session.deferred_playback_claim = Some(now.mono);
+            self.session.claim = PlaybackClaim::Deferred(now.mono);
             self.seat_audio_failure(failure, now);
+        } else {
+            self.session.claim = PlaybackClaim::Idle;
         }
     }
     pub(crate) fn audio_server_lost(&mut self) {
@@ -1523,11 +1608,7 @@ impl Daemon {
                 .map(|at| self.session.resumed_players.remove(at))
                 .is_some();
         if self.audio.update_player(&service, playing) && !resumed {
-            if self.stem_toggle_repause(&service) {
-                self.effects.announce_dirty = true;
-                return;
-            }
-            if self.rebound_repause(&service, now) {
+            if self.replay_after_yield(&service, now) {
                 self.effects.announce_dirty = true;
                 return;
             }
@@ -1537,42 +1618,33 @@ impl Daemon {
             self.effects.announce_dirty = true;
         }
     }
-    /// A stem click on the pods toggles the players of every laptop the
-    /// pods are connected to. On a laptop that yielded, the toggle is the
-    /// active device's pause/resume key, not a takeover press: with no
-    /// desktop input since the yield, keep the player paused and stay
-    /// out of the claim. Desktop input (a click, or space over the
-    /// media) after the yield is a real press and takes over normally.
-    fn stem_toggle_repause(&mut self, service: &str) -> bool {
-        let Some(yielded_at) = self.session.yield_pause_at else {
-            return false;
-        };
-        if !self.session.yield_paused.iter().any(|name| name == service) {
-            return false;
-        }
-        if self.accessory.ownership.as_fresh() == Some(&true) {
-            return false;
-        }
-        if self.session.last_input_at.is_some_and(|at| at > yielded_at) {
-            return false;
-        }
-        eprintln!(
-            "fleetpodsd: player {service:?} toggled by the pods while yielded; keeping it paused"
-        );
-        self.effects.pause_players.push(service.to_string());
-        true
-    }
-
-    /// A player paused for a yield that reports Playing again within the
-    /// rebound window, while the remote owner is playing, resumed by
-    /// itself (an output-device change looks like an ended interruption),
-    /// not from a press. Re-pause every such replay until the window
-    /// expires; a press after that is intent.
-    fn rebound_repause(&mut self, service: &str, now: Clock) -> bool {
+    /// Classify a player reporting Playing after this laptop yielded.
+    /// Two replays are not takeover presses and are re-paused here:
+    ///
+    /// - a stem toggle: the pods toggle every connected laptop's
+    ///   players, so a player this yield paused comes back whenever the
+    ///   active device is paused or resumed from the pods;
+    /// - a self-rebound: within the rebound window, an output-device
+    ///   change looks like an ended interruption and restarts playback
+    ///   while the remote owner is playing.
+    ///
+    /// Desktop input after the yield (a click, or space over the media)
+    /// makes either one a real press that takes over normally.
+    fn replay_after_yield(&mut self, service: &str, now: Clock) -> bool {
         let Some(at) = self.session.yield_pause_at else {
             return false;
         };
-
+        let input = self.session.last_input_at;
+        if self.session.yield_paused.iter().any(|name| name == service)
+            && self.accessory.ownership.as_fresh() != Some(&true)
+            && !input.is_some_and(|at_input| at_input > at)
+        {
+            eprintln!(
+                "fleetpodsd: player {service:?} toggled by the pods while yielded; keeping it paused"
+            );
+            self.effects.pause_players.push(service.to_string());
+            return true;
+        }
         if now.mono.saturating_since(at) > REBOUND_WINDOW_MS {
             self.session.yield_pause_at = None;
             return false;
@@ -1598,9 +1670,7 @@ impl Daemon {
         // took over (the space bar counts; no mouse is needed). Input
         // from before the yield is just the session that got paused.
         // The yield is over, so the guard lifts with it.
-        if self
-            .session
-            .last_input_at
+        if input
             .is_some_and(|input| input >= at && now.mono.saturating_since(input) <= INPUT_INTENT_MS)
         {
             self.session.yield_pause_at = None;
@@ -1718,44 +1788,39 @@ impl Daemon {
             self.session.resume_output_on_grant = false;
         }
         let requested = self.session.resume_output_on_grant || self.session.rearm_after_loss;
-        if granted && requested && !retry {
+        if granted && (requested || retry) {
             // Route directly first: the sink restart on every grant cost
             // most of a second, and the failed node it protected against
             // shows up as a silent transport, which the verification
-            // deadline turns into the rebuild below. The players keep
-            // playing; nothing is paused for an output that stays up.
-            let direct = match (self.config.accessory, self.last_graph.as_ref()) {
-                (Some(address), Some(graph)) => self.session.verification.begin_direct(
-                    self.connection.generation(),
-                    now.mono,
-                    |id| self.output.begin_direct(id, address, graph, now.mono),
-                ),
-                _ => self.session.verification.begin_direct(
-                    self.connection.generation(),
-                    now.mono,
-                    |_| true,
-                ),
-            };
-            if direct {
-                self.session.resume_output_on_grant = false;
-                self.session.rearm_after_loss = false;
-                eprintln!(
-                    "fleetpodsd: routing directly after ownership grant; rebuilding only if the transport stays silent"
-                );
-            }
-        } else if granted && retry {
-            if let (Some(address), Some(graph)) = (self.config.accessory, self.last_graph.as_ref())
-            {
-                if self.session.verification.was_direct() {
-                    self.output.cancel_recovery();
-                }
-                let began = self.session.verification.begin(
+            // deadline turns into a rebuild. The router owns the
+            // direct-to-rebuild transition; a direct route keeps the
+            // players playing, a rebuild pauses them below.
+            let direct = requested && !retry;
+            let began = match (self.config.accessory, self.last_graph.as_ref()) {
+                (Some(address), Some(graph)) => self.session.verification.begin_claim(
                     requested,
                     self.connection.generation(),
                     now.mono,
-                    |id| self.output.begin_recovery(id, address, graph, now.mono),
-                );
-                if began {
+                    direct,
+                    |id| self.output.begin_output(id, direct, address, graph, now.mono),
+                ),
+                _ if direct => self.session.verification.begin_claim(
+                    requested,
+                    self.connection.generation(),
+                    now.mono,
+                    true,
+                    |_| true,
+                ),
+                _ => false,
+            };
+            if began {
+                if direct {
+                    self.session.resume_output_on_grant = false;
+                    self.session.rearm_after_loss = false;
+                    eprintln!(
+                        "fleetpodsd: routing directly after ownership grant; rebuilding only if the transport stays silent"
+                    );
+                } else {
                     // Stop the media clock while its output is unavailable.
                     // This pause retains the playback claim, unlike yielding.
                     let players = self.audio.playing_players();
@@ -1941,7 +2006,7 @@ mod tests {
         daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, at(1_000));
         assert!(daemon.audio.local_playing());
         assert!(!daemon.output.wants_output());
-        assert!(daemon.session.deferred_playback_claim.is_some());
+        assert!(matches!(daemon.session.claim, PlaybackClaim::Deferred(_)));
         let generation = daemon.connection.generation();
         let mut effects =
             daemon.step(Input::ControlSocket { up: false, generation }, at(7_000)).effects;
@@ -1954,7 +2019,7 @@ mod tests {
         );
         assert!(daemon.audio.local_playing());
         assert!(
-            daemon.session.deferred_playback_claim.is_some(),
+            matches!(daemon.session.claim, PlaybackClaim::Deferred(_)),
             "insertion can still claim this play"
         );
     }
@@ -1992,13 +2057,13 @@ mod tests {
         // Probing absent pods only fails Host is down and cycles the adapter.
         assert!(!played.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
         assert!(!daemon.output.wants_output());
-        assert!(daemon.session.deferred_playback_claim.is_some());
+        assert!(matches!(daemon.session.claim, PlaybackClaim::Deferred(_)));
         // A bud appearing while playback continues still claims the seat.
         daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
         let appeared = daemon.step(Input::Tick, now);
         assert!(appeared.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
         assert!(daemon.output.wants_output());
-        assert!(daemon.session.deferred_playback_claim.is_none());
+        assert!(!matches!(daemon.session.claim, PlaybackClaim::Deferred(_)));
         let mutes: Vec<_> = appeared
             .effects
             .iter()
@@ -2022,7 +2087,7 @@ mod tests {
         daemon.handle(play("deferred"), now);
         // Playing, but never seen this session: no claim, no muted speakers.
         assert!(!daemon.output.wants_output());
-        assert!(daemon.session.deferred_playback_claim.is_some());
+        assert!(matches!(daemon.session.claim, PlaybackClaim::Deferred(_)));
         // Still nothing seen: a tick does not claim either.
         daemon.step(crate::step::Input::Tick, now);
         assert!(!daemon.output.wants_output());
@@ -2033,7 +2098,7 @@ mod tests {
         daemon.accessory.note_placement(false, Some(true), Some(false), now.mono);
         daemon.step(crate::step::Input::Tick, now);
         assert!(daemon.output.wants_output());
-        assert!(daemon.session.deferred_playback_claim.is_none());
+        assert!(!matches!(daemon.session.claim, PlaybackClaim::Deferred(_)));
     }
 
     #[test]

@@ -675,7 +675,7 @@ impl Daemon {
                 self.learn_apple_name(address, &label);
             }
             Observation::PeerPlaying { address, playing } => {
-                self.note_peer_playback(address, playing, now.mono);
+                self.note_peer_playback(address, playing, now);
             }
             Observation::PriorityAcknowledged => {
                 self.note_priority_ack();

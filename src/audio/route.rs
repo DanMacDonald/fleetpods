@@ -72,6 +72,9 @@ struct RouteState {
     takeover_started: Option<MonoMs>,
     missing_since: BTreeMap<(u32, u64), MonoMs>,
     recovery: Recovery,
+    /// The running recovery is a direct route (start only); a rebuild
+    /// supersedes its phases instead of waiting them out.
+    direct: bool,
     /// Released with the pods still connected: move streams off them too.
     returning: bool,
     asked_return: Option<MonoMs>,
@@ -166,6 +169,7 @@ impl RouteState {
     /// The audio server restarted. Stream serials from it are no longer the same streams.
     pub fn forget_server(&mut self) {
         self.recovery = Recovery::Idle;
+        self.direct = false;
         self.held.clear();
         self.missing_since.clear();
         self.quieted.clear();
@@ -192,6 +196,7 @@ impl RouteState {
             takeover_started: None,
             missing_since: BTreeMap::new(),
             recovery: Recovery::Idle,
+            direct: false,
             returning: false,
             asked_return: None,
         }
@@ -219,6 +224,7 @@ impl RouteState {
             since: now,
             until: now.saturating_add(5_000),
         };
+        self.direct = true;
         true
     }
 
@@ -231,6 +237,12 @@ impl RouteState {
         graph: &Graph,
         now: MonoMs,
     ) -> bool {
+        if self.direct {
+            // A direct route that stayed silent hands its phases over;
+            // the rebuild below owns the recovery from here.
+            self.recovery = Recovery::Idle;
+            self.direct = false;
+        }
         if self.recovering() || !self.want {
             return false;
         }
@@ -314,6 +326,7 @@ impl RouteState {
             return false;
         }
         self.recovery = Recovery::Idle;
+        self.direct = false;
         if !ok {
             self.want = false;
         }
@@ -479,23 +492,22 @@ impl Router {
         true
     }
 
-    /// Start the existing output for a direct route: no parking, no sink
-    /// restart, only the relink/settle/start phases that wake the node.
-    pub fn begin_direct(
+    /// Bring the output up for a claim. A direct route starts the
+    /// existing sink once streams settle; a rebuild parks and restarts
+    /// it. The router owns the transition: a rebuild supersedes a
+    /// direct route's phases without the caller coordinating it.
+    pub fn begin_output(
         &mut self,
         id: u64,
+        direct: bool,
         accessory: Address,
         graph: &Graph,
         now: MonoMs,
     ) -> bool {
-        self.state.begin_direct(id, accessory, graph, now)
-    }
-
-    /// Abandon a direct route's start phases so a rebuild can own the
-    /// recovery. Only the verification layer decides this, when its
-    /// direct attempt gives up.
-    pub fn cancel_recovery(&mut self) {
-        self.state.recovery = Recovery::Idle;
+        if direct {
+            return self.state.begin_direct(id, accessory, graph, now);
+        }
+        self.begin_recovery(id, accessory, graph, now)
     }
 
     pub fn finish_recovery(&mut self, id: u64, ok: bool) -> bool {
@@ -885,6 +897,7 @@ fn release(
     now: MonoMs,
 ) -> RouteAction {
     state.recovery = Recovery::Idle;
+    state.direct = false;
     let restore = std::mem::take(&mut state.held);
     state.quieted.clear();
     state.restore_sent.clear();
@@ -1620,7 +1633,7 @@ mod tests {
         );
         let mut router = Router::new();
         router.claim();
-        assert!(router.begin_recovery(7, pods, &picture, MonoMs(0)));
+        assert!(router.begin_output(7, false, pods, &picture, MonoMs(0)));
         let mut phases = vec![router.clone()];
         router.on_graph(Some(pods), &picture, false, MonoMs(10));
         phases.push(router.clone()); // Reset request is still queued.
