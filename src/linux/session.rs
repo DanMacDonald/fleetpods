@@ -1,7 +1,7 @@
 //! The process loop. Commands and adapter reports enter through `Daemon::step`.
 //! The BlueZ thread sends the same [`Input`] values the acceptance world does.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use crate::panel::ipc::Command;
 use crate::pods::lifecycle::{Profiles, RequestId};
+use crate::retry::{Delay, Limit, Policy, Requests, State as TaskState, Task};
 use crate::step::{Effect, Input, TransportReply};
-use crate::types::{Address, Clock, Generation};
+use crate::types::{Address, Clock, Generation, MonoMs};
 use crate::Daemon;
 
 use super::bluez::{self, Bus, CallResult, Device, Notice};
@@ -609,28 +610,14 @@ enum SecretJob {
 enum CallKind {
     StartDiscovery,
     StopDiscovery,
-    Disconnect {
-        address: Address,
-        generation: Generation,
-    },
-    Profile {
-        id: RequestId,
-    },
-    Handsfree {
-        id: RequestId,
-    },
-    Advertise,
-    Unadvertise,
+    Disconnect { address: Address, generation: Generation },
+    Profile { id: RequestId },
+    Handsfree { id: RequestId },
+    Advertise { id: RequestId },
+    Unadvertise { id: RequestId },
     Remove,
-    RestartDisconnect {
-        id: u64,
-        address: Address,
-    },
-    RestartConnect {
-        id: u64,
-    },
-    /// Our own write of Adapter1 `Powered`. The value is the one we asked for.
-    Power(bool),
+    RestartDisconnect { id: u64, address: Address },
+    RestartConnect { id: u64 },
 }
 
 struct PendingCall {
@@ -749,10 +736,10 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         sync(&reports, configured, &mut live);
     }
     loop {
-        let timeout = poll_timeout(&live);
+        let timeout = poll_timeout(&live, Instant::now());
         let polled_socket = live.link.identity();
         let (dbus_ready, socket_ready) = wait(&wake, &bus, &live.link, timeout);
-        expire_calls(&bus, &reports, &mut live);
+        expire_calls(&reports, &mut live);
         expire_connect(&reports, &mut live);
         let mut stop = false;
         while let Ok(job) = jobs.try_recv() {
@@ -830,12 +817,16 @@ fn worker(jobs: Receiver<Job>, reports: Sender<Input>, configured: Option<Addres
         } else if socket_ready {
             eprintln!("fleetpodsd: discarded readiness for a replaced control socket");
         }
-        service_controller_reset(&bus, &reports, &mut live);
         report_profiles(&reports, &mut live);
+        if live.bluez_back_pending {
+            bluez_returned(&reports, configured, &mut live, bus.inventory().ok());
+        }
+        observe_foreign_pairing_devices(&mut live, configured, Instant::now());
         if live.air.want_scan {
             verify_scan(&bus, &mut live);
             ensure_scan(&bus, &mut live);
         }
+        service_advertisement(&bus, &mut live);
     }
     live.link.close();
 }
@@ -861,8 +852,7 @@ struct Live {
     /// selected device, so absence is not unpairing until that device has
     /// been reported again (or explicitly removed).
     restoring_bluez: bool,
-    /// `BluezBack` waits until the post-restart power cycle finishes, so the
-    /// daemon does not reconnect into a controller that is about to go down.
+    /// `BluezBack` waits for inventory from the restarted bluetoothd.
     bluez_back_pending: bool,
     /// Deduplicated observations; scheduling lives in pods::lifecycle.
     reported_profiles: Option<Profiles>,
@@ -875,7 +865,7 @@ struct Live {
     // emitted once per ACL rather than on every notice.
     air: Air,
     /// Other paired AirPods already reported to the daemon, by name.
-    known_reported: HashMap<Address, String>,
+    known_reported: HashMap<Address, (String, bool)>,
 }
 
 impl Default for Live {
@@ -914,9 +904,7 @@ fn report_profiles(reports: &Sender<Input>, live: &mut Live) {
     let device = live.devices.iter().find(|d| d.address == address);
     let profiles = Profiles {
         accessory: address,
-        connected: live.connected == Some(true)
-            && live.held == Some(address)
-            && !live.air.reset_blocks_scan(),
+        connected: live.connected == Some(true) && live.held == Some(address),
         services_resolved: device.is_some_and(|d| d.connected && d.services_resolved),
         handsfree: device.is_some_and(|d| d.handsfree),
         busy: profile_busy(live, true),
@@ -948,10 +936,7 @@ fn connect_profile(
     id: RequestId,
     handsfree: bool,
 ) {
-    let failure = if id.generation != live.generation
-        || live.held != Some(address)
-        || live.air.reset_blocks_scan()
-    {
+    let failure = if id.generation != live.generation || live.held != Some(address) {
         Some(TransportReply::Failed)
     } else if profile_busy(live, handsfree) {
         Some(TransportReply::Busy)
@@ -985,26 +970,19 @@ fn connect_profile(
 
 /// How often a scan believed to be running is confirmed with BlueZ.
 const SCAN_CHECK: Duration = Duration::from_secs(30);
-/// Pause between attempts to power the controller off or back on.
-const RESET_RETRY: Duration = Duration::from_secs(2);
-/// Give up turning the adapter off after this many failed writes. Turning it
-/// back on is not capped: a failed "on" would otherwise leave the radio down.
-const RESET_OFF_LIMIT: u8 = 3;
-
-/// One power cycle after bluetoothd returns. `Discovering` can stay true
-/// across that restart while the controller delivers no AirPods advertisements.
-/// Cycling `Powered` is what makes those advertisements arrive again.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ControllerReset {
-    #[default]
-    Idle,
-    /// Ask BlueZ to set `Powered` false, once `at` has passed.
-    Off { at: Instant },
-    /// Ask BlueZ to set `Powered` true. Do not turn it off again.
-    On { at: Instant },
+/// Five attempts per advertisement lifetime, waiting 5/10/20/40 seconds.
+const ADVERTISEMENT_POLICY: Policy = Policy {
+    delay: Delay::Staged(&[5_000, 10_000, 20_000, 40_000]),
+    limit: Limit::Attempts(5),
+    // PendingCall owns the bounded D-Bus timeout and reports it as failure.
+    request_timeout_ms: None,
+    confirmation_timeout_ms: None,
+};
+enum AdvertisementAction {
+    Register(RequestId),
+    Unregister(RequestId),
 }
 
-#[derive(Default)]
 struct Air {
     current: Vec<u8>,
     /// True only after RegisterAdvertisement has succeeded.
@@ -1019,14 +997,180 @@ struct Air {
     /// Yield our scan while the user pairs through the Bluetooth panel.
     pairing_until: Option<Instant>,
     pairing_prepare_at: Option<Instant>,
+    /// Connected, unbonded classic-audio devices on this adapter, by the
+    /// last time BlueZ reported them. Their connection is a pairing or
+    /// profile-connect window owned by another client.
+    foreign_pairing: HashSet<Address>,
+    foreign_pairing_until: Option<Instant>,
+    advertisement: Task,
+    /// A release stays pending until BlueZ confirms removal, even after failure.
+    removal: Option<Task>,
+    requests: Requests,
+    clock_origin: Instant,
     scan_transport: Option<&'static str>,
-    reset: ControllerReset,
-    reset_off_failures: u8,
+}
+
+impl Default for Air {
+    fn default() -> Self {
+        Self {
+            current: Vec::new(),
+            registered: false,
+            wanted: false,
+            want_scan: false,
+            scanned: false,
+            scan_checked_at: None,
+            scan_retry_at: None,
+            pairing_until: None,
+            pairing_prepare_at: None,
+            foreign_pairing: HashSet::new(),
+            foreign_pairing_until: None,
+            advertisement: Task::new(ADVERTISEMENT_POLICY),
+            removal: None,
+            requests: Requests::default(),
+            clock_origin: Instant::now(),
+            scan_transport: None,
+        }
+    }
 }
 
 impl Air {
     fn pairing_paused(&self, now: Instant) -> bool {
         self.pairing_until.is_some_and(|until| now < until)
+            || self.foreign_pairing_until.is_some_and(|until| now < until)
+    }
+
+    /// BlueZ state for one non-configured device, from the platform's
+    /// device inventory. A connected unbonded classic-audio device means
+    /// another client owns a pair/connect handshake on this adapter.
+    fn observe_foreign_pairing(
+        &mut self,
+        address: Address,
+        connected: bool,
+        bonded: bool,
+        now: Instant,
+    ) {
+        if bonded {
+            if self.foreign_pairing.remove(&address) {
+                self.foreign_pairing_until = Some(now + Duration::from_secs(5));
+            }
+            return;
+        }
+        if connected {
+            self.foreign_pairing.insert(address);
+            self.foreign_pairing_until = Some(now + Duration::from_secs(15));
+            return;
+        }
+        if self.foreign_pairing.remove(&address) && self.foreign_pairing.is_empty() {
+            // The attempt ended without a bond; keep a short quiet tail
+            // so a retry is not chased by a scan restart.
+            self.foreign_pairing_until = Some(now + Duration::from_secs(10));
+        }
+    }
+
+    fn monotonic(&self, now: Instant) -> MonoMs {
+        MonoMs(now.saturating_duration_since(self.clock_origin).as_millis() as u64)
+    }
+
+    fn request_advertisement(&mut self, bytes: Vec<u8>) {
+        if !self.wanted {
+            self.advertisement.reset();
+        }
+        self.current = bytes;
+        self.wanted = true;
+    }
+
+    fn release_advertisement(&mut self) {
+        self.wanted = false;
+        self.advertisement.reset();
+    }
+
+    /// Decide and reserve the next operation together. The adapter executes
+    /// it; callers do not repeat intent, pairing or in-flight gates.
+    fn advance_advertisement(
+        &mut self,
+        now: Instant,
+        calls: &[PendingCall],
+    ) -> Option<AdvertisementAction> {
+        if calls.iter().any(|call| matches!(call.kind, CallKind::Unadvertise { .. })) {
+            return None;
+        }
+        let registering = calls.iter().any(|call| matches!(call.kind, CallKind::Advertise { .. }));
+        if (!self.wanted || self.pairing_paused(now)) && (self.registered || registering) {
+            self.retire_advertisement();
+        }
+        let at = self.monotonic(now);
+        if let Some(removal) = &mut self.removal {
+            return removal
+                .launch(&mut self.requests, Generation(0), at)
+                .map(AdvertisementAction::Unregister);
+        }
+        if !self.wanted || self.pairing_paused(now) || self.registered || registering {
+            return None;
+        }
+        self.advertisement
+            .launch(&mut self.requests, Generation(0), at)
+            .map(AdvertisementAction::Register)
+    }
+
+    fn advertisement_reply(&mut self, id: RequestId, accepted: bool, now: Instant) {
+        let current = self.advertisement.reply(id, accepted, self.monotonic(now));
+        // Even a cancelled request can have reserved the BlueZ slot. Keep
+        // that observation so reconciliation removes it when no longer wanted;
+        // its stale reply cannot complete a newer task or revive intent.
+        if accepted {
+            self.registered = true;
+            if !current {
+                self.retire_advertisement();
+            }
+        }
+    }
+
+    fn retire_advertisement(&mut self) {
+        self.removal.get_or_insert_with(|| Task::new(ADVERTISEMENT_POLICY));
+    }
+
+    fn advertisement_removal_reply(&mut self, id: RequestId, removed: bool, now: Instant) {
+        let at = self.monotonic(now);
+        if self.removal.as_mut().is_some_and(|task| task.reply(id, removed, at)) && removed {
+            self.advertisement_removed();
+        }
+    }
+
+    fn advertisement_removed(&mut self) {
+        self.registered = false;
+        self.removal = None;
+        // Removing a working registration ends that resource lifetime. A
+        // failed attempt retains its budget/backoff through cleanup or pairing.
+        if matches!(
+            self.advertisement.state(),
+            TaskState::Succeeded { .. } | TaskState::Running { .. }
+        ) {
+            self.advertisement.reset();
+        }
+    }
+
+    fn advertisement_wake(&self, now: Instant) -> Option<Instant> {
+        if let Some(removal) = &self.removal {
+            return match removal.state() {
+                TaskState::Backoff { until } | TaskState::Deferred { until } => {
+                    Some(self.clock_origin + Duration::from_millis(until.0))
+                }
+                TaskState::Idle => Some(now),
+                _ => None,
+            };
+        }
+        if !self.wanted {
+            return None;
+        }
+        if self.pairing_paused(now) {
+            return self.pairing_until.into_iter().chain(self.foreign_pairing_until).max();
+        }
+        match self.advertisement.state() {
+            TaskState::Backoff { until } | TaskState::Deferred { until } => {
+                Some(self.clock_origin + Duration::from_millis(until.0))
+            }
+            _ => None,
+        }
     }
 
     fn observe_pairing(&mut self, paired: bool, payload: Option<&[u8]>, now: Instant) {
@@ -1063,101 +1207,31 @@ impl Air {
     fn scan_due(&self, now: Instant) -> bool {
         !self.scanned && !self.pairing_paused(now) && self.scan_retry_at.is_none_or(|at| now >= at)
     }
-
-    /// bluetoothd has a new owner. A cycle already in flight is the one for
-    /// this return; a second signal must not start another.
-    fn arm_controller_reset(&mut self, now: Instant) {
-        if self.reset_blocks_scan() {
-            return;
-        }
-        self.reset = ControllerReset::Off { at: now };
-        self.reset_off_failures = 0;
-    }
-
-    fn cancel_controller_reset(&mut self) {
-        self.reset = ControllerReset::Idle;
-        self.reset_off_failures = 0;
-    }
-
-    fn reset_blocks_scan(&self) -> bool {
-        !matches!(self.reset, ControllerReset::Idle)
-    }
-
-    fn reset_deadline(&self) -> Option<Instant> {
-        match self.reset {
-            ControllerReset::Off { at } | ControllerReset::On { at } => Some(at),
-            ControllerReset::Idle => None,
-        }
-    }
-
-    fn delay_reset(&mut self, at: Instant) {
-        self.reset = match self.reset {
-            ControllerReset::Off { .. } => ControllerReset::Off { at },
-            ControllerReset::On { .. } => ControllerReset::On { at },
-            ControllerReset::Idle => ControllerReset::Idle,
-        };
-    }
-
-    /// The next `Powered` value to write, when its wait has elapsed.
-    fn power_request(&self, now: Instant) -> Option<bool> {
-        match self.reset {
-            ControllerReset::Off { at } if now >= at => Some(false),
-            ControllerReset::On { at } if now >= at => Some(true),
-            _ => None,
-        }
-    }
-
-    /// `up` is the value just requested. The adapter's own Powered signal does
-    /// not come through here: that signal is how the cycle looks from outside,
-    /// and treating it as a new return would cycle forever.
-    fn note_power_reply(&mut self, up: bool, ok: bool, now: Instant) {
-        if ok && !up {
-            self.reset_off_failures = 0;
-            self.reset = ControllerReset::On { at: now };
-            return;
-        }
-        if ok && up {
-            self.reset = ControllerReset::Idle;
-            self.reset_off_failures = 0;
-            // The power-down signal scheduled a scan retry. Discovery should
-            // start now, on the controller that just came back.
-            if self.want_scan {
-                self.scanned = false;
-                self.scan_retry_at = None;
-            }
-            return;
-        }
-        if up {
-            self.reset = ControllerReset::On { at: now + RESET_RETRY };
-            return;
-        }
-        self.reset_off_failures = self.reset_off_failures.saturating_add(1);
-        if self.reset_off_failures >= RESET_OFF_LIMIT {
-            self.reset = ControllerReset::Idle;
-            self.reset_off_failures = 0;
-            return;
-        }
-        self.reset = ControllerReset::Off { at: now + RESET_RETRY };
-    }
 }
 
-fn poll_timeout(live: &Live) -> i32 {
-    let now = Instant::now();
+fn poll_timeout(live: &Live, now: Instant) -> i32 {
     let mut timeout = (!live.calls.is_empty()).then_some(1_000);
+    if live.bluez_back_pending {
+        timeout = Some(timeout.map_or(1_000, |current| current.min(1_000)));
+    }
     if live.link.connecting() {
         // Wake at least once a second so a hung connect meets its deadline.
         timeout = Some(timeout.map_or(1_000, |current| current.min(1_000)));
     }
-    if live.air.want_scan && !live.air.reset_blocks_scan() {
+    if live.air.want_scan {
         // A running scan is rechecked; see verify_scan. A scan that needs
         // a new session is retried on the one-second poll.
         let scan = if live.air.scanned { SCAN_CHECK.as_millis() as i32 } else { 1_000 };
         timeout = Some(timeout.map_or(scan, |current| current.min(scan)));
     }
-    let power_in_flight = live.calls.iter().any(|call| matches!(call.kind, CallKind::Power(_)));
-    if !power_in_flight {
-        if let Some(at) = live.air.reset_deadline() {
-            let wait = at.saturating_duration_since(now).as_millis().min(60_000) as i32;
+    if live.adapter_path.is_some()
+        && !live.calls.iter().any(|call| {
+            matches!(call.kind, CallKind::Advertise { .. } | CallKind::Unadvertise { .. })
+        })
+    {
+        if let Some(at) = live.air.advertisement_wake(now) {
+            let wait =
+                at.saturating_duration_since(now).as_millis().clamp(1, i32::MAX as u128) as i32;
             timeout = Some(timeout.map_or(wait, |current| current.min(wait)));
         }
     }
@@ -1300,18 +1374,9 @@ fn handle_job(
             true
         }
         Job::Advertise(bytes) => {
-            live.air.wanted = true;
-            live.air.current = bytes;
+            live.air.request_advertisement(bytes);
             let _ = emit_service_data(bus, &live.air.current);
             ensure_scan(bus, live);
-            if !live.air.registered
-                && !live
-                    .calls
-                    .iter()
-                    .any(|call| matches!(call.kind, CallKind::Advertise | CallKind::Unadvertise))
-            {
-                register_advertisement(bus, live);
-            }
             true
         }
         Job::Listen => {
@@ -1413,17 +1478,25 @@ fn enqueue(
     Ok(())
 }
 
-fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
+fn expire_calls(reports: &Sender<Input>, live: &mut Live) {
     let pending = std::mem::take(&mut live.calls);
     let mut keep = Vec::new();
-    let mut advertisement_timed_out = false;
     for call in pending {
         if call.sent.elapsed() < Duration::from_secs(25) {
             keep.push(call);
             continue;
         }
-        if matches!(call.kind, CallKind::Advertise | CallKind::Unadvertise) {
-            advertisement_timed_out = true;
+        match call.kind {
+            CallKind::Advertise { id } => {
+                live.air.advertisement_reply(id, false, Instant::now());
+                // The unanswered call may have reserved a slot. Its replacement
+                // must wait for confirmed cleanup, not just a timeout.
+                live.air.retire_advertisement();
+            }
+            CallKind::Unadvertise { id } => {
+                live.air.advertisement_removal_reply(id, false, Instant::now());
+            }
+            _ => {}
         }
         if matches!(call.kind, CallKind::StopDiscovery) {
             eprintln!("fleetpodsd: Bluetooth discovery stop timed out; retrying");
@@ -1431,10 +1504,6 @@ fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
         if matches!(call.kind, CallKind::StartDiscovery) {
             eprintln!("fleetpodsd: Bluetooth discovery start timed out; retrying");
             live.air.scan_result(false, Instant::now());
-        }
-        if let CallKind::Power(up) = call.kind {
-            eprintln!("fleetpodsd: adapter power set timed out");
-            settle_controller_reset(reports, live, up, false);
         }
         if let CallKind::Profile { id } = call.kind {
             eprintln!("fleetpodsd: AirPods audio profile request went unanswered");
@@ -1450,10 +1519,6 @@ fn expire_calls(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
         }
     }
     live.calls = keep;
-    if advertisement_timed_out {
-        live.air.registered = false;
-        unregister_advertisement(bus, live);
-    }
 }
 
 fn on_notice(
@@ -1498,12 +1563,7 @@ fn on_notice(
         }
         Notice::Name { present: false } => note_bluez_left(reports, live),
         Notice::Name { present: true } => {
-            // A direct owner replacement does not deliver a separate "gone"
-            // signal. One cycle covers that return; a cycle already in
-            // flight is that same return.
-            if !live.air.reset_blocks_scan() {
-                begin_controller_cycle(live);
-            }
+            note_bluez_returned(reports, live);
             bluez_returned(reports, configured, live, bus.inventory().ok());
         }
         Notice::Sleep(sleeping) => report_sleep(reports, live, sleeping),
@@ -1684,7 +1744,7 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
             }
             let _ = reports.send(Input::OutputRestarted { id, ok });
         }
-        CallKind::Advertise => {
+        CallKind::Advertise { id } => {
             let accepted = match &result {
                 CallResult::Done => true,
                 CallResult::Failed { name, .. } if name.ends_with("AlreadyExists") => true,
@@ -1693,22 +1753,17 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                     false
                 }
             };
-            live.air.registered = accepted;
-            if accepted && !live.air.wanted {
-                unregister_advertisement(bus, live);
-            }
+            live.air.advertisement_reply(id, accepted, Instant::now());
         }
-        CallKind::Unadvertise => {
-            // A new fragment waits until removal of the old registration finishes.
-            live.air.registered = false;
+        CallKind::Unadvertise { id } => {
             let removed = matches!(&result, CallResult::Done)
                 || matches!(&result, CallResult::Failed { name, .. } if name.ends_with("DoesNotExist"));
-            if removed
-                && live.air.wanted
-                && !live.calls.iter().any(|call| matches!(call.kind, CallKind::Advertise))
-            {
-                register_advertisement(bus, live);
+            if !removed {
+                eprintln!(
+                    "fleetpodsd: fleet advertisement removal failed; keeping cleanup pending"
+                );
             }
+            live.air.advertisement_removal_reply(id, removed, Instant::now());
         }
         CallKind::Disconnect { address, generation } => {
             let ok = matches!(&result, CallResult::Done)
@@ -1754,13 +1809,6 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 eprintln!("fleetpodsd: bluetooth call failed: {err}");
             }
         }
-        CallKind::Power(up) => {
-            let ok = matches!(result, CallResult::Done);
-            if let CallResult::Failed { name, message } = &result {
-                eprintln!("fleetpodsd: adapter power set failed: {name}: {message}");
-            }
-            settle_controller_reset(reports, live, up, ok);
-        }
     }
 }
 
@@ -1799,30 +1847,36 @@ fn note_bluez_left(reports: &Sender<Input>, live: &mut Live) {
     // These registrations belong to the old bluetoothd instance.
     live.restoring_bluez = true;
     live.bluez_back_pending = false;
-    live.air.cancel_controller_reset();
     live.air.scan_result(false, Instant::now());
-    live.air.registered = false;
+    live.air.advertisement_removed();
+    live.air.advertisement.reset();
     live.air.scan_transport = None;
     drop_restarted_calls(live);
     live.defer_attach = true;
     live.devices.clear();
+    report_known_accessories(reports, live);
     let _ = reports.send(Input::BluezLost);
     note_connected(live, reports, false);
 }
 
-fn begin_controller_cycle(live: &mut Live) {
+fn note_bluez_returned(reports: &Sender<Input>, live: &mut Live) {
+    // Registrations and discovery belonged to the old bluetoothd
+    // instance. Resync from the new one's inventory; never answer a
+    // bluetoothd restart by toggling Adapter1.Powered.
     drop_restarted_calls(live);
-    live.air.registered = false;
+    live.air.advertisement_removed();
+    live.air.advertisement.reset();
     live.air.scan_transport = None;
     live.air.scan_result(false, Instant::now());
-    live.air.arm_controller_reset(Instant::now());
     live.bluez_back_pending = true;
-    eprintln!("fleetpodsd: bluetoothd returned; power-cycling the adapter");
+    // A direct owner replacement may arrive without a preceding loss notice.
+    live.devices.clear();
+    report_known_accessories(reports, live);
+    eprintln!("fleetpodsd: bluetoothd returned; resyncing inventory");
 }
 
-/// A Powered change on our controller. While a cycle is in progress the
-/// signal is that cycle, so the daemon stays in the bluetoothd-lost
-/// interrupt until [`settle_controller_reset`] sends one `BluezBack`.
+/// A Powered change on our controller, reported as an observation. The
+/// daemon decides what it means; this thread never writes Powered.
 fn report_adapter_power(reports: &Sender<Input>, live: &mut Live, path: &str, up: bool) {
     if live.adapter_path.as_deref() != Some(path) {
         return;
@@ -1831,9 +1885,6 @@ fn report_adapter_power(reports: &Sender<Input>, live: &mut Live, path: &str, up
         live.air.scan_result(false, Instant::now());
         live.defer_attach = true;
         close_control(live, reports);
-    }
-    if live.air.reset_blocks_scan() {
-        return;
     }
     let _ = reports.send(Input::AdapterPower(up));
 }
@@ -1849,10 +1900,12 @@ fn bluez_returned(
     if let Some(inventory) = inventory {
         remember_inventory(reports, configured, live, inventory);
         sync(reports, configured, live);
-    }
-    if live.bluez_back_pending {
+    } else if live.bluez_back_pending {
+        // Inventory is not readable yet; the poll retries the resync
+        // instead of reporting a return that never resynced.
         return;
     }
+    live.bluez_back_pending = false;
     let _ = reports.send(Input::BluezBack);
 }
 
@@ -1862,77 +1915,10 @@ fn drop_restarted_calls(live: &mut Live) {
             call.kind,
             CallKind::StartDiscovery
                 | CallKind::StopDiscovery
-                | CallKind::Advertise
-                | CallKind::Unadvertise
-                | CallKind::Power(_)
+                | CallKind::Advertise { .. }
+                | CallKind::Unadvertise { .. }
         )
     });
-}
-
-fn settle_controller_reset(reports: &Sender<Input>, live: &mut Live, up: bool, ok: bool) {
-    live.air.note_power_reply(up, ok, Instant::now());
-    if ok && up {
-        eprintln!("fleetpodsd: adapter power cycle finished");
-    } else if !ok && !live.air.reset_blocks_scan() {
-        eprintln!("fleetpodsd: adapter power cycle failed; leaving the controller as it is");
-    } else if !ok {
-        eprintln!("fleetpodsd: adapter power change failed; retrying");
-    }
-    if live.bluez_back_pending && !live.air.reset_blocks_scan() {
-        live.bluez_back_pending = false;
-        let _ = reports.send(Input::BluezBack);
-    }
-}
-
-fn service_controller_reset(bus: &Bus, reports: &Sender<Input>, live: &mut Live) {
-    let now = Instant::now();
-    let Some(up) = live.air.power_request(now) else {
-        return;
-    };
-    if live.calls.iter().any(|call| matches!(call.kind, CallKind::Power(_))) {
-        return;
-    }
-    // bluetoothd can publish its bus name before the adapter object exists.
-    // Waiting must not use up the failed-write budget.
-    if live.adapter_path.is_none() {
-        live.air.delay_reset(now + RESET_RETRY);
-        return;
-    }
-    if !set_powered(bus, live, up) {
-        settle_controller_reset(reports, live, up, false);
-    }
-}
-
-fn set_powered(bus: &Bus, live: &mut Live, up: bool) -> bool {
-    let Some(path) = live.adapter_path.clone() else {
-        return false;
-    };
-    if live.calls.iter().any(|call| matches!(call.kind, CallKind::Power(_))) {
-        return false;
-    }
-    let Ok(message) = dbus::Message::new_method_call(
-        "org.bluez",
-        &path,
-        "org.freedesktop.DBus.Properties",
-        "Set",
-    ) else {
-        return false;
-    };
-    let message = message.append3("org.bluez.Adapter1", "Powered", dbus::arg::Variant(up));
-    match bus.submit(message) {
-        Ok(serial) => {
-            live.calls.push(PendingCall {
-                serial,
-                kind: CallKind::Power(up),
-                sent: Instant::now(),
-            });
-            true
-        }
-        Err(err) => {
-            eprintln!("fleetpodsd: adapter power request failed: {err}");
-            false
-        }
-    }
 }
 
 fn device_removed(
@@ -1981,6 +1967,26 @@ fn remember_inventory(
 }
 
 fn report_known_accessories(reports: &Sender<Input>, live: &mut Live) {
+    // Identity survives in the daemon; connection evidence belongs to this
+    // inventory. The selected accessory has its own connection reports.
+    live.known_reported.retain(|address, (name, connected)| {
+        if live.accessory == Some(*address) {
+            return false;
+        }
+        if live.devices.iter().any(|device| {
+            device.address == *address && device.has_pairing() && bluez::looks_like_pods(device)
+        }) {
+            return true;
+        }
+        if *connected {
+            let _ = reports.send(Input::KnownAccessory {
+                address: *address,
+                name: name.clone(),
+                connected: false,
+            });
+        }
+        false
+    });
     for device in &live.devices {
         if !device.has_pairing() || !bluez::looks_like_pods(device) {
             continue;
@@ -1988,15 +1994,20 @@ fn report_known_accessories(reports: &Sender<Input>, live: &mut Live) {
         if live.accessory == Some(device.address) {
             continue;
         }
-        if live.known_reported.get(&device.address) != Some(&device.name) {
-            live.known_reported.insert(device.address, device.name.clone());
-            let _ = reports
-                .send(Input::KnownAccessory { address: device.address, name: device.name.clone() });
+        let state = (device.name.clone(), device.connected);
+        if live.known_reported.get(&device.address) != Some(&state) {
+            live.known_reported.insert(device.address, state);
+            let _ = reports.send(Input::KnownAccessory {
+                address: device.address,
+                name: device.name.clone(),
+                connected: device.connected,
+            });
         }
     }
 }
 
 fn sync(reports: &Sender<Input>, configured: Option<Address>, live: &mut Live) {
+    observe_foreign_pairing_devices(live, configured, Instant::now());
     report_known_accessories(reports, live);
     if live.accessory.is_some_and(|address| live.devices.iter().any(|d| d.address == address)) {
         // The device is known again. Its Paired/Bonded values, including an
@@ -2075,6 +2086,9 @@ fn observe_pairing(bus: &Bus, live: &mut Live, payload: Option<&[u8]>) {
     let now = Instant::now();
     let bonded = live.bonded.is_some_and(|(_, saved)| saved);
     live.air.observe_pairing(bonded, payload, now);
+    if live.air.pairing_paused(now) {
+        yield_pairing_window(bus, live);
+    }
     if bonded
         || !live.air.pairing_paused(now)
         || live.air.pairing_prepare_at.is_some_and(|at| now < at)
@@ -2088,6 +2102,59 @@ fn observe_pairing(bus: &Bus, live: &mut Live, payload: Option<&[u8]>) {
             eprintln!("fleetpodsd: could not enable Bluetooth pairing: {err}");
             live.air.pairing_prepare_at = Some(now + Duration::from_secs(5));
         }
+    }
+}
+
+/// Feed every non-configured device's bond/connection state into the
+/// pairing window. Only classic-audio devices count: a headset, an
+/// AACP accessory, or an HFP device. This never selects the device,
+/// disconnects it, or opens its control socket.
+fn observe_foreign_pairing_devices(live: &mut Live, configured: Option<Address>, now: Instant) {
+    let mut present = std::collections::HashSet::new();
+    let devices: Vec<(Address, bool, bool)> = live
+        .devices
+        .iter()
+        .filter(|device| {
+            (device.control || device.handsfree || device.headset)
+                && Some(device.address) != configured
+                && live.accessory != Some(device.address)
+        })
+        .map(|device| (device.address, device.connected, device.has_pairing()))
+        .collect();
+    for (address, connected, bonded) in devices {
+        present.insert(address);
+        live.air.observe_foreign_pairing(address, connected, bonded, now);
+    }
+    let vanished: Vec<Address> = live
+        .air
+        .foreign_pairing
+        .iter()
+        .filter(|address| !present.contains(address))
+        .copied()
+        .collect();
+    for address in vanished {
+        live.air.observe_foreign_pairing(address, false, false, now);
+    }
+}
+
+/// Give another client's pairing/connect handshake the radio: release
+/// only this client's discovery session and its fleet advertisement.
+fn yield_pairing_window(bus: &Bus, live: &mut Live) {
+    if live.air.scanned {
+        stop_discovery(bus, live);
+    }
+    service_advertisement(bus, live);
+}
+
+/// Execute the advertisement owner's next operation when BlueZ is available.
+fn service_advertisement(bus: &Bus, live: &mut Live) {
+    if live.adapter_path.is_none() {
+        return;
+    }
+    match live.air.advance_advertisement(Instant::now(), &live.calls) {
+        Some(AdvertisementAction::Register(id)) => register_advertisement(bus, live, id),
+        Some(AdvertisementAction::Unregister(id)) => unregister_advertisement(bus, live, id),
+        None => {}
     }
 }
 
@@ -2207,12 +2274,8 @@ const ADV_MIN_MS: u32 = 100;
 const ADV_MAX_MS: u32 = 150;
 
 fn release_advertisement(bus: &Bus, live: &mut Live) {
-    live.air.wanted = false;
-    // BlueZ reserves a slot before registration completes. Cancel that slot too.
-    if live.air.registered || live.calls.iter().any(|call| matches!(call.kind, CallKind::Advertise))
-    {
-        unregister_advertisement(bus, live);
-    }
+    live.air.release_advertisement();
+    service_advertisement(bus, live);
     // Keep valid properties available until BlueZ finishes removing the object.
 }
 
@@ -2225,8 +2288,8 @@ fn release_air(bus: &Bus, live: &mut Live) {
     live.air.scanned = false;
 }
 
-fn unregister_advertisement(bus: &Bus, live: &mut Live) {
-    if live.calls.iter().any(|call| matches!(call.kind, CallKind::Unadvertise)) {
+fn unregister_advertisement(bus: &Bus, live: &mut Live, id: RequestId) {
+    if live.calls.iter().any(|call| matches!(call.kind, CallKind::Unadvertise { .. })) {
         return;
     }
     let Some(path) = live.adapter_path.clone() else {
@@ -2243,8 +2306,15 @@ fn unregister_advertisement(bus: &Bus, live: &mut Live) {
     ) else {
         return;
     };
-    if let Ok(serial) = bus.submit(message.append1(object)) {
-        live.calls.push(PendingCall { serial, kind: CallKind::Unadvertise, sent: Instant::now() });
+    let now = Instant::now();
+    match bus.submit(message.append1(object)) {
+        Ok(serial) => {
+            live.calls.push(PendingCall { serial, kind: CallKind::Unadvertise { id }, sent: now })
+        }
+        Err(err) => {
+            eprintln!("fleetpodsd: fleet advertisement removal submit failed: {err}");
+            live.air.advertisement_removal_reply(id, false, now);
+        }
     }
 }
 
@@ -2295,9 +2365,6 @@ fn set_scan_filter(bus: &Bus, live: &Live, transport: Option<&str>) {
 /// the daemon deaf to case and ear reports. Release the session and start
 /// a new one instead.
 fn verify_scan(bus: &Bus, live: &mut Live) {
-    if live.air.reset_blocks_scan() {
-        return;
-    }
     let now = Instant::now();
     if !live.air.scan_check_due(now)
         || live.air.pairing_paused(now)
@@ -2323,9 +2390,6 @@ fn verify_scan(bus: &Bus, live: &mut Live) {
 }
 
 fn ensure_scan(bus: &Bus, live: &mut Live) {
-    if live.air.reset_blocks_scan() {
-        return;
-    }
     let now = Instant::now();
     if live.air.pairing_paused(now) {
         if live.air.scanned {
@@ -2368,7 +2432,7 @@ fn ensure_scan(bus: &Bus, live: &mut Live) {
     }
 }
 
-fn register_advertisement(bus: &Bus, live: &mut Live) {
+fn register_advertisement(bus: &Bus, live: &mut Live, id: RequestId) {
     let Some(path) = live.adapter_path.clone() else {
         return;
     };
@@ -2384,10 +2448,16 @@ fn register_advertisement(bus: &Bus, live: &mut Live) {
         return;
     };
     let options: HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> = HashMap::new();
-    let Ok(serial) = bus.submit(message.append2(object, options)) else {
-        return;
-    };
-    live.calls.push(PendingCall { serial, kind: CallKind::Advertise, sent: Instant::now() });
+    let now = Instant::now();
+    match bus.submit(message.append2(object, options)) {
+        Ok(serial) => {
+            live.calls.push(PendingCall { serial, kind: CallKind::Advertise { id }, sent: now })
+        }
+        Err(err) => {
+            eprintln!("fleetpodsd: fleet advertisement submit failed: {err}");
+            live.air.advertisement_reply(id, false, now);
+        }
+    }
 }
 
 fn emit_service_data(bus: &Bus, payload: &[u8]) -> Result<(), String> {
@@ -2417,7 +2487,7 @@ fn serve_advertisement(bus: &Bus, live: &mut Live, message: &dbus::Message) -> b
     }
     let member = message.member().map(|member| member.to_string()).unwrap_or_default();
     if member == "Release" {
-        live.air.registered = false;
+        live.air.advertisement_removed();
     }
     if let Some(reply) = advertisement_reply(&live.air.current, message) {
         let _ = bus.submit(reply);
@@ -3002,127 +3072,6 @@ mod advertisement_tests {
     }
 
     #[test]
-    fn bluetoothd_returning_power_cycles_the_adapter_once() {
-        let now = Instant::now();
-        let mut air = Air { want_scan: true, ..Air::default() };
-        air.scan_result(true, now);
-        air.arm_controller_reset(now);
-        assert_eq!(air.power_request(now), Some(false));
-        assert!(air.reset_blocks_scan());
-        // The return signal and the Powered signals the cycle causes must not
-        // start a second cycle. Powered is not a reply, so it does not advance
-        // this one either: only the Set call's reply does.
-        air.arm_controller_reset(now + Duration::from_millis(1));
-        assert_eq!(air.power_request(now + Duration::from_millis(1)), Some(false));
-        air.note_power_reply(false, true, now);
-        assert_eq!(air.power_request(now), Some(true));
-        air.arm_controller_reset(now + Duration::from_millis(2));
-        assert_eq!(air.power_request(now + Duration::from_millis(2)), Some(true));
-        air.note_power_reply(true, true, now);
-        assert_eq!(air.power_request(now), None);
-        assert!(!air.reset_blocks_scan());
-        assert!(air.scan_due(now));
-        // The next time bluetoothd returns, one new cycle starts.
-        air.arm_controller_reset(now + Duration::from_secs(1));
-        assert_eq!(air.power_request(now + Duration::from_secs(1)), Some(false));
-    }
-
-    #[test]
-    fn a_failed_power_off_retries_then_leaves_the_controller_alone() {
-        let now = Instant::now();
-        let mut air = Air::default();
-        air.arm_controller_reset(now);
-        air.note_power_reply(false, false, now);
-        assert_eq!(air.power_request(now), None);
-        assert_eq!(air.power_request(now + RESET_RETRY), Some(false));
-        air.note_power_reply(false, false, now + RESET_RETRY);
-        air.note_power_reply(false, false, now + RESET_RETRY * 2);
-        assert!(!air.reset_blocks_scan());
-        assert_eq!(air.power_request(now + RESET_RETRY * 3), None);
-    }
-
-    #[test]
-    fn power_on_keeps_retrying_without_turning_the_adapter_off_again() {
-        let now = Instant::now();
-        let mut air = Air::default();
-        air.arm_controller_reset(now);
-        air.note_power_reply(false, true, now);
-        air.note_power_reply(true, false, now);
-        assert_eq!(air.power_request(now), None);
-        assert_eq!(air.power_request(now + RESET_RETRY), Some(true));
-        air.note_power_reply(true, false, now + RESET_RETRY);
-        assert_eq!(air.power_request(now + RESET_RETRY * 2), Some(true));
-        air.note_power_reply(true, true, now + RESET_RETRY * 2);
-        assert!(!air.reset_blocks_scan());
-    }
-
-    #[test]
-    fn bluetoothd_leaving_cancels_the_power_cycle() {
-        let now = Instant::now();
-        let mut air = Air::default();
-        air.arm_controller_reset(now);
-        air.note_power_reply(false, true, now);
-        air.cancel_controller_reset();
-        assert!(!air.reset_blocks_scan());
-        assert_eq!(air.power_request(now), None);
-        air.arm_controller_reset(now);
-        assert_eq!(air.power_request(now), Some(false));
-    }
-
-    #[test]
-    fn bluez_back_waits_until_the_power_cycle_finishes() {
-        let (tx, rx) = mpsc::channel();
-        let mut live = Live { bluez_back_pending: true, ..Default::default() };
-        live.air.arm_controller_reset(Instant::now());
-        settle_controller_reset(&tx, &mut live, false, true);
-        assert!(rx.try_recv().is_err());
-        assert!(live.bluez_back_pending);
-        settle_controller_reset(&tx, &mut live, true, true);
-        assert!(matches!(rx.try_recv(), Ok(Input::BluezBack)));
-        assert!(!live.bluez_back_pending);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn a_power_cycle_keeps_its_powered_signals_until_one_return() {
-        let (tx, rx) = mpsc::channel();
-        let mut live = Live { adapter_path: Some("/org/bluez/hci0".into()), ..Default::default() };
-        begin_controller_cycle(&mut live);
-        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", false);
-        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", true);
-        assert!(rx.try_recv().is_err(), "this cycle's Powered stays inside the thread");
-        settle_controller_reset(&tx, &mut live, false, true);
-        assert!(rx.try_recv().is_err());
-        settle_controller_reset(&tx, &mut live, true, true);
-        assert!(matches!(rx.try_recv(), Ok(Input::BluezBack)));
-        assert!(rx.try_recv().is_err());
-        // The cycle is idle. A later toggle is the radio, and the daemon hears it.
-        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", false);
-        assert!(matches!(rx.try_recv(), Ok(Input::AdapterPower(false))));
-    }
-
-    #[test]
-    fn bluetoothd_leaving_during_a_cycle_does_not_report_the_return() {
-        let (tx, rx) = mpsc::channel();
-        let mut live = Live { adapter_path: Some("/org/bluez/hci0".into()), ..Default::default() };
-        begin_controller_cycle(&mut live);
-        note_bluez_left(&tx, &mut live);
-        let mut saw_lost = false;
-        while let Ok(input) = rx.try_recv() {
-            match input {
-                Input::BluezLost => saw_lost = true,
-                Input::BluezBack | Input::AdapterPower(_) => {
-                    panic!("leaving cancels the cycle without a return")
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_lost);
-        report_adapter_power(&tx, &mut live, "/org/bluez/hci0", true);
-        assert!(matches!(rx.try_recv(), Ok(Input::AdapterPower(true))));
-    }
-
-    #[test]
     fn a_running_scan_is_rechecked_with_bluez() {
         let now = Instant::now();
         let mut air = Air { want_scan: true, ..Air::default() };
@@ -3188,6 +3137,299 @@ mod advertisement_tests {
     }
 
     #[test]
+    fn a_bonded_host_yields_to_a_connecting_unbonded_audio_device() {
+        let now = Instant::now();
+        let max = Address::parse("70:F9:4A:BA:19:81").unwrap();
+        let mut air = Air { want_scan: true, ..Air::default() };
+        // This host already has a bond; a Max advert is not a Pro 3
+        // pairing frame, so the existing setup yield stays off.
+        let mut ordinary = pairing_frame();
+        ordinary[2] = 0;
+        air.observe_pairing(true, Some(&ordinary), now);
+        assert!(air.scan_due(now));
+
+        // BlueZ connecting that unbonded device is the pairing window.
+        air.observe_foreign_pairing(max, true, false, now);
+        assert!(air.pairing_paused(now));
+        assert!(!air.scan_due(now));
+        // Losing the connection ends the attempt after a short tail.
+        air.observe_foreign_pairing(max, false, false, now + Duration::from_secs(1));
+        assert!(air.pairing_paused(now + Duration::from_secs(10)));
+        assert!(!air.pairing_paused(now + Duration::from_secs(12)));
+
+        // A saved bond ends it after the existing five-second tail.
+        air.observe_foreign_pairing(max, true, false, now + Duration::from_secs(20));
+        air.observe_foreign_pairing(max, true, true, now + Duration::from_secs(21));
+        assert!(air.pairing_paused(now + Duration::from_secs(25)));
+        assert!(!air.pairing_paused(now + Duration::from_secs(27)));
+    }
+
+    fn launch_advertisement(air: &mut Air, now: Instant) -> Option<RequestId> {
+        match air.advance_advertisement(now, &[]) {
+            Some(AdvertisementAction::Register(id)) => Some(id),
+            None => None,
+            Some(AdvertisementAction::Unregister(_)) => panic!("unexpected unregister"),
+        }
+    }
+
+    #[test]
+    fn advertisement_requested_during_pairing_resumes_unless_released() {
+        for release in [false, true] {
+            let mut air = Air::default();
+            let now = air.clock_origin;
+            air.pairing_until = Some(now + Duration::from_secs(5));
+            air.request_advertisement(vec![1]);
+            assert!(launch_advertisement(&mut air, now).is_none());
+            air.request_advertisement(vec![2]);
+            if release {
+                air.release_advertisement();
+            }
+            assert_eq!(
+                launch_advertisement(&mut air, now + Duration::from_secs(5)).is_some(),
+                !release
+            );
+            assert_eq!(air.current, vec![2]);
+        }
+    }
+
+    #[test]
+    fn pairing_retires_inflight_registration_before_resuming() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut air, now).unwrap();
+        let mut calls =
+            vec![PendingCall { serial: 1, kind: CallKind::Advertise { id }, sent: now }];
+        air.pairing_until = Some(now + Duration::from_secs(5));
+        let Some(AdvertisementAction::Unregister(cleanup)) = air.advance_advertisement(now, &calls)
+        else {
+            panic!("pairing must retire the pending registration");
+        };
+        calls.push(PendingCall {
+            serial: 2,
+            kind: CallKind::Unadvertise { id: cleanup },
+            sent: now,
+        });
+        air.advertisement_reply(id, true, now);
+        calls.remove(0);
+        assert!(
+            air.advance_advertisement(now + Duration::from_secs(6), &calls).is_none(),
+            "pairing ending cannot race pending cleanup"
+        );
+        calls.clear();
+        air.advertisement_removal_reply(cleanup, true, now + Duration::from_secs(6));
+        assert!(matches!(
+            air.advance_advertisement(now + Duration::from_secs(6), &calls),
+            Some(AdvertisementAction::Register(_))
+        ));
+    }
+
+    #[test]
+    fn advertisement_budget_survives_payload_updates_and_pairing() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        for seconds in [0, 5, 15, 35, 75] {
+            let at = now + Duration::from_secs(seconds);
+            let id = launch_advertisement(&mut air, at).expect("scheduled attempt");
+            assert!(launch_advertisement(&mut air, at).is_none(), "one attempt in flight");
+            air.advertisement_reply(id, false, at);
+            air.advertisement_removed(); // cleanup must not erase the failed attempt
+            air.request_advertisement(vec![seconds as u8]);
+            air.pairing_until = Some(at + Duration::from_secs(1));
+            assert!(launch_advertisement(&mut air, at + Duration::from_secs(1)).is_none());
+        }
+        assert!(launch_advertisement(&mut air, now + Duration::from_secs(600)).is_none());
+        assert!(matches!(air.advertisement.state(), TaskState::Exhausted));
+        // Explicit release/new intent starts a new lifetime and budget.
+        air.release_advertisement();
+        air.request_advertisement(vec![3]);
+        assert!(launch_advertisement(&mut air, now + Duration::from_secs(600)).is_some());
+    }
+
+    #[test]
+    fn advertisement_removal_resumes_and_cancelled_replies_cannot_complete_new_attempts() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        let first = launch_advertisement(&mut air, now).unwrap();
+        air.advertisement_reply(first, true, now);
+        assert!(air.registered);
+        air.pairing_until = Some(now + Duration::from_secs(5));
+        air.advertisement_removed();
+        assert!(air.wanted);
+        assert!(launch_advertisement(&mut air, now).is_none());
+        let second = launch_advertisement(&mut air, now + Duration::from_secs(5)).unwrap();
+        air.release_advertisement();
+        air.request_advertisement(vec![2]);
+        let third = launch_advertisement(&mut air, now + Duration::from_secs(6)).unwrap();
+        assert_ne!(second, third);
+        air.advertisement_reply(second, false, now + Duration::from_secs(6));
+        assert!(matches!(air.advertisement.state(), TaskState::Running { id, .. } if id == third));
+        air.advertisement_reply(third, true, now + Duration::from_secs(6));
+        assert!(air.registered);
+    }
+
+    #[test]
+    fn a_late_registration_success_after_release_still_gets_retired() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut air, now).unwrap();
+        air.release_advertisement();
+        air.advertisement_reply(id, true, now);
+        assert!(!air.wanted, "late success cannot revive intent");
+        assert!(air.registered, "the reserved BlueZ slot still needs cleanup");
+        assert!(matches!(air.advertisement.state(), TaskState::Idle));
+        assert!(matches!(
+            air.advance_advertisement(now, &[]),
+            Some(AdvertisementAction::Unregister(_))
+        ));
+        air.advertisement_removed();
+        assert!(launch_advertisement(&mut air, now).is_none());
+        assert!(air.advertisement_wake(now).is_none());
+    }
+
+    #[test]
+    fn advertisement_retry_and_pairing_deadlines_wake_an_otherwise_idle_worker() {
+        let mut live = Live { adapter_path: Some("/org/bluez/hci0".into()), ..Live::default() };
+        let now = live.air.clock_origin;
+        live.air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut live.air, now).unwrap();
+        live.air.advertisement_reply(id, false, now);
+        assert_eq!(poll_timeout(&live, now), 5_000);
+        live.air.want_scan = true;
+        live.air.scanned = true;
+        assert_eq!(poll_timeout(&live, now), 5_000, "backoff beats scan check");
+        live.air.want_scan = false;
+        live.air.pairing_until = Some(now + Duration::from_secs(10));
+        assert_eq!(poll_timeout(&live, now), 10_000, "do not spin on a blocked retry");
+        live.air.release_advertisement();
+        assert_eq!(poll_timeout(&live, now), -1, "release retires the wakeup");
+    }
+
+    #[test]
+    fn failed_advertisement_cleanup_keeps_the_slot_and_a_bounded_budget() {
+        let mut live = Live { adapter_path: Some("/org/bluez/hci0".into()), ..Live::default() };
+        let now = live.air.clock_origin;
+        live.air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut live.air, now).unwrap();
+        live.air.advertisement_reply(id, true, now);
+        live.air.release_advertisement();
+        let mut last = None;
+        for seconds in [0, 5, 15, 35, 75] {
+            let at = now + Duration::from_secs(seconds);
+            let Some(AdvertisementAction::Unregister(id)) = live.air.advance_advertisement(at, &[])
+            else {
+                panic!("cleanup must precede registration");
+            };
+            assert!(live.air.advance_advertisement(at, &[]).is_none());
+            live.air.advertisement_removal_reply(id, false, at);
+            assert!(live.air.registered, "failure is not proof of removal");
+            // New payloads, new intent and expired pairing cannot erase cleanup.
+            live.air.release_advertisement();
+            live.air.request_advertisement(vec![seconds as u8]);
+            live.air.pairing_until = Some(at);
+            assert!(live.air.advance_advertisement(at, &[]).is_none());
+            if seconds == 0 {
+                assert_eq!(poll_timeout(&live, at), 5_000);
+            }
+            last = Some(id);
+        }
+        assert!(live.air.advance_advertisement(now + Duration::from_secs(600), &[]).is_none());
+        assert_eq!(poll_timeout(&live, now + Duration::from_secs(600)), -1);
+        assert!(live.air.registered);
+        // Authoritative Release unlocks the retained intent, without accepting
+        // a late reply from the exhausted cleanup as removal of the new slot.
+        live.air.advertisement_removed();
+        let next = launch_advertisement(&mut live.air, now + Duration::from_secs(601)).unwrap();
+        live.air.advertisement_reply(next, true, now + Duration::from_secs(601));
+        live.air.advertisement_removal_reply(last.unwrap(), true, now + Duration::from_secs(602));
+        assert!(live.air.registered);
+        note_bluez_left(&mpsc::channel().0, &mut live);
+        assert!(!live.air.registered && live.air.removal.is_none());
+    }
+
+    #[test]
+    fn timed_out_registration_requires_confirmed_cleanup_before_retry() {
+        let mut live = Live::default();
+        let now = live.air.clock_origin;
+        live.air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut live.air, now).unwrap();
+        live.calls.push(PendingCall {
+            serial: 1,
+            kind: CallKind::Advertise { id },
+            sent: now - Duration::from_secs(26),
+        });
+        let (tx, _rx) = mpsc::channel();
+        expire_calls(&tx, &mut live);
+        let Some(AdvertisementAction::Unregister(cleanup)) =
+            live.air.advance_advertisement(now, &[])
+        else {
+            panic!("a timed out registration might own a slot");
+        };
+        live.calls.push(PendingCall {
+            serial: 2,
+            kind: CallKind::Unadvertise { id: cleanup },
+            sent: now - Duration::from_secs(26),
+        });
+        expire_calls(&tx, &mut live);
+        assert!(live.air.removal.is_some(), "a timeout cannot prove removal");
+        let Some(AdvertisementAction::Unregister(retry)) =
+            live.air.advance_advertisement(now + Duration::from_secs(6), &[])
+        else {
+            panic!("cleanup timeout uses the same retry task");
+        };
+        live.air.advertisement_removal_reply(cleanup, true, now + Duration::from_secs(6));
+        assert!(live.air.removal.is_some(), "late completion cannot retire the newer cleanup");
+        live.air.advertisement_removal_reply(retry, true, now + Duration::from_secs(6));
+        assert!(live.air.removal.is_none() && !live.air.registered);
+        assert_eq!(live.air.advertisement.budget().0, 1, "cleanup preserves registration budget");
+        assert!(launch_advertisement(&mut live.air, now + Duration::from_secs(6)).is_some());
+    }
+
+    #[test]
+    fn registration_success_after_confirmed_removal_is_retired_before_reuse() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        let first = launch_advertisement(&mut air, now).unwrap();
+        air.release_advertisement();
+        air.advertisement_removed();
+        air.request_advertisement(vec![2]);
+        air.advertisement_reply(first, true, now);
+        let Some(AdvertisementAction::Unregister(cleanup)) = air.advance_advertisement(now, &[])
+        else {
+            panic!("late registration cannot satisfy a replacement lifetime");
+        };
+        air.advertisement_removal_reply(cleanup, true, now);
+        assert!(launch_advertisement(&mut air, now).is_some());
+    }
+
+    #[test]
+    fn bluetoothd_returning_resyncs_without_power_cycling() {
+        let (tx, rx) = mpsc::channel();
+        let mut live = Live::default();
+        note_bluez_returned(&tx, &mut live);
+        bluez_returned(
+            &tx,
+            None,
+            &mut live,
+            Some(bluez::Inventory {
+                adapters: HashMap::new(),
+                devices: Vec::new(),
+                transports: HashMap::new(),
+            }),
+        );
+        assert!(live.calls.is_empty(), "a return must not queue an adapter power call");
+        let mut saw_back = false;
+        while let Ok(input) = rx.try_recv() {
+            saw_back |= matches!(input, Input::BluezBack);
+        }
+        assert!(saw_back, "the resync reports BluezBack");
+    }
+
+    #[test]
     fn fleet_advertisements_do_not_require_a_tracked_bluetooth_device() {
         let (tx, rx) = std::sync::mpsc::channel();
         let bytes = vec![0x05, 0x01, 0x02];
@@ -3224,9 +3466,84 @@ mod advertisement_tests {
                 services_resolved: true,
                 handsfree: true,
                 control: true,
+                headset: false,
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn tracked_connection_evidence_follows_inventory_lifetime() {
+        for change in ["removed", "unpaired", "inventory", "lost", "replaced"] {
+            let mut live = handsfree_trial();
+            live.accessory = None;
+            let device = live.devices[0].clone();
+            let (tx, rx) = mpsc::channel();
+            report_known_accessories(&tx, &mut live);
+            assert!(matches!(rx.try_recv(), Ok(Input::KnownAccessory { connected: true, .. })));
+            match change {
+                "removed" => device_removed(&tx, None, &mut live, &device.path),
+                "unpaired" => {
+                    live.devices[0].paired = false;
+                    live.devices[0].bonded = false;
+                    report_known_accessories(&tx, &mut live);
+                }
+                "inventory" => {
+                    remember_inventory(
+                        &tx,
+                        None,
+                        &mut live,
+                        bluez::Inventory {
+                            adapters: HashMap::new(),
+                            devices: Vec::new(),
+                            transports: HashMap::new(),
+                        },
+                    );
+                    sync(&tx, None, &mut live);
+                }
+                "lost" => note_bluez_left(&tx, &mut live),
+                "replaced" => note_bluez_returned(&tx, &mut live),
+                _ => unreachable!(),
+            }
+            let retired: Vec<_> = rx
+                .try_iter()
+                .filter_map(|input| match input {
+                    Input::KnownAccessory { address, name, connected } => {
+                        Some((address, name, connected))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(retired, vec![(device.address, device.name.clone(), false)], "{change}");
+            report_known_accessories(&tx, &mut live);
+            assert!(rx.try_recv().is_err(), "retirement is reported once: {change}");
+            live.devices = vec![device.clone()];
+            report_known_accessories(&tx, &mut live);
+            assert!(
+                matches!(rx.try_recv(), Ok(Input::KnownAccessory { address, connected: true, .. })
+                if address == device.address),
+                "reappearance restores fresh evidence: {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_an_accessory_retires_its_inventory_deduplication() {
+        let mut live = handsfree_trial();
+        let address = live.accessory.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        report_known_accessories(&tx, &mut live);
+        assert!(matches!(rx.try_recv(), Ok(Input::KnownAccessory { connected: true, .. })));
+        live.accessory = Some(address);
+        report_known_accessories(&tx, &mut live);
+        assert!(rx.try_recv().is_err(), "the selected connection has its own reports");
+        assert!(live.known_reported.is_empty());
+        live.accessory = None;
+        report_known_accessories(&tx, &mut live);
+        assert!(
+            matches!(rx.try_recv(), Ok(Input::KnownAccessory { connected: true, .. })),
+            "returning to tracked status must publish a fresh observation"
+        );
     }
 
     #[test]
@@ -3281,6 +3598,7 @@ mod advertisement_tests {
                 services_resolved: false,
                 handsfree: false,
                 control: true,
+                headset: false,
             });
             let (tx, rx) = mpsc::channel();
             sync(&tx, Some(address), &mut live);
@@ -3351,6 +3669,7 @@ mod advertisement_tests {
             services_resolved: false,
             handsfree: false,
             control: true,
+            headset: false,
         });
         let (tx, rx) = mpsc::channel();
         sync(&tx, Some(address), &mut live);
@@ -3416,6 +3735,7 @@ mod advertisement_tests {
                 services_resolved: false,
                 handsfree: false,
                 control: true,
+                headset: false,
             };
             let mut live = Live::default();
             live.devices.push(device.clone());
@@ -3542,6 +3862,7 @@ mod advertisement_tests {
             services_resolved: false,
             handsfree: false,
             control: true,
+            headset: false,
         });
         let (tx, rx) = std::sync::mpsc::channel();
         for _ in 0..3 {

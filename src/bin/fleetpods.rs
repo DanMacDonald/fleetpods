@@ -64,6 +64,9 @@ fn main() {
         std::process::exit(1);
     };
     let mut wire = command.clone();
+    if command.starts_with("desktop-activity:") {
+        wire.push('\n');
+    }
     if let Some(address) = remove {
         wire = format!(
             "fleet:{}\n",
@@ -153,6 +156,7 @@ Commands:
   connect             Request the local seat
   reconnect-peer      Request the Apple-device reconnect
   activity            Submit fresh desktop activity
+  desktop-activity:UNIX_MS    Report the original desktop resume time
   handoff:release     Release local audio ownership
   adaptive:N          Request adaptive level 0-100
   onebud:on           Request one-bud noise cancellation on

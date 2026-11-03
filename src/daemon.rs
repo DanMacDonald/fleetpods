@@ -30,22 +30,8 @@ use crate::types::{
     NoiseMode, UnixMs,
 };
 
-/// One pod's placement from an advertisement, given its current placement.
-///
-/// A frame comes from one pod: `primary_left` names it, and `this_in_case`
-/// says whether that pod is in the case (XPS, 2026-10-19: the left pod
-/// docked sent `primary_left` frames, the right pod docked did not). A docked
-/// pod also sends frames claiming both pods are docked with neither in an ear,
-/// while the other pod is worn; the next frame, 0.27 s later, shows it worn.
-/// So that claim never docks a pod known to be in an ear. Otherwise a pod out
-/// of an ear has an unknown case placement, never an older one.
-/// Any bud freshly reported in an ear.
-fn worn(report: &Accessory) -> bool {
-    [&report.left_placement, &report.right_placement]
-        .into_iter()
-        .any(|placement| placement.as_fresh().is_some_and(|pod| pod.in_ear == Some(true)))
-}
-
+/// One bud's advertised placement. A docked bud's stale view must not
+/// overrule the other bud's fresh worn report.
 fn placement(
     sight: &crate::pods::air::Frame,
     right: bool,
@@ -447,7 +433,8 @@ impl Daemon {
         if let Some(old) = self.config.accessory {
             let prefs = self.config.live_prefs();
             self.config.saved_prefs.insert(old, prefs);
-            let report = std::mem::take(&mut self.accessory);
+            let mut report = std::mem::take(&mut self.accessory);
+            report.drop_control_reports();
             self.tracked.insert(old, report);
             if self.connection.stage() != Stage::Idle && self.connection.stage() != Stage::Waiting {
                 self.effects.disconnect_accessory = Some(old);
@@ -617,7 +604,8 @@ impl Daemon {
             Command::Status => Response::line(self.status_line(now)),
             // The platform must confirm deletion before clearing the core.
             Command::FleetReset => Response::line("error: fleet reset requires the keyring worker"),
-            Command::Activity => self.activity(now),
+            Command::Activity => self.activity(None, now),
+            Command::ActivityAt(at) => self.activity(Some(at), now),
             Command::Connect => self.connect(now),
             Command::AudioReset => self.reset_audio_output(),
             Command::ReconnectPeer => self.reconnect_peer(now),
@@ -885,14 +873,10 @@ impl Daemon {
     /// a pod briefly misreporting the other (XPS, 2026-10-19: four flips in 0.4 s).
     fn note_wearing(&mut self, at: MonoMs) {
         const OUT_SETTLE_MS: u64 = 1_000;
-        let ear =
-            |pod: &crate::types::Evidence<Placement>| pod.as_fresh().and_then(|pod| pod.in_ear);
-        let worn = match (ear(&self.accessory.left_placement), ear(&self.accessory.right_placement))
-        {
-            (Some(true), _) | (_, Some(true)) => true,
-            (Some(false), Some(false)) => false,
-            _ => return,
-        };
+        let Some(worn) = self.accessory.wearing() else { return };
+        if !worn {
+            self.inserted_at = None;
+        }
         match self.worn {
             Some((previous, _)) if previous == worn => {}
             Some((false, since)) if at.saturating_since(since) >= OUT_SETTLE_MS => {
@@ -1262,7 +1246,7 @@ impl Daemon {
             // dropped verbatim replays and stale sessions, so an intent
             // frame cannot step this laptop back twice.
             if snapshot.intent {
-                self.note_fleet_intent(snapshot.reporter, "fleet intent", now);
+                self.note_fleet_intent(snapshot.reporter, now);
             }
         }
         if outcome != Ingest::Replay {
@@ -2000,16 +1984,8 @@ impl Daemon {
                 }
             }
         }
-        if take
-            && retain == self.local_address
-            && self.pod_peers_known
-            && !self.pod_peers.contains(&message.source)
-        {
-            // The requester still has to page the pods before it can
-            // claim. Free their radio by stepping back now; streaming on
-            // until the pods' grant would keep the page from landing.
-            self.note_fleet_intent(message.source, "fleet seat request", now);
-        }
+        // Admission grants a connection slot. Only the peer's explicit
+        // roster playback intent can make the current audio owner step back.
         if self.reply_admission(&message, answer, retain, now) {
             self.remember_route(&message);
         }
@@ -2597,9 +2573,11 @@ impl Daemon {
             return;
         };
         if Some(owner) != selected {
-            let was_worn = self.tracked.get(&owner).is_some_and(worn);
+            let was_worn =
+                self.tracked.get(&owner).is_some_and(|report| report.wearing() == Some(true));
             self.track_other(owner, address, &sight, now);
-            let is_worn = self.tracked.get(&owner).is_some_and(worn);
+            let is_worn =
+                self.tracked.get(&owner).is_some_and(|report| report.wearing() == Some(true));
             if !was_worn && is_worn {
                 self.maybe_promote(owner, now);
             }
@@ -2632,6 +2610,15 @@ impl Daemon {
         self.accessory.note_advertisement(now.mono, sight.connection);
         if decision.adopt_model {
             self.accessory.note_model(sight.model);
+        }
+        if let Some(worn) = sight.head_worn {
+            let previous = self.accessory.head_worn();
+            self.accessory.note_head_worn(worn, now.mono);
+            let changed = previous != self.accessory.head_worn();
+            self.note_ears(None, None, now.mono, now.mono);
+            if changed {
+                eprintln!("fleetpodsd: advertised head wear address={owner} worn={worn}");
+            }
         }
         let link_up = self.connection.stage() == Stage::Ready;
         if !link_up && !model.is_headset() {
@@ -2721,10 +2708,15 @@ impl Daemon {
         if self.config.accessory == Some(candidate) {
             return;
         }
-        if !self.membership.accessory_keys_ready(candidate) {
+        // Advertisement paths need pairing keys to trust the candidate's
+        // identity; a platform-reported connected headset is already
+        // bond-verified, and selecting it is how its keys get learned.
+        let bond_verified =
+            self.tracked.get(&candidate).is_some_and(|report| report.bluez_connected);
+        if !self.membership.accessory_keys_ready(candidate) && !bond_verified {
             return;
         }
-        if worn(&self.accessory) {
+        if self.accessory.wearing() == Some(true) {
             return;
         }
         if self.audio.local_playing() && self.transport_active {
@@ -2761,6 +2753,9 @@ impl Daemon {
         report.note_advertisement(now.mono, sight.connection);
         if decision.adopt_model {
             report.note_model(sight.model);
+        }
+        if let Some(worn) = sight.head_worn {
+            report.note_head_worn(worn, now.mono);
         }
         if !model.is_headset() {
             let mut placements = [(None, None); 2];
@@ -2886,7 +2881,14 @@ impl Daemon {
     }
 
     pub fn note_ears(&mut self, left: Option<bool>, right: Option<bool>, at: MonoMs, now: MonoMs) {
-        let action = self.audio.ears(left, right, self.config.ear, at);
+        // Both signal sources feed the same aggregate policy input, without
+        // inventing per-earcup telemetry. Accessory owns source precedence.
+        let (left, right) = match self.accessory.head_worn() {
+            Some(worn) => (Some(worn), Some(worn)),
+            None => (left, right),
+        };
+        let action =
+            self.audio.ears(left, right, self.config.ear, self.accessory.model.is_headset(), at);
         self.apply_ear_action(action);
         let action = self.audio.ears_tick(self.config.ear, now);
         self.apply_ear_action(action);
@@ -2906,12 +2908,18 @@ impl Daemon {
             EarAction::Hold => {}
             EarAction::Pause => {
                 let players = self.audio.ear_paused().to_vec();
-                eprintln!("fleetpodsd: a bud left the ear; pausing {players:?}");
+                eprintln!(
+                    "fleetpodsd: {} removed; pausing {players:?}",
+                    self.accessory.model.display_name()
+                );
                 self.effects.pause_players.extend(players);
             }
             EarAction::Resume => {
                 let players = self.audio.take_ear_paused();
-                eprintln!("fleetpodsd: the buds are back in; resuming {players:?}");
+                eprintln!(
+                    "fleetpodsd: {} worn again; resuming {players:?}",
+                    self.accessory.model.display_name()
+                );
                 self.queue_resume(players);
             }
         }
@@ -3223,12 +3231,6 @@ impl Daemon {
             },
             now,
         )
-    }
-
-    fn pods_available(&self, now: MonoMs) -> bool {
-        !self.accessory.stowed()
-            && (self.accessory.lid.latest.as_fresh() == Some(&LidState::Open)
-                || self.accessory.playback_available(now))
     }
 
     /// A phone or Mac (not a fleet laptop) plays on the pods, by this laptop's
@@ -3576,13 +3578,28 @@ impl Daemon {
     /// A paired AirPods the platform knows about but that is not
     /// selected. Tracking it (even before its keys are harvested) makes
     /// it visible in status and selectable in the panel.
-    pub(crate) fn note_known_accessory(&mut self, address: Address, name: &str) {
+    pub(crate) fn note_known_accessory(
+        &mut self,
+        address: Address,
+        name: &str,
+        connected: bool,
+        now: Clock,
+    ) {
         if self.config.accessory == Some(address) {
             return;
         }
+        let was_connected = self.tracked.get(&address).is_some_and(|report| report.bluez_connected);
         let report = self.tracked.entry(address).or_default();
         if !name.is_empty() && report.name != name {
             report.name = name.to_string();
+        }
+        report.bluez_connected = connected;
+        // BlueZ connecting is a ready signal with a bond-verified
+        // identity, so unlike an advertisement-resolved pair it needs no
+        // keys to promote; selecting it is how its keys get learned. The
+        // shared gates still protect a worn or playing selected pair.
+        if connected && !was_connected {
+            self.maybe_promote(address, now);
         }
     }
 
@@ -4098,6 +4115,174 @@ mod tests {
         frame
     }
 
+    fn max2_frame(status: u8) -> Vec<u8> {
+        let mut frame: Vec<u8> =
+            "07 19 01 2d 20 23 f9 8f 06 13 04 74 0f 4d 64 71 ed 5b b0 11 06 6e 42 36 72 eb 01"
+                .split_whitespace()
+                .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+                .collect();
+        frame[5] = status;
+        frame
+    }
+
+    #[test]
+    fn max2_wear_promotes_only_a_trusted_candidate_and_preserves_selected_use() {
+        use crate::step::{Effect, Input};
+        for selected_worn in [false, true] {
+            let (mut daemon, first, max, irk) = two_pair_daemon();
+            let now = clock();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.step(
+                Input::Proximity {
+                    address: rpa(),
+                    payload: if selected_worn { worn_frame() } else { captured_case(0x39) },
+                },
+                now,
+            );
+            let advertiser = rpa_for(&irk);
+            for status in [0x20, 0x21] {
+                daemon.step(
+                    Input::Proximity { address: advertiser, payload: max2_frame(status) },
+                    now,
+                );
+                assert_eq!(daemon.config.accessory, Some(first));
+                assert_eq!(daemon.tracked[&max].wearing(), Some(false));
+            }
+            daemon
+                .step(Input::Proximity { address: addr(77), payload: max2_frame(0x23) }, at(1000));
+            assert_eq!(
+                daemon.tracked[&max].wearing(),
+                Some(false),
+                "untrusted transmitter cannot promote"
+            );
+            let result = daemon.step(
+                Input::Proximity { address: advertiser, payload: max2_frame(0x23) },
+                at(2000),
+            );
+            assert_eq!(daemon.config.accessory, Some(if selected_worn { first } else { max }));
+            assert!(!result
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PausePlayers(_) | Effect::MuteStreams(_))));
+            let report = if selected_worn { &daemon.tracked[&max] } else { &daemon.accessory };
+            assert_eq!(report.wearing(), Some(true));
+            assert!(report.left_placement.is_unknown() && report.right_placement.is_unknown());
+            assert!(!report.stowed() && !report.both_docked());
+            assert!(daemon.status_value(at(2000))["accessories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["headset"]["worn"] == true));
+        }
+    }
+
+    #[test]
+    fn removing_max2_cancels_pending_insertion_and_cached_lid_cannot_make_it_available() {
+        use crate::step::Input;
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.select_accessory(Some(addr(3)));
+        // Older decoders could leave an unrelated lid interpretation behind.
+        daemon.accessory.note_lid(LidState::Open, now.mono);
+        daemon.step(Input::Proximity { address: addr(3), payload: max2_frame(0x20) }, now);
+        assert!(!daemon.accessory.connection_available(now.mono));
+        daemon.step(Input::Proximity { address: addr(3), payload: max2_frame(0x23) }, at(1500));
+        assert!(daemon.inserted_at.is_some());
+        daemon.step(Input::Proximity { address: addr(3), payload: max2_frame(0x21) }, at(2000));
+        assert!(daemon.inserted_at.is_none());
+        assert!(!daemon.accessory.connection_available(at(2000).mono));
+    }
+
+    #[test]
+    fn waiting_status_uses_the_same_availability_as_connection_admission() {
+        for model in [Model::AirPodsPro3, Model::AirPodsMax2] {
+            for available in [false, true] {
+                let mut daemon = Daemon::new("xps");
+                let now = clock();
+                daemon.select_accessory(Some(addr(3)));
+                daemon.connection.wait_for_request();
+                daemon.accessory.note_model(model);
+                if model.is_headset() {
+                    // Legacy case data and a nearby connected phone cannot
+                    // override an unworn headset in either policy or status.
+                    daemon.accessory.note_lid(LidState::Open, now.mono);
+                    daemon.accessory.note_advertisement(now.mono, 4);
+                    daemon.accessory.note_head_worn(available, now.mono);
+                } else {
+                    daemon.accessory.note_placement(
+                        false,
+                        Some(available),
+                        Some(!available),
+                        now.mono,
+                    );
+                }
+                for elapsed in [0, 11_000] {
+                    let at = Clock::new(now.mono.0 + elapsed, now.unix.0 + elapsed);
+                    let expected = available && elapsed == 0;
+                    assert_eq!(daemon.accessory.connection_available(at.mono), expected);
+                    assert_eq!(
+                        daemon.status_value(at)["control_connection"]["stage"],
+                        if expected { "idle" } else { "waiting" }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn max2_availability_wakes_only_the_preferred_host_and_never_claims_audio() {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::step::{Effect, Input};
+        for local_preferred in [true, false] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            let (local, gram, max) = (addr(1), addr(2), addr(3));
+            daemon.set_local_address(Some(local));
+            daemon.select_accessory(Some(max));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "xps".into() },
+                    Member { address: gram, label: "gram".into() },
+                ],
+            });
+            daemon.activity_preference.note_local(
+                [3; 16],
+                max,
+                if local_preferred { local } else { gram },
+                now.unix,
+            );
+            daemon.step(Input::Proximity { address: max, payload: max2_frame(0x20) }, now);
+            let off = daemon.step(Input::Tick, at(3000));
+            assert!(!off.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })));
+            daemon.step(Input::Proximity { address: max, payload: max2_frame(0x23) }, at(4000));
+            let on = daemon.step(Input::Tick, at(6000));
+            assert_eq!(
+                on.effects.iter().any(|effect| matches!(effect, Effect::OpenLink { .. })),
+                local_preferred
+            );
+            assert!(!daemon.output.wants_output());
+            assert!(!on
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::MuteStreams(_) | Effect::PausePlayers(_))));
+            assert!(daemon.accessory.playback_available(at(6000).mono));
+            assert!(
+                !daemon.accessory.playback_available(at(15000).mono),
+                "a stale worn report is not availability"
+            );
+            daemon.accessory.expire(at(130000).mono, true);
+            assert_eq!(
+                daemon.accessory.wearing(),
+                None,
+                "missing advertisements do not invent removal"
+            );
+        }
+    }
+
     fn two_pair_daemon() -> (Daemon, Address, Address, [u8; 16]) {
         let mut daemon = Daemon::new("xps");
         let first = addr(3);
@@ -4131,7 +4316,7 @@ mod tests {
             .step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
         assert_eq!(daemon.config.accessory, Some(second));
         assert!(daemon.tracked.contains_key(&first), "the first pair stays tracked");
-        assert!(worn(&daemon.accessory), "the promoted pair's report is live");
+        assert!(daemon.accessory.wearing() == Some(true), "the promoted pair's report is live");
         assert!(outcome.effects.iter().any(|effect| matches!(
             effect,
             Effect::SelectAccessory { accessory: Some(address) } if *address == second
@@ -4175,7 +4360,10 @@ mod tests {
         use crate::step::Input;
         let (mut daemon, first, second, _irk) = two_pair_daemon();
         let now = clock();
-        daemon.step(Input::KnownAccessory { address: second, name: "AirPods Pro".into() }, now);
+        daemon.step(
+            Input::KnownAccessory { address: second, name: "AirPods Pro".into(), connected: false },
+            now,
+        );
         let status = daemon.status_value(now);
         let accessories = status["accessories"].as_array().unwrap();
         let entry = accessories
@@ -4192,6 +4380,54 @@ mod tests {
     }
 
     #[test]
+    fn a_connected_accessory_promotes_when_the_selected_pair_is_not_worn() {
+        use crate::step::Input;
+        for (scenario, selected_worn, connected) in [
+            ("accessory connects, selected in case", false, true),
+            ("selected pair worn", true, true),
+            ("accessory not connected", false, false),
+        ] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let first = addr(3);
+            let max = addr(9);
+            daemon.select_accessory(Some(first));
+            if selected_worn {
+                daemon.note_pod(
+                    false,
+                    Pod {
+                        battery: Battery::new(80, false).unwrap(),
+                        in_ear: Some(true),
+                        in_case: Some(false),
+                    },
+                    now.mono,
+                );
+            } else {
+                for right in [false, true] {
+                    daemon.note_pod(
+                        right,
+                        Pod {
+                            battery: Battery::new(80, true).unwrap(),
+                            in_ear: Some(false),
+                            in_case: Some(true),
+                        },
+                        now.mono,
+                    );
+                }
+            }
+            daemon.step(
+                Input::KnownAccessory { address: max, name: "AirPods Max".into(), connected },
+                now,
+            );
+            assert_eq!(
+                daemon.config.accessory,
+                Some(if connected && !selected_worn { max } else { first }),
+                "{scenario}"
+            );
+        }
+    }
+
+    #[test]
     fn pressing_play_promotes_a_worn_tracked_pair() {
         use crate::step::Input;
         let (mut daemon, first, second, second_irk) = two_pair_daemon();
@@ -4204,7 +4440,7 @@ mod tests {
         // again (as after a daemon restart, where no transition fires).
         let later = Clock::new(now.mono.0 + 121_000, now.unix.0 + 121_000);
         daemon.step(Input::Tick, later);
-        assert!(!worn(&daemon.accessory));
+        assert_ne!(daemon.accessory.wearing(), Some(true));
         daemon.tracked.get_mut(&second).unwrap().note_placement(
             false,
             Some(true),
@@ -5075,86 +5311,92 @@ mod tests {
     fn capture_starts_the_microphone_counts_frames_and_stops_after_two_restarts() {
         use crate::step::{Effect, Input};
 
-        let mut daemon = Daemon::new("gram");
-        daemon.set_identity("Pods", "A3064");
-        daemon.set_local_address(Some(addr(1)));
-        let now = clock();
-        ready_link(&mut daemon, now);
-        daemon.accessory.note_conversation(true, now.mono);
-        let started = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
-        let start = crate::audio::mic::start_command();
-        let off = crate::pods::setup::conversation(false);
-        assert!(started.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &off
-        )));
-        assert!(started.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &start
-        )));
-        assert!(started.effects.iter().all(|effect| !matches!(effect, Effect::StopListen)));
-        let generation = daemon.connection().generation();
-        let mut audio = vec![0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x01, 0x00];
-        audio.extend(std::iter::repeat_n(0, 14));
-        audio.extend_from_slice(&[1, 0, 0, 0, 1, 0x11]);
-        daemon.step(Input::Accessory { generation, packet: audio.clone() }, now);
-        daemon.step(
-            Input::Accessory { generation, packet: audio },
-            Clock::new(1_400, now.unix.0 + 400),
-        );
-        let status = daemon.status_value(Clock::new(1_400, now.unix.0 + 400));
-        assert_eq!(status["microphone"]["phase"], "capturing");
-        assert_eq!(status["microphone"]["frames"], 2);
-        assert_eq!(status["microphone"]["max_gap_ms"], 400);
-        daemon.step(
-            Input::Accessory {
-                generation,
-                packet: vec![0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x01, 0x00],
-            },
-            now,
-        );
-        assert_eq!(daemon.microphone().malformed(), 1);
+        for sku in ["A3064", "A2698", "A3454"] {
+            let mut daemon = Daemon::new("gram");
+            daemon.set_identity("Pods", sku);
+            daemon.set_local_address(Some(addr(1)));
+            let now = clock();
+            ready_link(&mut daemon, now);
+            assert_eq!(
+                daemon.mic_source.as_ref().map(|(_, rate, name)| (*rate, name.as_str())),
+                Some((64_000, "Pods"))
+            );
+            daemon.accessory.note_conversation(true, now.mono);
+            let started = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
+            let start = crate::audio::mic::start_command();
+            let off = crate::pods::setup::conversation(false);
+            assert!(started.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &off
+            )));
+            assert!(started.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &start
+            )));
+            assert!(started.effects.iter().all(|effect| !matches!(effect, Effect::StopListen)));
+            let generation = daemon.connection().generation();
+            let mut audio = vec![0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x01, 0x00];
+            audio.extend(std::iter::repeat_n(0, 14));
+            audio.extend_from_slice(&[1, 0, 0, 0, 1, 0x11]);
+            daemon.step(Input::Accessory { generation, packet: audio.clone() }, now);
+            daemon.step(
+                Input::Accessory { generation, packet: audio },
+                Clock::new(1_400, now.unix.0 + 400),
+            );
+            let status = daemon.status_value(Clock::new(1_400, now.unix.0 + 400));
+            assert_eq!(status["microphone"]["phase"], "capturing");
+            assert_eq!(status["microphone"]["frames"], 2);
+            assert_eq!(status["microphone"]["max_gap_ms"], 400);
+            daemon.step(
+                Input::Accessory {
+                    generation,
+                    packet: vec![0x04, 0x00, 0x04, 0x00, 0x58, 0x00, 0x01, 0x00],
+                },
+                now,
+            );
+            assert_eq!(daemon.microphone().malformed(), 1);
 
-        let again = daemon.step(Input::Tick, Clock::new(3_400, now.unix.0 + 2_400));
-        let stop = crate::audio::mic::stop_command();
-        assert!(again.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &stop
-        )));
-        assert!(again.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &start
-        )));
-        daemon.step(Input::Tick, Clock::new(5_400, now.unix.0 + 4_400));
-        let stopped = daemon.step(Input::Tick, Clock::new(7_400, now.unix.0 + 6_400));
-        let on = crate::pods::setup::conversation(true);
-        assert!(stopped.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &stop
-        )));
-        assert!(stopped.effects.iter().all(|effect| !matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &start
-        )));
-        assert!(stopped.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &on
-        )));
-        assert_eq!(daemon.status_value(now)["microphone"]["phase"], "needs_reopen");
-        let held = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
-        assert!(held.effects.iter().all(|effect| !matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &start
-        )));
-        assert_eq!(daemon.status_value(now)["microphone"]["phase"], "needs_reopen");
-        daemon.step(Input::Microphone { streaming: false, muted: false }, now);
-        assert_eq!(daemon.status_value(now)["microphone"]["phase"], "idle");
-        let reopened = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
-        assert!(reopened.effects.iter().any(|effect| matches!(
-            effect,
-            Effect::WriteControl { bytes, .. } if bytes == &start
-        )));
-        assert_eq!(daemon.status_value(now)["microphone"]["phase"], "capturing");
+            let again = daemon.step(Input::Tick, Clock::new(3_400, now.unix.0 + 2_400));
+            let stop = crate::audio::mic::stop_command();
+            assert!(again.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &stop
+            )));
+            assert!(again.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &start
+            )));
+            daemon.step(Input::Tick, Clock::new(5_400, now.unix.0 + 4_400));
+            let stopped = daemon.step(Input::Tick, Clock::new(7_400, now.unix.0 + 6_400));
+            let on = crate::pods::setup::conversation(true);
+            assert!(stopped.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &stop
+            )));
+            assert!(stopped.effects.iter().all(|effect| !matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &start
+            )));
+            assert!(stopped.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &on
+            )));
+            assert_eq!(daemon.status_value(now)["microphone"]["phase"], "needs_reopen");
+            let held = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
+            assert!(held.effects.iter().all(|effect| !matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &start
+            )));
+            assert_eq!(daemon.status_value(now)["microphone"]["phase"], "needs_reopen");
+            daemon.step(Input::Microphone { streaming: false, muted: false }, now);
+            assert_eq!(daemon.status_value(now)["microphone"]["phase"], "idle");
+            let reopened = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
+            assert!(reopened.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::WriteControl { bytes, .. } if bytes == &start
+            )));
+            assert_eq!(daemon.status_value(now)["microphone"]["phase"], "capturing");
+        }
     }
 
     #[test]
@@ -5163,28 +5405,30 @@ mod tests {
 
         use crate::step::Input;
 
-        let mut daemon = Daemon::new("gram");
-        daemon.set_identity("Pods", "A3064");
-        let now = clock();
-        ready_link(&mut daemon, now);
-        daemon.accessory.note_conversation(true, now.mono);
-        daemon.step(Input::Microphone { streaming: true, muted: false }, now);
-        assert!(daemon.mic_path.delivering.load(Ordering::Relaxed));
-        let generation = daemon.connection().generation();
-        daemon.step(Input::ControlSocket { up: false, generation }, now);
-        assert!(!daemon.mic_path.delivering.load(Ordering::Relaxed));
-        assert!(!daemon.mic_started);
-        assert_eq!(daemon.status_value(now)["microphone"]["phase"], "down");
-        let stop = crate::audio::mic::stop_command();
-        let on = crate::pods::setup::conversation(true);
-        assert!(daemon.staged_controls.iter().any(|bytes| bytes == &stop));
-        assert!(daemon.staged_controls.iter().any(|bytes| bytes == &on));
-        let ignored = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
-        assert!(ignored.effects.iter().all(|effect| !matches!(
+        for sku in ["A3064", "A2698", "A3454"] {
+            let mut daemon = Daemon::new("gram");
+            daemon.set_identity("Pods", sku);
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.accessory.note_conversation(true, now.mono);
+            daemon.step(Input::Microphone { streaming: true, muted: false }, now);
+            assert!(daemon.mic_path.delivering.load(Ordering::Relaxed));
+            let generation = daemon.connection().generation();
+            daemon.step(Input::ControlSocket { up: false, generation }, now);
+            assert!(!daemon.mic_path.delivering.load(Ordering::Relaxed));
+            assert!(!daemon.mic_started);
+            assert_eq!(daemon.status_value(now)["microphone"]["phase"], "down");
+            let stop = crate::audio::mic::stop_command();
+            let on = crate::pods::setup::conversation(true);
+            assert!(daemon.staged_controls.iter().any(|bytes| bytes == &stop));
+            assert!(daemon.staged_controls.iter().any(|bytes| bytes == &on));
+            let ignored = daemon.step(Input::Microphone { streaming: true, muted: false }, now);
+            assert!(ignored.effects.iter().all(|effect| !matches!(
             effect,
             crate::step::Effect::WriteControl { bytes, .. } if bytes == &crate::audio::mic::start_command()
         )));
-        assert_eq!(daemon.status_value(now)["microphone"]["phase"], "down");
+            assert_eq!(daemon.status_value(now)["microphone"]["phase"], "down");
+        }
     }
 
     #[test]
@@ -6437,6 +6681,9 @@ mod tests {
         battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
         battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
         battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
+        if daemon.accessory.model.is_headset() {
+            battery = vec![4, 0, 4, 0, 4, 0, 1, 1, 1, 80, 2, 1];
+        }
         let mut effects = daemon.step(Input::ControlSocket { up: true, generation }, now).effects;
         for packet in [
             vec![0x01, 0x00, 0x04, 0x00, 0x01],
@@ -6491,7 +6738,8 @@ mod tests {
             }
             daemon.step_back(now);
             daemon.displaced = true;
-            daemon.accessory.left = crate::types::Evidence::fresh(
+            daemon.note_pod(
+                false,
                 Pod {
                     battery: crate::types::Battery::new(60, false).unwrap(),
                     in_ear: Some(true),
@@ -7067,80 +7315,113 @@ mod tests {
     }
 
     #[test]
-    fn taking_a_bud_out_pauses_brave_and_putting_it_back_resumes_it() {
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::step::{Effect, Input};
-        let brave = "org.mpris.MediaPlayer2.brave";
-        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
-        let mut daemon = Daemon::new("xps");
-        let now = clock();
-        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
-        ready_link(&mut daemon, now);
-        let generation = daemon.connection().generation();
-        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
-        daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, now);
-        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
-        daemon.step(
-            Input::Audio(Graph {
-                default_sink: "pods".into(),
-                sinks: vec![Sink {
-                    name: "pods".into(),
-                    address: Some(addr(3)),
-                    profile: Some("a2dp-sink".into()),
-                }],
-                cards: vec![],
-                streams: vec![LiveStream {
-                    id: 9,
-                    generation: 9,
-                    sink: "pods".into(),
-                    role: "".into(),
-                    node: "Brave".into(),
-                    mute: false,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            }),
-            now,
-        );
-        assert!(daemon.audio.routed());
-        let mut effects = Vec::new();
-        let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
-            effects.extend(daemon.step(input, clock).effects);
-        };
-        feed(&mut daemon, Input::Accessory { generation, packet: ears(0x00, 0x00) }, at(100));
-        feed(&mut daemon, Input::Tick, at(600));
-        feed(&mut daemon, Input::Accessory { generation, packet: ears(0x01, 0x00) }, at(1_000));
-        // The control link reports a change once; the tick settles it.
-        feed(&mut daemon, Input::Tick, at(1_500));
-        let paused: Vec<_> =
-            effects.iter().filter(|e| matches!(e, Effect::PausePlayers(_))).cloned().collect();
-        assert_eq!(paused.len(), 1, "{effects:?}");
-        assert!(
-            matches!(&paused[0], Effect::PausePlayers(players) if players == &[brave.to_string()])
-        );
-        effects.clear();
-        let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
-            effects.extend(daemon.step(input, clock).effects);
-        };
-        feed(&mut daemon, Input::Player { service: brave.into(), playing: Some(false) }, at(1_600));
-        feed(&mut daemon, Input::Accessory { generation, packet: ears(0x00, 0x00) }, at(3_000));
-        feed(&mut daemon, Input::Tick, at(3_500));
-        let resumed = effects
+    fn wear_removal_pauses_and_reinsertion_resumes_owned_playback() {
+        for signal in ["buds", "advertisement", "headset-control"] {
+            use crate::audio::route::{Graph, LiveStream, Sink};
+            use crate::step::{Effect, Input};
+            let brave = "org.mpris.MediaPlayer2.brave";
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            if signal == "headset-control" {
+                daemon.set_identity("Max", "A3454");
+            }
+            ready_link(&mut daemon, now);
+            let generation = daemon.connection().generation();
+            let wear = |removed: bool| {
+                if signal == "advertisement" {
+                    Input::Proximity {
+                        address: addr(3),
+                        payload: max2_frame(if removed { 0x21 } else { 0x23 }),
+                    }
+                } else {
+                    Input::Accessory {
+                        generation,
+                        packet: vec![4, 0, 4, 0, 6, 0, u8::from(removed), 0],
+                    }
+                }
+            };
+            if signal == "advertisement" {
+                daemon.step(wear(false), now);
+            }
+            daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
+            daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, now);
+            daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
+            daemon.step(
+                Input::Audio(Graph {
+                    default_sink: "pods".into(),
+                    sinks: vec![Sink {
+                        name: "pods".into(),
+                        address: Some(addr(3)),
+                        profile: Some("a2dp-sink".into()),
+                    }],
+                    cards: vec![],
+                    streams: vec![LiveStream {
+                        id: 9,
+                        generation: 9,
+                        sink: "pods".into(),
+                        role: "".into(),
+                        node: "Brave".into(),
+                        mute: false,
+                        volume: 1.0,
+                        corked: false,
+                    }],
+                }),
+                now,
+            );
+            assert!(daemon.audio.routed());
+            let mut effects = Vec::new();
+            let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
+                effects.extend(daemon.step(input, clock).effects);
+            };
+            feed(&mut daemon, wear(false), at(100));
+            feed(&mut daemon, Input::Tick, at(600));
+            feed(&mut daemon, wear(true), at(1_000));
+            if signal == "headset-control" {
+                // A lagging advertisement must not cancel the control removal.
+                feed(
+                    &mut daemon,
+                    Input::Proximity { address: addr(3), payload: max2_frame(0x23) },
+                    at(1_100),
+                );
+            }
+            // Either a BLE or control report uses the same removal debounce.
+            feed(&mut daemon, Input::Tick, at(1_500));
+            let paused: Vec<_> =
+                effects.iter().filter(|e| matches!(e, Effect::PausePlayers(_))).cloned().collect();
+            assert_eq!(paused.len(), 1, "{effects:?}");
+            assert!(
+                matches!(&paused[0], Effect::PausePlayers(players) if players == &[brave.to_string()])
+            );
+            effects.clear();
+            let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
+                effects.extend(daemon.step(input, clock).effects);
+            };
+            feed(
+                &mut daemon,
+                Input::Player { service: brave.into(), playing: Some(false) },
+                at(1_600),
+            );
+            feed(&mut daemon, wear(false), at(3_000));
+            feed(&mut daemon, Input::Tick, at(3_500));
+            let resumed = effects
             .iter()
             .filter(
                 |e| matches!(e, Effect::ResumePlayers(players) if players == &[brave.to_string()]),
             )
             .count();
-        assert_eq!(resumed, 1, "{effects:?}");
-        // Our own resume is not a new play that claims again.
-        let claim = [4, 0, 4, 0, 9, 0, 6, 1, 0, 0, 0];
-        let replayed =
-            daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_600));
-        assert!(!replayed.effects.iter().any(|effect| {
-            matches!(effect, Effect::WriteControl { bytes, .. } if bytes == &claim)
-                || matches!(effect, Effect::MuteStreams(_))
-        }));
-        assert!(daemon.audio.local_playing());
+            assert_eq!(resumed, 1, "{effects:?}");
+            // Our own resume is not a new play that claims again.
+            let claim = [4, 0, 4, 0, 9, 0, 6, 1, 0, 0, 0];
+            let replayed = daemon
+                .step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_600));
+            assert!(!replayed.effects.iter().any(|effect| {
+                matches!(effect, Effect::WriteControl { bytes, .. } if bytes == &claim)
+                    || matches!(effect, Effect::MuteStreams(_))
+            }));
+            assert!(daemon.audio.local_playing());
+        }
     }
 
     #[test]
@@ -8588,11 +8869,11 @@ mod tests {
             // Long past the rebound window, a stem click toggles this
             // laptop's paused player back to Playing. With no desktop
             // input it is the pods' pause/resume key talking, not a
-            // takeover press: stay paused, twice in a row.
+            // takeover press: repeated toggles must stay paused.
             if desktop_press {
                 daemon.step(Input::Command(Command::Activity), at(60_000));
             }
-            for toggle in 0..2 {
+            for toggle in 0..8 {
                 daemon.step(
                     Input::Player { service: service.into(), playing: Some(false) },
                     at(60_000 + toggle * 1_000),
@@ -8620,6 +8901,53 @@ mod tests {
                 );
                 assert!(!daemon.output.wants_output(), "a stem toggle must not claim");
             }
+        }
+    }
+
+    #[test]
+    fn delayed_activity_keeps_its_event_time_across_a_yield() {
+        use crate::step::{Effect, Input};
+        let local = addr(2);
+        let gram = addr(4);
+        let mut source = vec![4, 0, 4, 0, 0x0e, 0];
+        source.extend(gram.bytes().into_iter().rev());
+        source.push(2);
+        for (event_ms, delivered_ms, play_ms, takes_over) in [
+            (200, 1_000, 1_500, false),   // input before yield, delivered afterwards
+            (400, 1_000, 1_500, true),    // actual input after yield
+            (400, 30_000, 30_500, false), // expired report
+            (2_000, 1_000, 1_500, false), // future timestamp
+            (400, 1_000, 30_500, false),  // input expires before playback
+        ] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_local_address(Some(local));
+            ready_link(&mut daemon, now);
+            let generation = daemon.connection.generation();
+            let service = "org.mpris.MediaPlayer2.brave";
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.note_pod_peers(vec![local, gram], now.unix);
+            daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+            daemon.step(Input::Accessory { generation, packet: source.clone() }, at(1));
+            daemon.step(Input::Tick, at(301));
+            assert!(!daemon.output.wants_output());
+            daemon.step(Input::Command(Command::ActivityAt(at(event_ms).unix)), at(delivered_ms));
+            daemon
+                .step(Input::Player { service: service.into(), playing: Some(false) }, at(play_ms));
+            let replayed = daemon.step(
+                Input::Player { service: service.into(), playing: Some(true) },
+                at(play_ms + 1),
+            );
+            assert_eq!(
+                daemon.output.wants_output(),
+                takes_over,
+                "event={event_ms}, delivered={delivered_ms}, play={play_ms}"
+            );
+            assert_eq!(
+                replayed.effects.iter().any(|effect| matches!(effect, Effect::PausePlayers(_))),
+                !takes_over
+            );
         }
     }
 
@@ -8729,7 +9057,7 @@ mod tests {
     }
 
     #[test]
-    fn an_admission_for_a_peer_not_yet_on_the_pods_steps_the_holder_back() {
+    fn connection_admission_does_not_imply_playback_intent() {
         use crate::fleet::members::{Fleet, Member};
         use crate::fleet::route_air::{Kind, Message};
         use crate::pods::observe::Observation;
@@ -8776,21 +9104,63 @@ mod tests {
                 now,
             );
             let stepped = daemon.step(Input::Tick, at(10));
-            if peer_on_pods {
-                assert!(
-                    !stepped.effects.iter().any(|effect| matches!(effect, Effect::PausePlayers(_))),
-                    "a peer already on the pods claims over its own link; no step-back"
-                );
-                assert_eq!(daemon.session.intent_until, None);
-            } else {
-                assert!(
-                    stepped.effects.iter().any(|effect| matches!(
-                        effect, Effect::PausePlayers(names) if names == &[service.to_string()]
-                    )),
-                    "the holder must free the pods' radio for a peer that still has to connect"
-                );
-                assert!(daemon.session.intent_until.is_some());
-            }
+            let reply = daemon.read_route(&daemon.route_reply.as_ref().unwrap().packet).unwrap();
+            assert_eq!(reply.result, crate::fleet::route_air::Answer::Ok);
+            assert_eq!(reply.retain, Some(local));
+            assert!(
+                !stepped.effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::PausePlayers(_) | Effect::MuteStreams(_) | Effect::Disconnect { .. }
+                )),
+                "connection admission must not interrupt the owner: {peer_on_pods}"
+            );
+            assert!(daemon.audio.local_playing());
+            assert!(daemon.output.wants_output());
+            assert_eq!(daemon.session.intent_until, None);
+            let later = daemon.step(Input::Tick, at(13_000));
+            assert!(
+                !later.effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::PausePlayers(_) | Effect::ResumePlayers(_)
+                )),
+                "a background join must not create a speculative pause/resume hold"
+            );
+
+            // Actual playback intent still frees the radio before the claim,
+            // including when the requester has not finished connecting yet.
+            let intent_at = at(14_000);
+            daemon.observe_nearby(
+                host_id(Some(gram)),
+                gram,
+                "gram",
+                intent_at.unix,
+                true,
+                Some([9; 16]),
+            );
+            daemon.hear_roster(
+                crate::fleet::roster_air::Snapshot {
+                    reporter: gram,
+                    session: [9; 16],
+                    sequence: 1,
+                    sent: intent_at.unix,
+                    accessory: addr(3),
+                    peers: if peer_on_pods { vec![local, gram] } else { vec![local] },
+                    audio_source: Some(local),
+                    last_use: UnixMs(0),
+                    pending: false,
+                    audio_idle: false,
+                    intent: true,
+                },
+                intent_at,
+            );
+            let takeover = daemon.step(Input::Tick, at(14_010));
+            assert!(
+                takeover.effects.iter().any(|effect| matches!(
+                    effect, Effect::PausePlayers(names) if names == &[service.to_string()]
+                )),
+                "explicit playback intent still yields ahead of the peer's claim"
+            );
+            assert!(daemon.session.intent_until.is_some());
         }
     }
 

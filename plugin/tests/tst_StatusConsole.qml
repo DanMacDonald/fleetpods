@@ -24,6 +24,7 @@ TestCase {
   }
 
   function append(row) {
+    row.accessory = row.accessory || ""
     row.device = row.device || ""
     row.retryPeer = row.retryPeer || ""
     row.retryAt = row.retryAt || 0
@@ -115,6 +116,20 @@ TestCase {
     rows.setProperty(0, "message", "Connecting to AirPods... Connected!")
     compare(label.text, "Connected to AirPods")
     compare(findChild(item, "headerSymbol").stateName, "success")
+  }
+
+  function test_accessoryNameSurvivesConnectionAndRetryRendering() {
+    rows.clear()
+    append({ time: "16:00:00", message: "AirPods Max 2 connected.", kind: "connection",
+      eventKind: "connected", accessory: "AirPods Max 2", live: false, detail: "" })
+    var item = createTemporaryObject(consoleView, this)
+    compare(findChild(item, "latestStatus").text, "Connected to AirPods Max 2")
+    rows.setProperty(0, "live", true)
+    rows.setProperty(0, "eventKind", "connecting")
+    compare(item.messageText(rows.get(0)), "Connecting to AirPods Max 2...")
+    rows.setProperty(0, "retryPeer", "lg-gram")
+    rows.setProperty(0, "retryAt", 0)
+    compare(item.messageText(rows.get(0)), "Retrying AirPods Max 2 connection...")
   }
 
   function test_disconnectWaitAnimatesAndBecomesConnectingInPlace() {

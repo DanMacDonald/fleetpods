@@ -112,27 +112,23 @@ impl Format {
     }
 }
 
-/// Pro 3 is the verified entry. Pro 2 (A2698) uses the same constants,
-/// validated on hardware 2026-11-01 (tone at exactly 880 Hz decoded
-/// clean; see docs/multi-accessory.md). Other SKUs stay hidden.
+/// SKUs enabled for AACP microphone capture. Keep untested older Max models
+/// on the stock input; a shared family name is not evidence of codec support.
+/// See docs/support.md for hardware validation of this format.
 pub fn format_for_sku(sku: &str) -> Option<Format> {
-    match sku {
-        "A3063" | "A3064" | "A3065" => Some(Format {
-            model: Model::AirPodsPro3,
-            audio_specific_config: [0xf8, 0xe6, 0x30, 0x00],
-            coding_hz: 48_000,
-            delivery_hz: 64_000,
-            samples_per_frame: 480,
-        }),
-        "A2698" => Some(Format {
-            model: Model::AirPodsPro2Lightning,
-            audio_specific_config: [0xf8, 0xe6, 0x30, 0x00],
-            coding_hz: 48_000,
-            delivery_hz: 64_000,
-            samples_per_frame: 480,
-        }),
-        _ => None,
-    }
+    let model = match sku {
+        "A3063" | "A3064" | "A3065" => Model::AirPodsPro3,
+        "A2698" => Model::AirPodsPro2Lightning,
+        "A3454" => Model::AirPodsMax2,
+        _ => return None,
+    };
+    Some(Format {
+        model,
+        audio_specific_config: [0xf8, 0xe6, 0x30, 0x00],
+        coding_hz: 48_000,
+        delivery_hz: 64_000,
+        samples_per_frame: 480,
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,7 +293,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_pro_3_format_is_exposed_and_stalls_are_bounded() {
+    fn supported_formats_are_explicit_and_stalls_are_bounded() {
         let format = format_for_sku("A3064").unwrap();
         assert_eq!(format.coding_hz, 48_000);
         assert_eq!(format.delivery_hz, 64_000);
@@ -311,7 +307,13 @@ mod tests {
         assert_eq!(pro2.delivery_hz, 64_000);
         assert_eq!(pro2.samples_per_frame, 480);
         assert_eq!(pro2.audio_specific_config, [0xf8, 0xe6, 0x30, 0x00]);
-        assert!(format_for_sku("A2084").is_none());
+        let max = format_for_sku("A3454").unwrap();
+        assert_eq!(max.model, Model::AirPodsMax2);
+        assert_eq!(max.audio_specific_config, format.audio_specific_config);
+        assert_eq!(max.delivery_hz, format.delivery_hz);
+        for unsupported in ["A2084", "A2096", "A3184", ""] {
+            assert!(format_for_sku(unsupported).is_none());
+        }
 
         let mut mic = Microphone::new();
         assert_eq!(mic.note_live(true), Motion::None);

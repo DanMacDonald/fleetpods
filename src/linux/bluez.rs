@@ -45,6 +45,9 @@ pub struct Device {
     pub services_resolved: bool,
     pub handsfree: bool,
     pub control: bool,
+    /// AirPods Max form factor, from the BlueZ modalias product or the
+    /// device-reported name. Buds do not set this.
+    pub headset: bool,
 }
 
 impl Device {
@@ -366,6 +369,7 @@ pub fn device_from(
         services_resolved: prop_bool(props, "ServicesResolved"),
         handsfree: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(HANDSFREE)),
         control: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(CONTROL_SERVICE)),
+        headset: is_headset(props),
     })
 }
 
@@ -625,9 +629,22 @@ fn devices_from(objects: &Objects) -> Vec<Device> {
             services_resolved: prop_bool(props, "ServicesResolved"),
             handsfree: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(HANDSFREE)),
             control: uuids.iter().any(|uuid| uuid.eq_ignore_ascii_case(CONTROL_SERVICE)),
+            headset: is_headset(props),
         });
     }
     devices
+}
+
+/// Modalias products for the Max family (the advertisement product ids
+/// byte-swapped), with the reported name as a fallback.
+fn is_headset(props: &Props) -> bool {
+    let modalias = prop_string(props, "Modalias").unwrap_or_default();
+    let product = modalias
+        .split('p')
+        .nth(1)
+        .and_then(|rest| u32::from_str_radix(&rest[..rest.len().min(4)], 16).ok());
+    matches!(product, Some(0x200a | 0x201f | 0x202d))
+        || prop_string(props, "Name").is_some_and(|name| name.contains("AirPods Max"))
 }
 
 fn prop_rssi(props: &Props) -> Option<i16> {
@@ -692,6 +709,7 @@ mod tests {
             services_resolved: false,
             handsfree: false,
             control,
+            headset: false,
         }
     }
 

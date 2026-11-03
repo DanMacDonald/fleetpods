@@ -40,15 +40,16 @@ Rectangle {
 
   function messageText(row) {
     if (!row) return "No recent activity"
+    var accessory = row.accessory || "AirPods"
     if (row.live && row.retryPeer) {
       var seconds = Math.max(0, Math.ceil((row.retryAt - root.nowMs) / 1000))
-      var label = seconds > 0 ? "Waiting for " + row.retryPeer + ". Retrying in " + seconds + "s" : "Retrying AirPods connection"
+      var label = seconds > 0 ? "Waiting for " + row.retryPeer + ". Retrying in " + seconds + "s" : "Retrying " + accessory + " connection"
       return label + (".".repeat(root.dots) + "   ").slice(0, 3)
     }
     if (row.live && row.eventKind === "waitingDisconnect")
       return row.message.slice(0, -3) + ".".repeat(root.dots)
-    if (row.live) return Model.connectingLine(row.detail, root.dots, false, row.device)
-    if (row.eventKind === "connected") return "Connected to AirPods"
+    if (row.live) return Model.connectingLine(row.detail, root.dots, false, row.device, accessory)
+    if (row.eventKind === "connected") return "Connected to " + accessory
     if (row.eventKind === "connectingAgain") return "Retrying connection"
     return row.message
   }

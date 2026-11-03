@@ -1,4 +1,4 @@
-//! AAC-ELD through FFmpeg. A frame is kept only when it matches the Pro 3 table.
+//! AAC-ELD through FFmpeg. A frame is kept only when it matches the selected microphone format.
 
 use super::mic::Format;
 

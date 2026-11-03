@@ -32,6 +32,8 @@ pub fn pairing_model(payload: &[u8]) -> Option<Model> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub model: Model,
+    /// Aggregate head wear, only for models with a verified BLE layout.
+    pub head_worn: Option<bool>,
     pub primary_left: bool,
     pub this_in_case: bool,
     pub both_in_case: bool,
@@ -70,7 +72,12 @@ pub fn parse(payload: &[u8]) -> Option<Frame> {
     if payload.len() < HEADER + BLOCK || payload[0] != PROXIMITY || payload[2] != PAIRED {
         return None;
     }
+    let model = Model::from_product(u16::from_be_bytes([payload[3], payload[4]]));
     let status = payload[5];
+    // A3454 uses either earcup bit, not the older Max's bit 5. XPS capture
+    // 2026-11-03: off 0x20/0x21, worn 0x23. A single bit is sufficient;
+    // this does not identify which cup is worn or imply both are worn.
+    let head_worn = (model == Model::AirPodsMax2).then_some(status & 0x0a != 0);
     let primary_left = status & 0x20 != 0;
     let flipped = !primary_left;
     let this_in_case = status & 0x40 != 0;
@@ -80,7 +87,7 @@ pub fn parse(payload: &[u8]) -> Option<Frame> {
     let right_in_ear = (status & if swapped { 0x02 } else { 0x08 }) != 0;
     let flags = payload[7] >> 4;
     let case_nibble = payload[7] & 0x0f;
-    let lid = (this_in_case || both_in_case).then(|| {
+    let lid = (!model.is_headset() && (this_in_case || both_in_case)).then(|| {
         if payload[8] & 0x08 == 0 {
             LidState::Open
         } else {
@@ -89,7 +96,8 @@ pub fn parse(payload: &[u8]) -> Option<Frame> {
     });
     let encrypted = payload[payload.len() - BLOCK..].try_into().ok()?;
     Some(Frame {
-        model: Model::from_product(u16::from_be_bytes([payload[3], payload[4]])),
+        model,
+        head_worn,
         primary_left,
         this_in_case,
         both_in_case,
@@ -179,6 +187,31 @@ fn aes_decrypt(key: &[u8; 16], block: &[u8; 16]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max2_wear_uses_either_sensor_without_inventing_case_or_older_max_wear() {
+        let mut frame: Vec<u8> =
+            "07 19 01 2d 20 23 f9 8f 06 13 04 74 0f 4d 64 71 ed 5b b0 11 06 6e 42 36 72 eb 01"
+                .split_whitespace()
+                .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+                .collect();
+        for (status, worn) in
+            [(0x20, false), (0x21, false), (0x23, true), (0x28, true), (0x2b, true)]
+        {
+            frame[5] = status;
+            let parsed = parse(&frame).unwrap();
+            assert_eq!(parsed.model, Model::AirPodsMax2);
+            assert_eq!(parsed.head_worn, Some(worn));
+            assert_eq!(parsed.lid, None);
+        }
+        // Bud-only case flags are never a headset case observation.
+        frame[5] = 0x64;
+        assert_eq!(parse(&frame).unwrap().lid, None);
+        for product in [0x0a, 0x1f, 0x27, 0xff] {
+            frame[3] = product;
+            assert_eq!(parse(&frame).unwrap().head_worn, None);
+        }
+    }
 
     #[test]
     fn pairing_envelope_is_separate_from_placement_and_limited_to_verified_model() {

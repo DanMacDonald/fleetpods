@@ -1,4 +1,6 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/audio/eld_ffmpeg.c");
+    println!("cargo:rerun-if-changed=src/linux/micsource.c");
     let codec = pkg_config::Config::new().probe("libavcodec").unwrap();
     let util = pkg_config::Config::new().probe("libavutil").unwrap();
     let pipewire = pkg_config::Config::new().probe("libpipewire-0.3").unwrap();

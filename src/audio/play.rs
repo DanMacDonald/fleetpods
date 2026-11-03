@@ -8,6 +8,8 @@ use crate::types::{EarBehavior, MonoMs, PlayKind, PlaybackEvent, UnixMs};
 
 const TOKEN_LIMIT: usize = 64;
 const EAR_DEBOUNCE_MS: u64 = 400;
+// Headsets have one aggregate report, without the buds' primary-role churn.
+const HEAD_REMOVAL_DEBOUNCE_MS: u64 = 100;
 const OBSERVER_TTL_MS: u64 = 5_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,10 +125,9 @@ struct Duck {
 
 #[derive(Clone, Debug)]
 struct Ears {
-    left: Option<bool>,
-    right: Option<bool>,
     /// Unknown until the first reading, which is a baseline and not a change.
     settled: Option<Removal>,
+    /// Placement and its settle deadline; repeated reports do not postpone it.
     pending: Option<(Removal, MonoMs)>,
     paused_by_us: bool,
     /// The players a removal paused, which reinsertion plays again.
@@ -174,8 +175,6 @@ impl Audio {
             token_set: BTreeSet::new(),
             duck: Duck { saved: None, active: false },
             ears: Ears {
-                left: None,
-                right: None,
                 settled: None,
                 pending: None,
                 paused_by_us: false,
@@ -426,10 +425,9 @@ impl Audio {
         left: Option<bool>,
         right: Option<bool>,
         behavior: EarBehavior,
+        headset: bool,
         now: MonoMs,
     ) -> EarAction {
-        self.ears.left = left;
-        self.ears.right = right;
         let Some(removal) = removal(left, right) else {
             self.ears.pending = None;
             return EarAction::Hold;
@@ -438,31 +436,26 @@ impl Audio {
             self.ears.settled = Some(removal);
             return EarAction::Hold;
         }
-        if Some(removal) != self.ears.settled {
-            match self.ears.pending {
-                Some((pending, since))
-                    if pending == removal && now.saturating_since(since) >= EAR_DEBOUNCE_MS =>
-                {
-                    self.ears.pending = None;
-                    self.settle(removal, behavior)
-                }
-                Some((pending, _)) if pending == removal => EarAction::Hold,
-                _ => {
-                    self.ears.pending = Some((removal, now));
-                    EarAction::Hold
-                }
-            }
-        } else {
+        if Some(removal) == self.ears.settled {
             self.ears.pending = None;
-            EarAction::Hold
+            return EarAction::Hold;
         }
+        if !self.ears.pending.is_some_and(|(pending, _)| pending == removal) {
+            let delay = if headset && removal == Removal::Both {
+                HEAD_REMOVAL_DEBOUNCE_MS
+            } else {
+                EAR_DEBOUNCE_MS
+            };
+            self.ears.pending = Some((removal, now.saturating_add(delay)));
+        }
+        self.ears_tick(behavior, now)
     }
 
     pub fn ears_tick(&mut self, behavior: EarBehavior, now: MonoMs) -> EarAction {
-        let Some((removal, since)) = self.ears.pending else {
+        let Some((removal, deadline)) = self.ears.pending else {
             return EarAction::Hold;
         };
-        if now.saturating_since(since) < EAR_DEBOUNCE_MS {
+        if now < deadline {
             return EarAction::Hold;
         }
         self.ears.pending = None;
@@ -608,17 +601,45 @@ mod tests {
         assert!(audio.update_player(BRAVE, Some(true)));
         audio.set_routed(true);
         assert_eq!(
-            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(0)),
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, false, MonoMs(0)),
             EarAction::Hold
         );
         audio
     }
 
     #[test]
+    fn head_removal_settles_quickly_without_shortening_rewear_or_bud_debounce() {
+        for headset in [false, true] {
+            let mut audio = worn_and_playing();
+            // A brief sensor flicker is still ignored.
+            audio.ears(Some(false), Some(false), EarBehavior::PauseOne, headset, MonoMs(10));
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, headset, MonoMs(60));
+            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(500)), EarAction::Hold);
+            audio.ears(Some(false), Some(false), EarBehavior::PauseOne, headset, MonoMs(1_000));
+            // Repeated reports cannot postpone the deadline.
+            audio.ears(Some(false), Some(false), EarBehavior::PauseOne, headset, MonoMs(1_050));
+            let deadline = if headset { 1_100 } else { 1_400 };
+            assert_eq!(
+                audio.ears_tick(EarBehavior::PauseOne, MonoMs(deadline - 1)),
+                EarAction::Hold
+            );
+            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(deadline)), EarAction::Pause);
+            assert_eq!(
+                audio.ears_tick(EarBehavior::PauseOne, MonoMs(deadline + 1)),
+                EarAction::Hold
+            );
+            audio.update_player(BRAVE, Some(false));
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, headset, MonoMs(2_000));
+            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_100)), EarAction::Hold);
+            assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_400)), EarAction::Resume);
+        }
+    }
+
+    #[test]
     fn a_fresh_play_overrides_an_ear_pause_but_a_snapshot_does_not() {
         for browser in [false, true] {
             let mut audio = worn_and_playing();
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(100));
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, false, MonoMs(100));
             assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(500)), EarAction::Pause);
             assert_eq!(audio.ear_paused(), [BRAVE]);
             audio.update_player(BRAVE, Some(false));
@@ -647,12 +668,12 @@ mod tests {
             }
             assert!(audio.local_playing(), "the old ear pause must not suppress explicit play");
             assert_eq!(
-                audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(600)),
+                audio.ears(Some(false), Some(true), EarBehavior::PauseOne, false, MonoMs(600)),
                 EarAction::Hold
             );
             assert!(audio.local_playing(), "unchanged placement must not pause it again");
             // The user's play replaced our pause, so reinsertion resumes nothing.
-            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(700));
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, false, MonoMs(700));
             assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_100)), EarAction::Hold);
         }
     }
@@ -661,29 +682,29 @@ mod tests {
     fn a_flicker_does_not_pause_and_only_our_pause_resumes() {
         let mut audio = worn_and_playing();
         assert_eq!(
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(100)),
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, false, MonoMs(100)),
             EarAction::Hold
         );
         assert_eq!(
-            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(150)),
+            audio.ears(Some(true), Some(true), EarBehavior::PauseOne, false, MonoMs(150)),
             EarAction::Hold
         );
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_000)), EarAction::Hold);
         assert!(audio.local_playing());
         assert_eq!(
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(1_000)),
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, false, MonoMs(1_000)),
             EarAction::Hold
         );
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_400)), EarAction::Pause);
         assert!(!audio.local_playing());
         // Our own pause reported back, then the second bud out: no second pause.
         audio.update_player(BRAVE, Some(false));
-        audio.ears(Some(false), Some(false), EarBehavior::PauseOne, MonoMs(1_500));
+        audio.ears(Some(false), Some(false), EarBehavior::PauseOne, false, MonoMs(1_500));
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_900)), EarAction::Hold);
         // One bud back is not yet the two that were worn.
-        audio.ears(Some(true), Some(false), EarBehavior::PauseOne, MonoMs(2_000));
+        audio.ears(Some(true), Some(false), EarBehavior::PauseOne, false, MonoMs(2_000));
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_400)), EarAction::Hold);
-        audio.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(2_500));
+        audio.ears(Some(true), Some(true), EarBehavior::PauseOne, false, MonoMs(2_500));
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(2_900)), EarAction::Resume);
         assert_eq!(audio.take_ear_paused(), vec![BRAVE.to_string()]);
     }
@@ -691,7 +712,7 @@ mod tests {
     #[test]
     fn only_a_removal_through_the_pods_pauses_a_player_the_daemon_can_pause() {
         let removal = |audio: &mut Audio| {
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(100));
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, false, MonoMs(100));
             audio.ears_tick(EarBehavior::PauseOne, MonoMs(500))
         };
         // A bud left in the case from the start is not a removal.
@@ -700,7 +721,7 @@ mod tests {
         audio.update_player(BRAVE, Some(true));
         audio.set_routed(true);
         assert_eq!(
-            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, MonoMs(0)),
+            audio.ears(Some(false), Some(true), EarBehavior::PauseOne, false, MonoMs(0)),
             EarAction::Hold
         );
         assert_eq!(audio.ears_tick(EarBehavior::PauseOne, MonoMs(1_000)), EarAction::Hold);
@@ -714,7 +735,7 @@ mod tests {
         let mut tab = Audio::new();
         tab.startup_players(&[]);
         tab.set_routed(true);
-        tab.ears(Some(true), Some(true), EarBehavior::PauseOne, MonoMs(0));
+        tab.ears(Some(true), Some(true), EarBehavior::PauseOne, false, MonoMs(0));
         let play = PlaybackEvent {
             kind: PlayKind::Play,
             application: "browser".into(),
@@ -728,13 +749,13 @@ mod tests {
         assert!(tab.local_playing());
         // Pause on both removed waits for the second bud.
         let mut both = worn_and_playing();
-        both.ears(Some(false), Some(true), EarBehavior::PauseBoth, MonoMs(100));
+        both.ears(Some(false), Some(true), EarBehavior::PauseBoth, false, MonoMs(100));
         assert_eq!(both.ears_tick(EarBehavior::PauseBoth, MonoMs(500)), EarAction::Hold);
-        both.ears(Some(false), Some(false), EarBehavior::PauseBoth, MonoMs(600));
+        both.ears(Some(false), Some(false), EarBehavior::PauseBoth, false, MonoMs(600));
         assert_eq!(both.ears_tick(EarBehavior::PauseBoth, MonoMs(1_000)), EarAction::Pause);
         // Another device taking the pods ends the pause; reinsertion resumes nothing.
         both.yield_playback();
-        both.ears(Some(true), Some(true), EarBehavior::PauseBoth, MonoMs(1_100));
+        both.ears(Some(true), Some(true), EarBehavior::PauseBoth, false, MonoMs(1_100));
         assert_eq!(both.ears_tick(EarBehavior::PauseBoth, MonoMs(1_500)), EarAction::Hold);
     }
 

@@ -23,6 +23,7 @@ Item {
       var row = list[i]
       if (i < messages.count) {
         var shown = messages.get(i)
+        if (shown.accessory !== (row.accessory || "")) messages.setProperty(i, "accessory", row.accessory || "")
         if (shown.kind !== row.kind) messages.setProperty(i, "kind", row.kind)
         if (shown.retryAt !== (row.retryAt || 0)) messages.setProperty(i, "retryAt", row.retryAt || 0)
         if (shown.retryPeer !== (row.retryPeer || "")) messages.setProperty(i, "retryPeer", row.retryPeer || "")
@@ -32,7 +33,7 @@ Item {
         if (shown.device !== (row.event && row.event.device || "")) messages.setProperty(i, "device", row.event && row.event.device || "")
         if (shown.detail !== row.detail) messages.setProperty(i, "detail", row.detail)
       } else {
-        messages.append({ rowId: row.id, time: Qt.formatTime(new Date(row.at), "HH:mm:ss"), message: row.message,
+        messages.append({ accessory: row.accessory || "", rowId: row.id, time: Qt.formatTime(new Date(row.at), "HH:mm:ss"), message: row.message,
           kind: row.kind, eventKind: eventKind(row), live: row.live, detail: row.detail, retryAt: row.retryAt || 0,
           retryPeer: row.retryPeer || "", device: row.event && row.event.device || "" })
       }

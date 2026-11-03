@@ -296,7 +296,7 @@ Panel {
     cursorActive = false
     cursorIndex = 0
     pods.refresh()
-    if (!fleetVisible) pods.requestActivity("panel-opened")
+    if (!fleetVisible) pods.requestActivity("panel-opened", Date.now())
     Qt.callLater(function () {
       if (fleetVisible && pods.view.fleet.phase === "incoming") fleetPane.codeInput.forceActiveFocus()
       else if (fleetVisible) fleetOverlay.forceActiveFocus()

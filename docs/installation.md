@@ -52,7 +52,7 @@ To share between Omarchy machines, install FleetPods on both and keep them nearb
 
 If you already belong to another fleet, joining asks whether to leave it on this computer. Declining an incoming invitation ends that invitation.
 
-For calls or recording, choose your AirPods as the input device in the application's audio settings. FleetPods supplies the high-resolution input for AirPods Pro 3 (and Pro 2 A2698, validated on hardware 2026-11-01) while keeping the stereo playback profile. Other pairs keep the stock Bluetooth input.
+For calls or recording, choose your AirPods as the input device in the application's audio settings. FleetPods supplies the high-resolution input for AirPods Pro 3, Pro 2 A2698 and Max 2 A3454 while keeping the stereo playback profile. See the [microphone validation notes](support.md#microphone-and-case-display) for tested behavior. Other pairs keep the stock Bluetooth input.
 
 ## Upgrade
 

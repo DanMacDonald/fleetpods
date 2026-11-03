@@ -80,6 +80,9 @@ impl Nearby {
             // The alternate payload does not contain normal lid/placement fields.
         } else if let Some(frame) = frame {
             candidate.report.note_advertisement(now, frame.connection);
+            if let Some(worn) = frame.head_worn {
+                candidate.report.note_head_worn(worn, now);
+            }
             if !model.is_headset() {
                 for right in [false, true] {
                     let ear = if frame.both_in_case {

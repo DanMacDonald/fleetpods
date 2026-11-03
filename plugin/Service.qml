@@ -48,7 +48,12 @@ Item {
   ActivityGate {
     id: activityGate
     idle: desk.isIdle
-    onActiveChanged: if (active && !screensaverCheck.running) screensaverCheck.running = true
+    onResumed: function(observedMs) {
+      if (!screensaverCheck.running) {
+        screensaverCheck.observedMs = observedMs
+        screensaverCheck.running = true
+      }
+    }
   }
 
   // The compositor can report input while Omarchy's screensaver is up without
@@ -59,11 +64,12 @@ Item {
   // or if it closes within 3 s.
   Process {
     id: screensaverCheck
+    property real observedMs: 0
     command: ["sh", "-c",
       "up() { hyprctl clients -j | grep -q '\"class\": \"org.omarchy.screensaver\"'; }; "
       + "up || exit 0; for i in $(seq 12); do sleep 0.25; up || exit 0; done; exit 1"]
     onExited: function(exitCode) {
-      if (exitCode === 0) root.requestActivity("desktop-resumed")
+      if (exitCode === 0) root.requestActivity("desktop-resumed", observedMs)
       else console.log("fleetpods-activity ignored: the screensaver is still up")
     }
   }
@@ -95,13 +101,14 @@ Item {
     onTriggered: root.stepStatusLog({ ev: "tick" })
   }
 
-  function requestActivity(source) {
+  function requestActivity(source, observedMs) {
     if (!daemonReachable || busy || activityHold || activityProcess.running)
       return
     console.log("fleetpods-activity request source=" + String(source || "unspecified")
       + " connected=" + connected + " idle=" + desk.isIdle)
     activityHold = !connected
     activityRequestedMs = Date.now()
+    activityProcess.observedMs = observedMs
     activityProcess.running = true
   }
 
@@ -116,7 +123,8 @@ Item {
 
   Process {
     id: activityProcess
-    command: [root.ctlPath, "activity"]
+    property real observedMs: 0
+    command: [root.ctlPath, "desktop-activity:" + observedMs.toFixed(0)]
     stdout: StdioCollector { id: activityOut; waitForEnd: true }
     onExited: function (exitCode) {
       if (root.connected) {

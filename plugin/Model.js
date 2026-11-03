@@ -790,7 +790,8 @@ function podsNearby(lastAdvertisementMs, lidState, nowMs, nearbyMs) {
   return (nowMs || Date.now()) - last < (nearbyMs || 20000)
 }
 
-function controlConnectionLabel(connection) {
+function controlConnectionLabel(connection, accessory) {
+  accessory = accessory || "AirPods"
   if (!connection) return ""
   if (connection.peer_reconnect) return "Trying to reconnect the Apple device..."
   var stage = connection.stage
@@ -799,13 +800,13 @@ function controlConnectionLabel(connection) {
   if (stage === "interrupted") return "Disconnected. Waiting for activity or Play."
   if (stage === "failed") {
     var reason = connection.reason ? " (" + connection.reason + ")" : ""
-    return "AirPods connection unavailable" + reason + ". Waiting for desktop activity."
+    return accessory + " connection unavailable" + reason + ". Waiting for desktop activity."
   }
   if (connection.recovering || stage === "retrying") {
     var attempt = connection.retry > 0 ? " (" + connection.retry + " of " + connection.retry_limit + ")" : ""
     return "Retrying connection" + attempt + "..."
   }
-  return "Connecting to AirPods."
+  return "Connecting to " + accessory + "."
 }
 
 // Pods docked in the case cannot answer, so the daemon's control retries there are not an attempt to show.
@@ -826,19 +827,22 @@ function connectionAttempt(connection) {
 }
 
 // The dots are padded to three so a retry beside them stays put in the monospace console.
-function connectingLine(detail, dots, connected, device) {
-  if (connected) return "Connecting to AirPods... Connected!"
+function connectingLine(detail, dots, connected, device, accessory) {
+  accessory = accessory || "AirPods"
+  if (connected) return "Connecting to " + accessory + "... Connected!"
   var marks = ".".repeat(dots)
-  return "Connecting " + (device ? device + " " : "") + "to AirPods" + (detail ? (marks + "   ").slice(0, 3) + " " + detail : marks)
+  return "Connecting " + (device ? device + " " : "") + "to " + accessory + (detail ? (marks + "   ").slice(0, 3) + " " + detail : marks)
 }
 
-function connectionLog(connection, refreshing, caption, phase) {
+function connectionLog(connection, refreshing, caption, phase, accessory) {
   var progress = controlConnectionLabel(connection)
   var ready = connection && connection.stage === "ready" && !connection.peer_reconnect
   // Failures have their reason row; an interrupted link has its connectionHold status row.
   var hidden = connection && !connection.peer_reconnect && (connection.stage === "waiting" || connection.stage === "failed" || connection.stage === "interrupted")
   var connectionEvent = ready ? { kind: "connected" } : progress && !hidden ? { kind: "connection", connection: connection } : null
   var statusEvent = progress || refreshing || (ready && caption && caption.kind === "inCase") ? null : caption
+  connectionEvent = accessoryEvent(connectionEvent, accessory)
+  statusEvent = accessoryEvent(statusEvent, accessory)
   return {
     connection: statusText(connectionEvent), connectionEvent: connectionEvent,
     status: statusText(statusEvent), statusEvent: statusEvent,
@@ -1009,13 +1013,13 @@ function localAudioLabel(state, failure, worn, playbackConfirmed, device, idleOw
 
 // The seats show who stays where, so a switch names only where the audio went.
 // The AirPods started playing from another device: the event, named for where the audio went.
-function audioSwitchCaption(device) {
-  return "AirPods audio moved to " + device + "."
+function audioSwitchCaption(device, accessory) {
+  return (accessory || "AirPods") + " audio moved to " + device + "."
 }
 
 // Where the AirPods' audio currently is, whether or not anything is playing.
-function audioHeldCaption(device) {
-  return "AirPods audio is on " + device + "."
+function audioHeldCaption(device, accessory) {
+  return (accessory || "AirPods") + " audio is on " + device + "."
 }
 
 function domainEvent(linuxHeld, appleDevices, omarchyDevices, holdingOmarchySeat, disconnected, takingSeat, ownershipUnknown, bluezConnected) {
@@ -1647,6 +1651,15 @@ function statusLog(previous, event) {
 }
 
 function statusLogApply(s, status, now) {
+  var identity = function (value) {
+    var selected = (value.accessories || []).filter(function (entry) { return entry.selected })[0]
+    return selected ? selected.address : value.deviceName || value.modelName || ""
+  }
+  if (status.ok && identity(s.status) && identity(status) && identity(s.status) !== identity(status)) {
+    s.rows.forEach(function (row) { row.live = false })
+    Object.assign(s, statusLogDaemonState())
+    s.previous = {}; s.errors = []
+  }
   var pairJoined = observedFleetJoin(s.status, status)
   var ended = fleetOutcome(s.status, status)
   s.statusLoaded = true
@@ -1822,46 +1835,59 @@ function deviceNameMarkup(text, names, color) {
   })
 }
 
+// Capture the selected accessory on each row; history must not follow later selections.
+function accessoryLabel(status) {
+  status = status || {}
+  return String(status.deviceName || "").trim() || String(status.modelName || "").trim()
+    || (status.isHeadset ? "AirPods Max" : "AirPods")
+}
+
+function accessoryEvent(event, accessory) {
+  return event && accessory && accessory !== "AirPods"
+    ? Object.assign({}, event, { accessory: event.accessory || accessory }) : event
+}
+
 // The words for a status event: a log row or the panel's description. Decisions compare kinds, never these words.
 function statusText(event) {
   if (!event) return ""
+  var accessory = event.accessory || "AirPods"
   switch (event.kind) {
     case "offline": return "FleetPods is not running"
     case "waitingForPlayback": return event.device + " disconnected. Play audio or click to reconnect."
-    case "joinedAlongside": return "Connected to AirPods alongside " + event.peer + "."
+    case "joinedAlongside": return "Connected to " + accessory + " alongside " + event.peer + "."
     case "pairedAlongside": return event.device + " connected alongside " + event.peer + "."
     case "fleetSwitching": return "Switching Omarchy Fleet connection to " + event.device + "…"
     case "fleetSwitched": return "Omarchy Fleet connection switched to " + event.device + "."
       + (event.keeper != null ? " " + event.keeper + " keeps the audio." : "")
-    case "reporterConnected": return "AirPods connected to " + event.device + "."
+    case "reporterConnected": return accessory + " connected to " + event.device + "."
     case "fleetUnconfirmed": return "Omarchy fleet switching. Last reported: " + event.device + "."
-    case "connection": return controlConnectionLabel(event.connection)
+    case "connection": return controlConnectionLabel(event.connection, accessory)
     case "inCase": return "Available, in case"
     case "caseClosed": return "Case closed"
     case "elsewhere": return event.device
-      ? event.device + " is connected. The AirPods are available."
-      : "Connected elsewhere. The AirPods are available."
+      ? event.device + " is connected. " + (event.accessory || "The AirPods") + " are available."
+      : "Connected elsewhere. " + (event.accessory || "The AirPods") + " are available."
     case "unavailable": return event.headset ? "Unavailable" : "Unavailable · possibly in case"
-    case "audioTaken": return audioSwitchCaption(event.device)
-    case "audioOn": return audioHeldCaption(event.device)
+    case "audioTaken": return audioSwitchCaption(event.device, accessory)
+    case "audioOn": return audioHeldCaption(event.device, accessory)
     case "claiming": return event.device + " claims ownership."
     case "reclaiming": return "Reclaiming Omarchy seat. Apple keeps audio."
     case "connectedHere": return "Connected to " + event.device + "."
-    case "controlPending": return "Bluetooth connected. Waiting for " + event.device + " to finish AirPods setup."
-    case "notConnected": return event.device + " is not connected to the AirPods."
+    case "controlPending": return "Bluetooth connected. Waiting for " + event.device + " to finish " + accessory + " setup."
+    case "notConnected": return event.device + " is not connected to " + (event.accessory || "the AirPods") + "."
     case "appleHasAudio": return "Apple fleet has the audio. " + (!event.device ? "No Omarchy seat connection is confirmed."
       : event.device + (event.seated ? " keeps the Omarchy seat." : " is not confirmed in the Omarchy seat."))
     case "waitingDisconnect": return "Waiting for " + event.peer + " to disconnect..."
-    case "connecting": return connectingLine(event.detail, 3, false, event.device)
-    case "connected": return event.fromAttempt ? connectingLine("", 3, true) : "AirPods connected."
+    case "connecting": return connectingLine(event.detail, 3, false, event.device, accessory)
+    case "connected": return event.fromAttempt ? connectingLine("", 3, true, "", accessory) : accessory + " connected."
     case "connectingAgain": return "Trying to connect again..."
     case "peerBusy": return "Waiting for " + event.peer + "..."
     case "retryScheduled": return "Waiting for " + event.peer + "."
     case "retriesExhausted": return "Waiting for " + event.peer + ". Automatic retries stopped."
-    case "retryCancelled": return "AirPods connection retry cancelled."
-    case "retryRequested": return "Requested an AirPods connection via " + event.peer + "."
+    case "retryCancelled": return accessory + " connection retry cancelled."
+    case "retryRequested": return "Requested " + (event.accessory ? "a connection to " + accessory : "an AirPods connection") + " via " + event.peer + "."
     case "retryStopped": return "Connection via " + event.peer + " stopped: " + event.reason
-    case "switchFailed": return event.device + " couldn't connect to the AirPods."
+    case "switchFailed": return event.device + " couldn't connect to " + (event.accessory || "the AirPods") + "."
     case "audioRestored": return event.device + " audio connection restored."
   }
   throw new Error("statusText: unknown status event kind " + event.kind)
@@ -1978,6 +2004,7 @@ function statusLogInputs(s, now) {
   var recoveringApple = !!s.presentation.audio && seat.appleOwnsAudio
     && !!control && control.stage !== "interrupted" && (control.recovering || controlOpening(control))
   var subtitle = pairingRequired || caseClosed ? live : heldSubtitle(seat.switching || recoveringApple, live, carriedAudio)
+  caption = accessoryEvent(caption, accessoryLabel(pods))
   s.caption = caption
   s.description = statusText(caption)
   s.subtitle = subtitleText(subtitle)
@@ -2044,7 +2071,10 @@ function statusLogLastStatus(s) {
 
 // A row keeps the event it shows, so later decisions about the row read its kind, never its words.
 function statusLogAppend(s, message, kind, live, detail, event) {
-  s.rows.push({ id: s.nextId++, at: s.now, kind: kind, message: message, event: event || null, live: live === true,
+  var accessory = accessoryLabel(s.status)
+  event = accessoryEvent(event, accessory)
+  s.rows.push({ id: s.nextId++, at: s.now, kind: kind, message: event ? statusText(event) : message,
+    accessory: accessory, event: event || null, live: live === true,
     detail: detail || "", retryPeer: "", retryAt: 0 })
   if (s.rows.length > LOG_CAPACITY) s.rows.splice(0, s.rows.length - LOG_CAPACITY)
 }
@@ -2054,6 +2084,7 @@ function statusLogNote(s, event, kind, live, detail) {
 }
 
 function statusLogReword(row, event, fields) {
+  event = accessoryEvent(event, row.accessory)
   Object.assign(row, fields, { message: statusText(event), event: event })
 }
 
@@ -2133,8 +2164,8 @@ function statusLogConnection(s, control, current, fleetRetry, connectionHold, al
 }
 
 function statusLogRecord(s, input) {
-  var current = connectionLog(input.controlConnection, input.refreshing, input.caption, input.phase)
-  var setStatus = function (event) { current.statusEvent = event; current.status = statusText(event) }
+  var current = connectionLog(input.controlConnection, input.refreshing, input.caption, input.phase, accessoryLabel(s.status))
+  var setStatus = function (event) { current.statusEvent = accessoryEvent(event, accessoryLabel(s.status)); current.status = statusText(current.statusEvent) }
   if (input.connectionHold) setStatus(input.connectionHold)
   if (input.fleetRetryStop && input.fleetRetryStop.reason) {
     setStatus({ kind: "retryStopped", peer: input.fleetRetryStop.peer, reason: input.fleetRetryStop.reason })

@@ -29,6 +29,13 @@ pub struct Placement {
     pub in_case: Option<bool>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct HeadWear {
+    worn: bool,
+    /// Control reports stand until link loss; advertisements are only a fallback.
+    control: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Accessory {
     pub name: String,
@@ -44,6 +51,8 @@ pub struct Accessory {
     pub right_placement: Evidence<Placement>,
     pub case_battery: Evidence<Battery>,
     pub headset: Evidence<Battery>,
+    /// Aggregate head wear, separate from earbud placement and battery.
+    head_worn: Evidence<HeadWear>,
     pub lid: Lid,
     pub noise: Evidence<NoiseMode>,
     pub adaptive: Evidence<u8>,
@@ -57,6 +66,9 @@ pub struct Accessory {
     pub pairing_at: Option<MonoMs>,
     /// Connection byte from that advertisement. Absent until one is accepted.
     pub ble_connection: Option<u8>,
+    /// BlueZ currently has this accessory connected (platform-reported,
+    /// only tracked for accessories other than the selected pair).
+    pub bluez_connected: bool,
 }
 
 impl Accessory {
@@ -74,6 +86,7 @@ impl Accessory {
             right_placement: Evidence::Unknown,
             case_battery: Evidence::Unknown,
             headset: Evidence::Unknown,
+            head_worn: Evidence::Unknown,
             lid: Lid::default(),
             noise: Evidence::Unknown,
             adaptive: Evidence::Unknown,
@@ -84,6 +97,7 @@ impl Accessory {
             advertised_at: None,
             pairing_at: None,
             ble_connection: None,
+            bluez_connected: false,
         }
     }
 
@@ -93,11 +107,14 @@ impl Accessory {
         self.model = Model::from_sku(sku);
     }
 
-    /// The link that reported this seat is gone. Battery and lid stay.
-    pub fn drop_owner(&mut self) {
+    /// Retire link-owned evidence on disconnect or selection change. Battery and lid stay.
+    pub fn drop_control_reports(&mut self) {
         self.ownership = Evidence::Unknown;
         self.source = Evidence::Unknown;
         self.remote_address = Evidence::Unknown;
+        if self.control_head_wear() {
+            self.head_worn = Evidence::Unknown;
+        }
     }
 
     pub fn note_ownership(&mut self, local: bool, at: MonoMs) {
@@ -148,15 +165,61 @@ impl Accessory {
         self.headset = Evidence::fresh(battery, at);
     }
 
+    pub fn note_head_worn(&mut self, worn: bool, at: MonoMs) {
+        if !self.control_head_wear() {
+            self.head_worn = Evidence::fresh(HeadWear { worn, control: false }, at);
+            self.ear_reported = true;
+        }
+    }
+
+    pub fn note_control_head_worn(&mut self, worn: bool, at: MonoMs) {
+        self.head_worn = Evidence::fresh(HeadWear { worn, control: true }, at);
+        self.ear_reported = true;
+    }
+
+    pub fn head_worn(&self) -> Option<bool> {
+        self.head_worn.as_fresh().map(|wear| wear.worn)
+    }
+
+    fn control_head_wear(&self) -> bool {
+        self.head_worn.as_fresh().is_some_and(|wear| wear.control)
+    }
+
+    /// One wear observation for selection and insertion policy. Missing or
+    /// stale evidence stays unknown; a headset never invents earbud placement.
+    pub fn wearing(&self) -> Option<bool> {
+        if self.model.is_headset() {
+            return self.head_worn();
+        }
+        let ear = |pod: &Evidence<Placement>| pod.as_fresh().and_then(|pod| pod.in_ear);
+        match (ear(&self.left_placement), ear(&self.right_placement)) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), Some(false)) => Some(false),
+            _ => None,
+        }
+    }
+
     pub fn note_lid(&mut self, state: LidState, at: MonoMs) {
         self.lid.observe(state, at);
+    }
+
+    /// Availability for connection admission and its status projection. An
+    /// open bud case permits a control connection, but not speaker muting.
+    pub fn connection_available(&self, now: MonoMs) -> bool {
+        !self.stowed()
+            && ((!self.model.is_headset() && self.lid.latest.as_fresh() == Some(&LidState::Open))
+                || self.playback_available(now))
     }
 
     /// Evidence that disconnected pods can play now. Case advertisements and
     /// old placement reports do not justify silencing the laptop's speakers.
     pub fn playback_available(&self, now: MonoMs) -> bool {
         let recent = |at| now.saturating_since(at) <= 10_000;
+        if self.model == Model::AirPodsMax2 {
+            return self.head_worn.at().is_some_and(recent) && self.head_worn() == Some(true);
+        }
         if self.model.is_headset() {
+            // Older Max wear layouts remain unverified here.
             return self.advertised_at.is_some_and(recent);
         }
         [&self.left_placement, &self.right_placement].into_iter().any(|pod| {
@@ -226,6 +289,9 @@ impl Accessory {
     /// so while `linked` its readings stand until the next report. The lid is advertised only.
     pub fn expire(&mut self, now: MonoMs, linked: bool) {
         self.lid.latest = std::mem::take(&mut self.lid.latest).expire(now, REPORT_TTL_MS);
+        if !linked || !self.control_head_wear() {
+            self.head_worn = std::mem::take(&mut self.head_worn).expire(now, REPORT_TTL_MS);
+        }
         if linked {
             return;
         }
@@ -249,5 +315,27 @@ impl Accessory {
 impl Default for Accessory {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_wear_stands_until_link_loss_then_advertisements_take_over() {
+        let mut accessory = Accessory::new();
+        accessory.set_identity("Max", "A3454");
+        accessory.note_head_worn(true, MonoMs(0));
+        accessory.note_control_head_worn(false, MonoMs(1));
+        accessory.note_head_worn(true, MonoMs(2));
+        accessory.expire(MonoMs(REPORT_TTL_MS + 3), true);
+        assert_eq!(accessory.wearing(), Some(false));
+        accessory.drop_control_reports();
+        assert_eq!(accessory.wearing(), None);
+        accessory.note_head_worn(true, MonoMs(REPORT_TTL_MS + 4));
+        assert_eq!(accessory.wearing(), Some(true));
+        accessory.expire(MonoMs(2 * REPORT_TTL_MS + 5), true);
+        assert_eq!(accessory.wearing(), None);
     }
 }

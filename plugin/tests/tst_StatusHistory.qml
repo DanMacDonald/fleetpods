@@ -37,8 +37,10 @@ TestCase {
     compare(item.entries.get(1).eventKind, "")
     var connected = row(1, "Connecting to AirPods... Connected!")
     connected.event = { kind: "connected", fromAttempt: true }
+    connected.accessory = "AirPods Max 2"
     item.rows = [connected, row(2, "No event")]
     compare(item.entries.get(0).eventKind, "connected")
+    compare(item.entries.get(0).accessory, "AirPods Max 2")
   }
 
   function test_clearAndTrimDropRows() {

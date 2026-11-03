@@ -26,6 +26,7 @@ pub enum Command {
     Status,
     FleetReset,
     Activity,
+    ActivityAt(UnixMs),
     Connect,
     AudioReset,
     Disconnect,
@@ -125,6 +126,7 @@ const SIMPLE: &[Verb] = &[
 pub fn cli_waits(command: &str) -> bool {
     command == "fleet"
         || command.starts_with("select:")
+        || command.starts_with("desktop-activity:")
         || SIMPLE.iter().any(|verb| verb.wire == command && verb.waits)
 }
 
@@ -141,7 +143,9 @@ pub fn push(bytes: &[u8]) -> Incoming {
 }
 
 fn framed_prefix(bytes: &[u8]) -> bool {
-    for prefix in [b"playback:".as_slice(), b"priority:", b"incoming:", b"fleet:"] {
+    for prefix in
+        [b"playback:".as_slice(), b"priority:", b"incoming:", b"fleet:", b"desktop-activity:"]
+    {
         if bytes.starts_with(prefix) || prefix.starts_with(bytes) {
             return true;
         }
@@ -150,6 +154,13 @@ fn framed_prefix(bytes: &[u8]) -> bool {
 }
 
 fn parse_text(text: &str) -> Command {
+    if let Some(at) = text.strip_prefix("desktop-activity:") {
+        return at
+            .parse::<u64>()
+            .ok()
+            .map(|at| Command::ActivityAt(UnixMs(at)))
+            .unwrap_or(Command::Unknown);
+    }
     if let Some(json) = text.strip_prefix("fleet:") {
         return Command::Fleet(parse_fleet(json));
     }
@@ -319,6 +330,30 @@ mod tests {
         assert!(cli_waits("fleet"));
         assert!(!cli_waits("disconnect"));
         assert!(!cli_waits("nonsense"));
+    }
+
+    #[test]
+    fn activity_observations_are_framed_and_preserve_the_event_timestamp() {
+        assert_eq!(push(b"activity"), Incoming::Ready(Command::Activity));
+        assert_eq!(push(b"desktop-activity:123"), Incoming::NeedMore);
+        assert_eq!(
+            push(b"desktop-activity:123\n"),
+            Incoming::Ready(Command::ActivityAt(UnixMs(123)))
+        );
+        assert_eq!(push(b"desktop-activity:nope\n"), Incoming::Ready(Command::Unknown));
+        assert!(cli_waits("desktop-activity:123"));
+        assert_eq!(push(b"input"), Incoming::Ready(Command::Unknown));
+    }
+
+    #[test]
+    fn desktop_activity_waits_for_every_fragment_until_the_newline() {
+        let wire = b"desktop-activity:123456\n";
+        for split in 1..wire.len() {
+            assert_eq!(push(&wire[..split]), Incoming::NeedMore, "split {split}");
+        }
+        assert_eq!(push(wire), Incoming::Ready(Command::ActivityAt(UnixMs(123456))));
+        assert_eq!(push(b"activity"), Incoming::Ready(Command::Activity));
+        assert_eq!(push(b"disconnect"), Incoming::Ready(Command::Disconnect));
     }
 
     #[test]

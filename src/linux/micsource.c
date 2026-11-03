@@ -2,6 +2,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/props.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -12,6 +13,11 @@ struct MicHooks {
     void (*format_ok)(void *, int);
 };
 
+struct MicClient {
+    struct spa_list link;
+    uint32_t id;
+};
+
 struct MicRun {
     struct pw_stream *stream;
     void *user;
@@ -19,11 +25,50 @@ struct MicRun {
     uint32_t rate;
     int broken;
     int closing;
+    int streaming;
+    struct spa_list clients;
 };
 
 static void report_streaming(struct MicRun *run, int on)
 {
-    if (run->hooks.streaming) run->hooks.streaming(run->user, on);
+    run->streaming = on;
+    if (run->hooks.streaming)
+        run->hooks.streaming(run->user, on && !spa_list_is_empty(&run->clients));
+}
+
+/* A running source can remain in the playback graph without a recorder.
+ * The adapter owns actual client links; the daemon still owns capture. */
+static void on_global(void *data, uint32_t id, uint32_t permissions,
+    const char *type, uint32_t version, const struct spa_dict *props)
+{
+    struct MicRun *run = data;
+    struct MicClient *client;
+    (void)permissions;
+    (void)version;
+    const char *output;
+    uint32_t node_id;
+    if (run->closing || !props || strcmp(type, PW_TYPE_INTERFACE_Link) != 0) return;
+    output = spa_dict_lookup(props, PW_KEY_LINK_OUTPUT_NODE);
+    node_id = pw_stream_get_node_id(run->stream);
+    if (!output || node_id == PW_ID_ANY || strtoul(output, NULL, 10) != node_id) return;
+    client = calloc(1, sizeof(*client));
+    if (!client) return;
+    client->id = id;
+    spa_list_append(&run->clients, &client->link);
+    report_streaming(run, run->streaming);
+}
+
+static void on_global_remove(void *data, uint32_t id)
+{
+    struct MicRun *run = data;
+    struct MicClient *client, *tmp;
+    spa_list_for_each_safe(client, tmp, &run->clients, link) {
+        if (client->id != id) continue;
+        spa_list_remove(&client->link);
+        free(client);
+        report_streaming(run, run->streaming);
+        break;
+    }
 }
 
 static void report_muted(struct MicRun *run, int on)
@@ -127,6 +172,13 @@ static int run_once(const char *name, const char *description, const char *addre
     struct pw_core *core;
     struct pw_properties *props;
     struct pw_stream_events events;
+    struct pw_registry *registry;
+    struct spa_hook registry_listener, stream_listener;
+    const struct pw_registry_events registry_events = {
+        .version = PW_VERSION_REGISTRY_EVENTS,
+        .global = on_global,
+        .global_remove = on_global_remove,
+    };
     struct MicRun run;
     uint8_t pod_buffer[1024];
     struct spa_pod_builder builder;
@@ -136,6 +188,11 @@ static int run_once(const char *name, const char *description, const char *addre
     if (!loop) return 0;
     context = pw_context_new(loop, NULL, 0);
     core = context ? pw_context_connect(context, NULL, 0) : NULL;
+    if (!core) {
+        fprintf(stderr, "fleetpodsd: microphone source did not connect\n");
+        close_attempt(NULL, core, context, loop);
+        return 0;
+    }
     if (!description || !*description) description = "AirPods";
     props = pw_properties_new(
         PW_KEY_NODE_NAME, name,
@@ -158,15 +215,18 @@ static int run_once(const char *name, const char *description, const char *addre
     events.param_changed = on_format;
     events.process = on_process;
     memset(&run, 0, sizeof run);
+    spa_list_init(&run.clients);
     run.user = user;
     run.hooks = *hooks;
     run.rate = rate;
-    run.stream = pw_stream_new_simple(loop, name, props, &events, &run);
-    if (!core || !run.stream) {
+    /* Stream binding and client-link observations share one ordered connection. */
+    run.stream = pw_stream_new(core, name, props);
+    if (!run.stream) {
         fprintf(stderr, "fleetpodsd: microphone source did not connect\n");
         close_attempt(run.stream, core, context, loop);
         return 0;
     }
+    pw_stream_add_listener(run.stream, &stream_listener, &events, &run);
     memset(&info, 0, sizeof info);
     info.format = SPA_AUDIO_FORMAT_F32;
     info.rate = rate;
@@ -180,9 +240,22 @@ static int run_once(const char *name, const char *description, const char *addre
         close_attempt(run.stream, core, context, loop);
         return 0;
     }
+    registry = pw_core_get_registry(core, PW_VERSION_REGISTRY, 0);
+    if (!registry) {
+        close_attempt(run.stream, core, context, loop);
+        return 0;
+    }
+    pw_registry_add_listener(registry, &registry_listener, &registry_events, &run);
     while (!__atomic_load_n(stop, __ATOMIC_ACQUIRE) && !run.broken)
         pw_loop_iterate(loop, 200);
     run.closing = 1;
+    spa_hook_remove(&registry_listener);
+    pw_proxy_destroy((struct pw_proxy *)registry);
+    while (!spa_list_is_empty(&run.clients)) {
+        struct MicClient *client = spa_list_first(&run.clients, struct MicClient, link);
+        spa_list_remove(&client->link);
+        free(client);
+    }
     close_attempt(run.stream, core, context, loop);
     report_streaming(&run, 0);
     report_format(&run, 0);

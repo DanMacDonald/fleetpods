@@ -2486,6 +2486,48 @@ check('restored membership clears the keyring wait',
   check('canceling a real attempt restores fleet observation', state.seat.switching, false)
 }
 
+// Connection history owns the accessory name observed for each event.
+{
+  const ready = { ...Model.defaultStatus(), ok: true, connected: true, bluezConnected: true,
+    bluetoothPaired: true, pairingKeysReady: true, isHeadset: true,
+    localName: 'omarchy-xps', controlConnection: { stage: 'ready' } }
+  for (const [deviceName, modelName, expected] of [
+    ['AirPods Max 2', 'AirPods Max', 'AirPods Max 2'],
+    ["Owner’s headphones", 'AirPods Max', "Owner’s headphones"],
+    ['', 'AirPods Max 2', 'AirPods Max 2'],
+    ['  ', '', 'AirPods Max']
+  ]) {
+    let log = Model.statusLog(Model.statusLogState(), { ev: 'status', t: 1000,
+      status: { ...ready, deviceName, modelName } })
+    const connection = log.rows.find(row => row.event && row.event.kind === 'connected')
+    check('connected log names ' + expected, connection.message, expected + ' connected.')
+    check('console receives captured name ' + expected, connection.accessory, expected)
+    const count = log.rows.length
+    log = Model.statusLog(log, { ev: 'status', t: 1100, status: { ...ready, deviceName, modelName } })
+    check('named status does not duplicate on refresh ' + expected, log.rows.length, count)
+  }
+  let log = Model.statusLog(Model.statusLogState(), { ev: 'status', t: 1000,
+    status: { ...ready, deviceName: 'AirPods Max 2' } })
+  log = Model.statusLog(log, { ev: 'status', t: 2000,
+    status: { ...ready, deviceName: 'AirPods Pro 3', isHeadset: false } })
+  check('switching accessories preserves both connected events',
+    log.rows.filter(row => row.event && row.event.kind === 'connected').map(row => row.message),
+    ['AirPods Max 2 connected.', 'AirPods Pro 3 connected.'])
+  log = Model.statusLog(Model.statusLogState(), { ev: 'status', t: 1000,
+    status: { ...ready, deviceName: 'AirPods Max 2', connected: false,
+      controlConnection: { stage: 'connecting' } } })
+  const pending = log.rows.find(row => row.live)
+  check('attempt carries its accessory', pending.accessory, 'AirPods Max 2')
+  log = Model.statusLog(log, { ev: 'status', t: 2000,
+    status: { ...ready, deviceName: 'AirPods Pro 3', isHeadset: false } })
+  const old = log.rows.find(row => row.id === pending.id)
+  check('switch closes the previous accessory attempt', old.live, false)
+  check('new connection does not rewrite an old attempt', old.message, pending.message)
+  check('audio handoff identifies accessory and host',
+    Model.statusText({ kind: 'audioTaken', accessory: 'AirPods Max 2', device: 'lg-gram' }),
+    'AirPods Max 2 audio moved to lg-gram.')
+}
+
 if (failures > 0) {
   console.log(failures + " failed")
   Deno.exit(1)

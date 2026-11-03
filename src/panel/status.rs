@@ -247,8 +247,12 @@ fn insert_batteries(status: &mut Map<String, Value>, accessory: &Accessory) {
     if let Some(battery) = accessory.case_battery.known() {
         status.insert("case".into(), battery_value(battery));
     }
-    if let Some(battery) = accessory.headset.known() {
-        status.insert("headset".into(), battery_value(battery));
+    let mut headset = accessory.headset.known().map(battery_value);
+    if let Some(worn) = accessory.head_worn() {
+        headset.get_or_insert_with(|| json!({"available": true}))["worn"] = json!(worn);
+    }
+    if let Some(headset) = headset {
+        status.insert("headset".into(), headset);
     }
 }
 
@@ -321,32 +325,15 @@ fn insert_presence(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>) {
     status.insert("waiting_for_playback".into(), json!(snapshot.displaced));
 }
 
-/// `waiting` on the wire means the case is shut or the buds are still docked.
-/// Buds in the ear, an open lid, or a live call or music report are available,
-/// so the panel must not say this laptop is waiting for the AirPods.
+/// Project the same availability used for connection admission. Status must
+/// not infer wear from battery, lid or connection flags independently.
 fn published_stage(snapshot: &Snapshot<'_>) -> &'static str {
     let stage = snapshot.connection.stage();
-    if stage == Stage::Waiting && pods_available(snapshot) {
+    if stage == Stage::Waiting && snapshot.accessory.connection_available(snapshot.clock.mono) {
         "idle"
     } else {
         stage.wire()
     }
-}
-
-fn pods_available(snapshot: &Snapshot<'_>) -> bool {
-    let worn = |pod: &Evidence<Pod>| pod.known().is_some_and(|pod| pod.in_ear == Some(true));
-    if worn(&snapshot.accessory.left) || worn(&snapshot.accessory.right) {
-        return true;
-    }
-    if matches!(snapshot.accessory.lid.latest, Evidence::Fresh { value: LidState::Open, .. }) {
-        return true;
-    }
-    let in_use = matches!(snapshot.accessory.ble_connection, Some(4 | 5 | 6 | 7 | 9));
-    let fresh = snapshot
-        .accessory
-        .advertised_at
-        .is_some_and(|at| snapshot.clock.mono.saturating_since(at) < 20_000);
-    in_use && fresh
 }
 
 fn insert_ownership(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>, connected: bool) {

@@ -66,6 +66,7 @@ pub enum Input {
     KnownAccessory {
         address: Address,
         name: String,
+        connected: bool,
     },
     /// The paired accessory BlueZ reported.
     Paired {
@@ -338,8 +339,8 @@ impl Daemon {
                 self.set_local_address(Some(address));
                 None
             }
-            Input::KnownAccessory { address, name } => {
-                self.note_known_accessory(address, &name);
+            Input::KnownAccessory { address, name, connected } => {
+                self.note_known_accessory(address, &name, connected, now);
                 None
             }
             Input::Paired { address, name } => {
@@ -566,6 +567,17 @@ impl Daemon {
         match bud {
             crate::pods::setup::Bud::Headset => {
                 self.accessory.note_headset(battery, now);
+                if let Some(worn) = in_ear {
+                    let changed = self.accessory.head_worn() != Some(worn);
+                    self.accessory.note_control_head_worn(worn, now);
+                    self.note_ears(None, None, now, now);
+                    if changed {
+                        eprintln!(
+                            "fleetpodsd: {} control head wear worn={worn}",
+                            self.accessory.model.display_name()
+                        );
+                    }
+                }
             }
             crate::pods::setup::Bud::Left => {
                 self.note_pod(false, Pod { battery, in_ear, in_case }, now);

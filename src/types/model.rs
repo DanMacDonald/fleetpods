@@ -32,6 +32,7 @@ impl Model {
             0x1b20 => Self::AirPods4Anc,
             0x0a20 => Self::AirPodsMaxLightning,
             0x1f20 => Self::AirPodsMaxUsbc,
+            0x2d20 => Self::AirPodsMax2,
             0x0e20 => Self::AirPodsPro,
             0x1420 => Self::AirPodsPro2Lightning,
             0x2420 => Self::AirPodsPro2Usbc,

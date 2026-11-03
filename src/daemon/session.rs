@@ -304,6 +304,7 @@ impl Daemon {
         self.claim_idle_on_activity(now);
         self.tick_ears(now.mono);
         self.follow_insertion(now);
+        self.route_owned_playback(false, now);
         // Fleet admission expiry can change connection intent. Collect it
         // before the final route/setup decision, then publish the final state.
         let mut effects = self.collect_background_effects(now);
@@ -491,7 +492,7 @@ impl Daemon {
     /// The remembered host alone reacts to availability. A sleeping owner is
     /// never timed out in favor of a less recently used laptop.
     fn reconnect_preferred(&mut self, now: Clock) {
-        let available = self.pods_available(now.mono);
+        let available = self.accessory.connection_available(now.mono);
         self.activity_preference.observe_availability(available, now.mono);
         if self.connection.stage() != Stage::Ready
             && !self.preferred_connection_allowed()
@@ -537,15 +538,32 @@ impl Daemon {
             && self.config.accessory.is_some()
             && !self.radio_quiet()
             && self.connection_hold(now.mono).is_none()
-            && self.pods_available(now.mono)
+            && self.accessory.connection_available(now.mono)
     }
 
-    pub(super) fn activity(&mut self, now: Clock) -> Response {
-        // Recorded before every gate: even an ignored activity report is
-        // proof someone is at this keyboard, which is what separates a
-        // press from a player's self-resume after a yield.
-        self.session.last_input_at = Some(now.mono);
-        self.remember_activity(now);
+    pub(super) fn activity(&mut self, observed_at: Option<UnixMs>, now: Clock) -> Response {
+        // A shell report keeps the event time across screensaver/process delays.
+        // Bare CLI activity is an explicit request made now. Reject old/future
+        // observations rather than converting them into fresh input.
+        let reported = observed_at.is_some();
+        let observed_at = observed_at.unwrap_or(now.unix);
+        let Some(age) = now.unix.0.checked_sub(observed_at.0) else {
+            return Response::line("ignored");
+        };
+        if age > INPUT_INTENT_MS || age > now.mono.0 {
+            return Response::line("ignored");
+        }
+        let input = MonoMs(now.mono.0 - age);
+        if reported && self.session.last_input_at.is_some_and(|previous| input <= previous) {
+            return Response::line("ignored");
+        }
+        self.session.last_input_at = Some(input);
+        // Input that preceded the handoff cannot authorize undoing it, even
+        // if delivery finishes after the handoff.
+        if reported && self.session.yield_pause_at.is_some_and(|yielded| input <= yielded) {
+            return Response::line("ignored");
+        }
+        self.remember_activity(Clock { mono: input, unix: observed_at });
         if self.config.accessory.is_none()
             || self.radio_quiet()
             || !self.enforce_connection_admission(now.mono)
@@ -557,7 +575,7 @@ impl Daemon {
             return Response::line("ignored");
         }
         if self.connection.stage() == Stage::Ready {
-            self.activity_at = Some(now.mono);
+            self.activity_at = Some(input);
             return Response::line(if self.claim_idle_on_activity(now) {
                 "accepted"
             } else {
@@ -611,22 +629,16 @@ impl Daemon {
         }
     }
 
-    fn background_connection_allowed(&self) -> bool {
-        let out = |pod: &crate::types::Evidence<Pod>| {
-            pod.as_fresh().is_some_and(|pod| pod.in_ear == Some(true) || pod.in_case == Some(false))
-        };
+    fn background_connection_allowed(&self, now: MonoMs) -> bool {
         self.preferred_connection_allowed()
             && self.config.accessory.is_some()
             && !self.radio_quiet()
-            && !self.accessory.stowed()
             && self.connection.reason() != "disconnect"
-            && (self.accessory.lid.latest.as_fresh() == Some(&LidState::Open)
-                || out(&self.accessory.left)
-                || out(&self.accessory.right))
+            && self.accessory.connection_available(now)
     }
 
     fn open_background_connection(&mut self, now: Clock) {
-        self.session.background_requested = self.background_connection_allowed();
+        self.session.background_requested = self.background_connection_allowed(now.mono);
         if self.session.background_requested {
             self.begin_background_open(now);
         }
@@ -736,7 +748,7 @@ impl Daemon {
     fn fail_reconnect(&mut self, reason: &'static str, now: Clock) {
         self.session.background_requested = false;
         self.seat.note_failure(reason, now);
-        if self.background_connection_allowed()
+        if self.background_connection_allowed(now.mono)
             && !self.accessory.both_docked()
             && self.enforce_connection_admission(now.mono)
         {
@@ -764,26 +776,22 @@ impl Daemon {
         }
     }
 
-    /// Stream-only players can use ownership already confirmed by the pods.
-    fn route_owned_playback(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
-        let Some(accessory) = self.config.accessory else {
-            return;
-        };
-        if self.accessory.both_docked()
-            && crate::audio::route::playback_started(
-                self.last_graph.as_ref(),
-                graph,
-                accessory,
-                self.output.source_sink(),
-            )
-        {
+    /// Player snapshots and new streams may use directly confirmed local
+    /// ownership. Neither can turn an explicit release into a takeover.
+    fn route_owned_playback(&mut self, new_stream: bool, now: Clock) {
+        if new_stream && self.accessory.both_docked() {
             self.return_to_speakers(now);
             return;
         }
-        if self.output.wants_output()
+        if self.config.accessory.is_none()
+            || self.output.wants_output()
             || self.connection.stage() != Stage::Ready
             || self.audio.yielded()
             || self.accessory.both_docked()
+            || (!new_stream
+                && (!self.accessory.model.is_headset()
+                    || !self.audio.local_playing()
+                    || self.accessory.wearing() != Some(true)))
         {
             return;
         }
@@ -793,16 +801,11 @@ impl Daemon {
         {
             return;
         }
-        if crate::audio::route::playback_started(
-            self.last_graph.as_ref(),
-            graph,
-            accessory,
-            self.output.source_sink(),
-        ) {
+        if new_stream {
             self.remember_activity(now);
-            self.claim_seat(now);
-            eprintln!("fleetpodsd: routing new playback through already-owned AirPods");
         }
+        self.claim_seat(now);
+        eprintln!("fleetpodsd: routing playback through already-owned AirPods");
     }
 
     /// An existing Bluetooth ACL still needs a tracked, retryable control setup.
@@ -999,7 +1002,7 @@ impl Daemon {
     /// players paused for it resume when the hold expires without a grant.
     /// Only a fresh, stored roster report reaches this; replays are dropped
     /// by the roster watermark before they can act twice.
-    pub(crate) fn note_fleet_intent(&mut self, reporter: Address, reason: &str, now: Clock) {
+    pub(crate) fn note_fleet_intent(&mut self, reporter: Address, now: Clock) {
         if self.session.intent_until.is_some()
             || self.accessory.ownership.as_fresh() != Some(&true)
             || self.connection.stage() != Stage::Ready
@@ -1007,7 +1010,9 @@ impl Daemon {
         {
             return;
         }
-        eprintln!("fleetpodsd: {reason} from {reporter}; stepping back ahead of its claim");
+        eprintln!(
+            "fleetpodsd: fleet playback intent from {reporter}; stepping back ahead of its claim"
+        );
         self.session.intent_paused = self.audio.playing_players();
         self.session.intent_until = Some(now.mono.saturating_add(INTENT_HOLD_MS));
         self.session.release_output_until = Some(now.mono.saturating_add(RELEASE_OUTPUT_MS));
@@ -1140,9 +1145,15 @@ impl Daemon {
             .tracked
             .iter()
             .find(|(address, report)| {
-                self.membership.accessory_keys_ready(**address) && super::worn(report)
+                self.membership.accessory_keys_ready(**address) && report.wearing() == Some(true)
             })
-            .map(|(address, _)| *address);
+            .map(|(address, _)| *address)
+            .or_else(|| {
+                self.tracked
+                    .iter()
+                    .find(|(_, report)| report.bluez_connected)
+                    .map(|(address, _)| *address)
+            });
         if let Some(candidate) = candidate {
             self.maybe_promote(candidate, now);
         }
@@ -1218,7 +1229,7 @@ impl Daemon {
         self.session.stem_claims_sent = 0;
         self.end_capture();
         self.microphone.set_control_ready(false);
-        self.accessory.drop_owner();
+        self.accessory.drop_control_reports();
         self.peer_playback.clear();
         self.idle_claimed = None;
         self.activity_at = None;
@@ -1595,7 +1606,15 @@ impl Daemon {
         }
     }
     pub(crate) fn observe_audio_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
-        self.route_owned_playback(graph, now);
+        let started = self.config.accessory.is_some_and(|accessory| {
+            crate::audio::route::playback_started(
+                self.last_graph.as_ref(),
+                graph,
+                accessory,
+                self.output.source_sink(),
+            )
+        });
+        self.route_owned_playback(started, now);
         self.last_graph = Some(graph.clone());
     }
 
@@ -1804,10 +1823,13 @@ impl Daemon {
         let Some(at) = self.session.yield_pause_at else {
             return false;
         };
-        let input = self.session.last_input_at;
+        let input = self
+            .session
+            .last_input_at
+            .filter(|input| *input > at && now.mono.saturating_since(*input) <= INPUT_INTENT_MS);
         if self.session.yield_paused.iter().any(|name| name == service)
             && self.accessory.ownership.as_fresh() != Some(&true)
-            && !input.is_some_and(|at_input| at_input > at)
+            && input.is_none()
         {
             eprintln!(
                 "fleetpodsd: player {service:?} toggled by the pods while yielded; keeping it paused"
@@ -1840,9 +1862,7 @@ impl Daemon {
         // took over (the space bar counts; no mouse is needed). Input
         // from before the yield is just the session that got paused.
         // The yield is over, so the guard lifts with it.
-        if input
-            .is_some_and(|input| input >= at && now.mono.saturating_since(input) <= INPUT_INTENT_MS)
-        {
+        if input.is_some() {
             self.session.yield_pause_at = None;
             self.session.last_input_at = None;
             eprintln!(
@@ -2494,6 +2514,118 @@ mod tests {
                 assert!(!daemon.routing.phase().busy());
                 assert!(daemon.reopen_wait);
                 assert!(!daemon.session.background_requested);
+            }
+        }
+    }
+
+    #[test]
+    fn startup_playback_routes_only_after_local_ownership_is_confirmed() {
+        use crate::panel::ipc::Command;
+        use crate::step::Input;
+        // (scenario, player playing before ready) -> router wants output
+        for (scenario, playing) in [("already playing", true), ("nothing playing", false)] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let service = "org.mpris.MediaPlayer2.brave";
+            daemon.select_accessory(Some(addr(3)));
+            daemon.accessory.note_model(crate::types::Model::AirPodsMax2);
+            daemon.accessory.note_advertisement(now.mono, 1);
+            daemon.accessory.note_head_worn(true, now.mono);
+            daemon.step(Input::Command(Command::Connect), now);
+            let generation = daemon.connection().generation();
+            daemon.note_ownership(true, now.mono);
+            // A daemon restart learns the player from the snapshot, not
+            // from a Playing transition, so no claim has fired yet.
+            daemon.step(
+                Input::Players(vec![crate::audio::play::PlayerSeen {
+                    service: service.into(),
+                    playing,
+                }]),
+                now,
+            );
+            // The control link finishes setting up after the play started.
+            let mut battery = vec![0x04, 0x00, 0x04, 0x00, 0x04, 0x00, 0x03];
+            battery.extend_from_slice(&[0x04, 0x01, 80, 0x02, 0x01]);
+            battery.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
+            battery.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
+            daemon.step(Input::ControlSocket { up: true, generation }, now);
+            for packet in [
+                vec![0x01, 0x00, 0x04, 0x00, 0x01],
+                vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01],
+                battery,
+                vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02],
+            ] {
+                daemon.step(Input::Accessory { generation, packet }, now);
+            }
+            assert_eq!(daemon.output.wants_output(), playing, "{scenario}");
+        }
+
+        // Same reconcile when the snapshot arrives after the link is ready.
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        daemon.note_pod(
+            false,
+            Pod {
+                battery: Battery::new(80, false).unwrap(),
+                in_ear: Some(true),
+                in_case: Some(false),
+            },
+            now.mono,
+        );
+        daemon.accessory.note_model(crate::types::Model::AirPodsMax2);
+        daemon.accessory.note_advertisement(now.mono, 1);
+        daemon.accessory.note_head_worn(true, now.mono);
+        ready_link(&mut daemon, now);
+        daemon.note_ownership(true, now.mono);
+        assert!(!daemon.output.wants_output());
+        daemon.step(
+            Input::Players(vec![crate::audio::play::PlayerSeen {
+                service: "org.mpris.MediaPlayer2.brave".into(),
+                playing: true,
+            }]),
+            now,
+        );
+        assert!(daemon.output.wants_output(), "snapshot after ready also claims");
+    }
+
+    #[test]
+    fn snapshots_cannot_undo_release_or_take_audio_from_a_remote_owner() {
+        use crate::fleet::members::{Fleet, GroupKey, Member};
+        use crate::step::Input;
+        for released in [false, true] {
+            for remote in [false, true] {
+                let mut daemon = Daemon::new("xps");
+                let now = clock();
+                daemon.set_local_address(Some(addr(1)));
+                daemon.set_identity("Max", "A3454");
+                ready_link(&mut daemon, now);
+                daemon.restore_fleet(Fleet {
+                    id: crate::types::FleetId::new([3; 16]),
+                    key: GroupKey::new([4; 32]),
+                    members: vec![Member { address: addr(2), label: "gram".into() }],
+                });
+                daemon.accessory.note_head_worn(true, now.mono);
+                if released {
+                    daemon.step(Input::Command(Command::HandoffRelease), now);
+                }
+                daemon.note_ownership(!remote, now.mono);
+                if remote {
+                    daemon.note_source(false, 2, now.mono);
+                    daemon.note_remote(addr(2), now.mono);
+                    daemon.note_remote_player(addr(2), now.mono);
+                }
+                daemon.step(
+                    Input::Players(vec![crate::audio::play::PlayerSeen {
+                        service: "org.mpris.MediaPlayer2.brave".into(),
+                        playing: true,
+                    }]),
+                    now,
+                );
+                assert_eq!(
+                    daemon.output.wants_output(),
+                    !released && !remote,
+                    "released={released} remote={remote}"
+                );
             }
         }
     }

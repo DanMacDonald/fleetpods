@@ -25,7 +25,7 @@ recovery returns to Routing. These transitions add no sleeps.
 | --- | --- |
 | `daemon::session` | Admission cancellation, claim/release and rejoin operations; private background intent, deferred claims, ownership timing, player resumes and recovery bookkeeping |
 | `Lifecycle` | Connection phases, once-per-generation OpenLink request, A2DP/codec launch conditions and success observations, optional HFP, resource cancellation |
-| `retry::Task` | Control setup, A2DP, codec and output-verification attempt identity, retry timing and budget, callback/confirmation deadlines, stale-reply rejection |
+| `retry::Task` | Control setup, A2DP, codec and output-verification attempt identity, retry timing and budget, callback/confirmation deadlines, stale-reply rejection; fleet advertisement registration budgets |
 | `pods::link` / `pods::setup` | Control socket setup, AACP exchange, bounded link retries and interruption; Connection contains the sole Apple reconnect sequence |
 | `audio::route::Router` | Saved stream identities, speaker muting, stream moves/restoration and output recovery |
 | Linux Bluetooth/PipeWire adapters | Actual handles and asynchronous calls; report observations and tagged completions |
@@ -33,12 +33,95 @@ recovery returns to Routing. These transitions add no sleeps.
 Admission/preference/pairing rules supply permission to open. The lifecycle
 issues the request in Linking; there is no separate daemon launch flag. BlueZ
 service discovery runs with the physical connection and reports its result.
+Fleet admission reserves a connection slot; it does not imply playback intent.
+A background join must not pause the current owner or create a speculative resume
+hold. The authenticated roster's playback-intent flag is the single early-yield
+trigger, preserving advance release for actual takeovers before a control claim
+can arrive.
+
 Permission to open is not permission to take audio: `Facts.intent` is
 `JoinInBackground` until the router holds a playback claim (`TakeAudio`), and
 only `TakeAudio` pursues profiles, routing and streaming. Ownership claims are
 written in one place (`Session::emit_ownership_claim`); desktop activity may
 claim an idle fleet owner immediately, but an outside device that only just
 reported not playing is still joining and cannot be claimed for 10 s.
+
+Desktop activity uses one event path. The shell timestamps an observed idle-to-active
+transition (or a panel-open action) before its screensaver check, and sends
+`desktop-activity:UNIX_MS`. The daemon converts it to monotonic time, rejects stale,
+future or repeated observations, and keeps the original timestamp when deciding
+whether input followed a yield. Remaining active generates no input heartbeat.
+Repeated unsolicited player starts do not become takeover intent; fresh input
+expires after 15 seconds. Bare CLI `activity` remains an explicit request made now.
+The timestamped verb has a distinct prefix and requires a newline; any partial
+read waits for the complete message instead of turning it into fresh activity.
+
+Startup player snapshots supply observations, never new takeover intent. For a
+worn headset, the existing owned-playback routing path can restore playback only
+when the pods directly confirm local ownership and playback has not been yielded.
+The same owner handles newly observed streams. Explicit Play and insertion retain
+their existing claim paths; snapshots cannot reclaim a released or remote seat.
+
+Fleet advertisement intent belongs to the Linux radio worker. Pairing temporarily
+blocks registration without clearing that intent, including a first request
+received during pairing. One reconciler registers or retires the BlueZ object.
+Its `retry::Task` allows five registration attempts, with 5/10/20/40-second waits;
+the worker schedules those deadlines even without scan or socket traffic. Payload
+updates and pairing holds preserve a failed attempt's budget. Explicit release
+followed by new intent, removal of a successful registration, or a bluetoothd
+restart starts a new registration lifetime. D-Bus call timeouts report failure to
+the task; tagged late replies cannot complete a newer attempt.
+
+Removal is a separate operation under that same radio owner, using the shared
+retry task with the same five-attempt backoff. Failure, timeout or a failed submit
+leaves cleanup pending and blocks registration, even if intent or pairing changes.
+Only successful unregister, DoesNotExist, an authoritative Release, or BlueZ loss
+confirms that the slot is gone. Exhausted cleanup remains blocked until an
+authoritative removal or BlueZ restart; payload updates cannot replenish its budget.
+A timed-out registration also needs confirmed cleanup before retrying. Removing
+that uncertain slot preserves the failed registration's budget. Cleanup replies
+are tagged so an old success cannot remove a replacement registration.
+
+Max 2 wear is an observation, not another connection lifecycle. `pods::air` decodes
+the model-specific bits; headset control placement reports feed the same aggregate
+observation. `Accessory` owns that observation and source precedence: after a control
+wear report arrives, advertisements cannot overwrite it until the link ends or the
+selected accessory changes. Battery-only reports do not invent wear. `Accessory`
+answers wear/availability queries. Existing saved-address and IRK checks
+gate updates to a saved accessory. Tracked wear feeds the existing selection gates;
+selected wear feeds the existing insertion and owned-player pause/resume debounce.
+Headset removal settles after 100 ms; earbud reports and re-wear retain 400 ms.
+Both use the same pending deadline and pause/resume owner.
+A new accessory's first report is not an insertion, and removal retires pending
+insertion intent. No timer, retry loop or connection launch lives in the BLE
+handler. Background admission uses the same availability query as preferred-host
+reconnection and the published waiting/idle status, preserving fleet preference
+and explicit-disconnect rules. `Accessory::connection_available` owns that query;
+`playback_available` remains stricter because an open case alone must not mute
+speaker playback.
+
+For Max 2, proximity alone no longer authorizes automatic playback preparation:
+a worn report must be fresh (ten seconds for availability). Missing reports become
+unknown rather than generating removal. Advertisement wear expires even while the
+control link is up; control wear stands until link loss, when it is cleared and fresh
+advertisements may take over. Either BLE sensor counts as worn; one-cup removal is
+not inferred from this aggregate report. Older Max advertisement behavior is unchanged until
+its wear layout is verified.
+
+BlueZ inventory reconciliation owns connection evidence for non-selected paired
+accessories. Removal, loss of pairing or replacement of the BlueZ instance retires
+that evidence; saved identity and keys remain in the daemon. Selecting an accessory
+hands observations to its selected connection and retires the inventory dedup entry.
+
+Microphone support is selected by SKU in `audio::mic::format_for_sku`; Max 2
+uses the existing format, source and capture lifetime. `pace_microphone` offers
+one source for the selected ready control link. The PipeWire adapter observes
+links from that source and reports demand only while it is streaming and has
+a client, so `set_microphone` ends capture even if the playback graph is still
+running. Stream binding and link observations share one PipeWire core connection,
+and both are retired with that source lifetime. Demand starts capture;
+mute, client departure or control loss stops it through the existing owner.
+No Max-specific capture worker or retry policy is introduced.
 
 ## Where to change a connection's lifetime
 

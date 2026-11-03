@@ -284,7 +284,7 @@ pub fn resolve(
         }
     }
     // Source notifications describe changes, not a heartbeat. Keep the last
-    // reported holder until the control session ends (drop_owner clears these
+    // reported holder until the control session ends (drop_control_reports clears these
     // reports), but do not turn its old source category into live playback.
     if let Some(mut holder) = from_last_report(ownership, source_report, remote) {
         if let Holder::Local { playing } = &mut holder {
