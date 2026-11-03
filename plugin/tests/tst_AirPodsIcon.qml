@@ -18,6 +18,7 @@ TestCase {
 
   Component { id: icon; Pods.AirPodsIcon { iconSize: 24; variant: "pro" } }
   Component { id: popup; Pods.AirPodsIcon { iconSize: 128; variant: "pro"; pixelArt: true } }
+  Component { id: gatedPopup; Pods.AirPodsIcon { iconSize: 128; variant: "pro"; pixelArt: true; animatePlacement: false } }
   Component { id: motionMarker; Rectangle { x: 2; y: 96; width: 3; height: 3; color: "#ff00ff" } }
 
   function test_standaloneDescentUsesConstantScreenVelocity_data() {
@@ -226,6 +227,47 @@ TestCase {
     verify(item.usesMeshCase, "cancelled exit must not launch standalone pods later")
   }
 
+  function test_firstAuthoritativePlacementStaysSettled() {
+    var item = createTemporaryObject(gatedPopup, this, { caseState: "closed" })
+    // Initial valid status has no placement telemetry. It must not enable
+    // animations before the first real report, even with a live connection.
+    var status = Model.defaultStatus()
+    status.connected = true
+    item.animatePlacement = Model.casePlacementKnown(status)
+    wait(50)
+    compare(item.animatePlacement, false)
+    status.left = Model.podFrom({ available: true, in_ear: true, in_case: false })
+    status.right = Model.podFrom({ available: true, in_ear: true, in_case: false })
+    item.caseState = ""
+    compare(item.budsIn, 1, "first authoritative in-ear state is already at rest")
+    compare(findChild(item, "artworkMotion").y, 0)
+    item.animatePlacement = Model.casePlacementKnown(status)
+    compare(item.animatePlacement, true)
+    wait(50)
+    compare(item.budsIn, 1, "enabling placement animation does not replay the entrance")
+
+    // Later physical transitions still animate.
+    item.caseState = "open-empty"
+    item.caseState = ""
+    tryVerify(function() { return item.budsIn < 1 }, 1200)
+    tryCompare(item, "budsIn", 1, 1200)
+  }
+
+  function test_transientClosedReportDoesNotReplayStandaloneDrop() {
+    var item = createTemporaryObject(popup, this, { caseState: "" })
+    compare(item.budsIn, 1)
+    item.caseState = "closed"
+    wait(100)
+    compare(item.displayCaseState, "", "a brief closed report is not presented yet")
+    item.caseState = ""
+    wait(300)
+    compare(item.displayCaseState, "")
+    compare(item.budsIn, 1, "returning to standalone must not replay the drop")
+
+    item.caseState = "closed"
+    tryCompare(item, "displayCaseState", "closed", 600)
+  }
+
   function test_standaloneStartupAndHiddenChangesStaySettled() {
     var item = createTemporaryObject(popup, this, { caseState: "" })
     compare(item.budsIn, 1)
@@ -306,7 +348,9 @@ TestCase {
     var mesh = findChild(item, "caseMesh")
     wait(settledMs)
     item.caseState = "closed"
-    if (mesh === null) mesh = findChild(item, "caseMesh")
+    if (mesh === null) {
+      tryVerify(function() { mesh = findChild(item, "caseMesh"); return mesh !== null }, 600)
+    }
     wait(150)
     compare(mesh.lid, 1)
     if (data.state !== "open-right") verify(mesh.rightLift > 0 && mesh.rightLift < 1)

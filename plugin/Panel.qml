@@ -366,6 +366,7 @@ Panel {
           color: root.barIconColor
           variant: root.podsVariant
           caseState: root.barCaseState
+          animatePlacement: pods.caseIconReady
           // Drawn through the copy below; the bar skips transparent items, which would measure the Shape outline too.
           // Not `visible: false`: a hidden Shape stops drawing its layer and the copy comes out blank.
           opacity: 0
@@ -529,6 +530,7 @@ Panel {
               color: root.foreground
               variant: root.podsVariant
               caseState: root.barCaseState
+              animatePlacement: pods.caseIconReady
             }
 
             Column {
@@ -584,49 +586,6 @@ Panel {
             foreground: root.foreground
           }
 
-          Column {
-            visible: pods.view.accessories && pods.view.accessories.length > 1
-            width: parent.width
-            spacing: Style.space(4)
-
-            Repeater {
-              model: pods.view.accessories || []
-
-              delegate: RowLayout {
-                width: parent.width
-                spacing: Style.space(8)
-
-                Text {
-                  textFormat: Text.PlainText
-                  Layout.fillWidth: true
-                  text: (modelData.deviceName !== "" ? modelData.deviceName : (modelData.modelName !== "" ? modelData.modelName : modelData.address))
-                    + (modelData.selected ? "  •  Active" : "")
-                  color: modelData.selected ? root.foreground : root.dim
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                  font.bold: modelData.selected
-                  elide: Text.ElideRight
-                }
-
-                Text {
-                  visible: !modelData.selected
-                  textFormat: Text.PlainText
-                  text: "Use"
-                  color: Commons.Color.accent
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
-                }
-
-                MouseArea {
-                  anchors.fill: parent
-                  enabled: !modelData.selected
-                  cursorShape: Qt.PointingHandCursor
-                  onClicked: pods.selectAccessory(modelData.address)
-                }
-              }
-            }
-          }
-
           Text {
             visible: pods.fleetRequestError !== ""
             width: parent.width
@@ -672,6 +631,7 @@ Panel {
             connectionSpinVisible: root.connectionSpinVisible
             connectionComplete: Model.localSeatConnected(pods.view)
             caseState: root.barCaseState
+            animatePlacement: pods.caseIconReady
             pairingMode: pods.view.pairingMode && (!pods.view.bluetoothPaired || !pods.view.pairingKeysReady)
             leftBatteryLevel: (!pods.view.bluetoothPaired || !pods.view.pairingKeysReady) ? Model.LEVEL_UNKNOWN : Model.displayedBatteryLevel(pods.view.leftPod.level, pods.view.daemonReachable, pods.view.connected, pods.view.lastAdvertisementMs, root.batteryNow)
             rightBatteryLevel: (!pods.view.bluetoothPaired || !pods.view.pairingKeysReady) ? Model.LEVEL_UNKNOWN : Model.displayedBatteryLevel(pods.view.rightPod.level, pods.view.daemonReachable, pods.view.connected, pods.view.lastAdvertisementMs, root.batteryNow)

@@ -54,7 +54,13 @@ jobs:
       QT_QUICK_BACKEND: software
     steps:
       - name: Install Qt test dependencies
-        run: pacman -Syu --noconfirm --needed git qt6-declarative qt6-5compat qt6-svg ttf-dejavu
+        run: pacman -Syu --noconfirm --needed git mesa qt6-declarative qt6-5compat qt6-svg ttf-dejavu
       - uses: actions/checkout@v4
       - name: Run QML tests
         run: /usr/lib/qt6/bin/qmltestrunner -input plugin/tests -import plugin/tests/imports
+      - name: Run RHI-rasterized QML test
+        env:
+          QT_QUICK_BACKEND: rhi
+          QSG_RHI_BACKEND: opengl
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: /usr/lib/qt6/bin/qmltestrunner -input plugin/tests -import plugin/tests/imports 'ReconnectSeat::test_pairedConnectorsHaveEqualPaintedWidth'

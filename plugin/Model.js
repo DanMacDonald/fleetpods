@@ -542,6 +542,17 @@ function rememberPodPlacement(pod, previous) {
   return previous === true || previous === false ? previous : null
 }
 
+// A valid status or connection alone says nothing about physical placement.
+// Keep startup artwork settled until the first actual placement report.
+function casePlacementKnown(status) {
+  if (status.isHeadset) return true
+  var lid = status.iconLidState === undefined ? status.caseLidState : status.iconLidState
+  if (lid === LID_OPEN || lid === LID_CLOSED) return true
+  return [status.left, status.right].some(function(pod) {
+    return pod && (pod.inEar || pod.inCase || pod.outOfCase)
+  })
+}
+
 function caseIconState(isHeadset, lidState, left, right, previousState, hadInEar,
                        lastAdvertisementMs, nowMs, nearbyMs, connected, earReported, unpaired,
                        rememberedPlacement) {

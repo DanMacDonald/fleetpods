@@ -45,7 +45,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `reported_ownership` | Direct ownership report: `1` local, `0` remote, `-1` unknown. Stale values are still projected, with their timestamp |
 | `audio_source_local`, `audio_source_type` | Direct source report, same rule. Not filled from `audio::seat` |
 | `audio_owner` | `audio::seat`: fresh direct reports, then a fresh fleet roster, then the last direct holder from this control session. An aged source category alone does not mean playing; current playback observations supply that state. Disconnect clears the remembered direct holder |
-| `audio_output_health.state`, `.resets`, `.last_reset_ok` | Raw Pulse sink state (`0` running, `1` idle, `2` suspended, negative transient/error values), number of output resets requested in this daemon process, and whether the last suspend/resume commands completed. `null` means unobserved or pending. A successful reset does not confirm audible playback |
+| `audio_output_health.state`, `.resets`, `.last_reset_ok` | Raw Pulse sink state (`0` running, `1` idle, `2` suspended, negative transient/error values), number of output rebuilds admitted in this daemon process (takeover, watchdog or manual), and whether the last rebuild reached a successful Start reply. Failed or cancelled rebuilds report `false`; `null` means unobserved or pending. A successful Start does not confirm audible playback |
 | `remote_playing` | Resolved holder is remote and playing |
 | `remote_source_address` | Direct remote-address report. Omitted when unknown |
 | `roster_audio_owner` | Resolved holder's address, falling back to the fresh fleet roster when the resolved holder has no address |
@@ -128,6 +128,7 @@ the card. Codec `retry_wait` is the one-second delay after failure or timeout;
 and graph confirmation each have a five-second deadline. These states come
 directly from the shared retry task, as do A2DP's existing retry/exhaustion states.
 HFP may still be waiting, connecting or failed while the main phase is
-streaming. Streaming requires output, routed playback without recovery, and
-observed active transport; it does not measure audibility or video sync. Legacy
+streaming. Streaming requires output, routed playback without recovery, an observed
+running output, and active transport; `waiting_for=output_running` includes
+missing, idle, suspended or failed output-state observations. It does not measure audibility or video sync. Legacy
 control-stage fields retain their meanings. See [the lifecycle](connection-lifecycle.md).

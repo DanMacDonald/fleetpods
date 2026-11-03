@@ -615,7 +615,6 @@ impl World {
                 self.step_host(name, Input::LinkReleased { accessory, generation, ok: true });
             }
             Effect::SelectProfile { .. }
-            | Effect::RearmOutput { .. }
             | Effect::RestartOutput { .. }
             | Effect::StartOutput { .. }
             | Effect::ConnectTransport { .. }

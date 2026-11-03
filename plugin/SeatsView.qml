@@ -51,6 +51,7 @@ Item {
   property string fontFamily: ""
   property string podsVariant: "buds"
   property string caseState: ""
+  property bool animatePlacement: true
   property bool pairingMode: false
   property int leftBatteryLevel: -1
   property int rightBatteryLevel: -1
@@ -251,6 +252,7 @@ Item {
     color: root.foreground
     variant: root.podsVariant
     caseState: root.caseState
+    animatePlacement: root.animatePlacement
     pairingMode: root.pairingMode
     // The stems end at y=113 and the case at y=117.5. Keep their painted
     // bottoms on the same baseline beside the case battery circle.

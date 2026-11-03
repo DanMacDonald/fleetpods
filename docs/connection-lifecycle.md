@@ -11,7 +11,7 @@ flowchart LR
     B -->|Bluetooth up| C[PreparingPaths: A2DP and codec]
     C -->|profile succeeds or output already exists| D[CompletingProfiles: arm HFP]
     D -->|output exists| E[Routing]
-    E -->|routed and transport active| F[Streaming]
+    E -->|routed, output running and transport active| F[Streaming]
 ```
 
 A fast observation can cross several phases in one step. Background control
@@ -33,6 +33,12 @@ recovery returns to Routing. These transitions add no sleeps.
 Admission/preference/pairing rules supply permission to open. The lifecycle
 issues the request in Linking; there is no separate daemon launch flag. BlueZ
 service discovery runs with the physical connection and reports its result.
+Permission to open is not permission to take audio: `Facts.intent` is
+`JoinInBackground` until the router holds a playback claim (`TakeAudio`), and
+only `TakeAudio` pursues profiles, routing and streaming. Ownership claims are
+written in one place (`Session::emit_ownership_claim`); desktop activity may
+claim an idle fleet owner immediately, but an outside device that only just
+reported not playing is still joining and cannot be claimed for 10 s.
 
 ## Where to change a connection's lifetime
 
@@ -116,7 +122,7 @@ A2DP reply and service discovery, then an idle profile worker. It can start or
 finish after the lifecycle reaches Routing or Streaming. Unsupported HFP is
 skipped; failure does not block an available output. Codec selection likewise
 does not introduce a playback barrier. The main joins are **output exists**,
-then **routed and transport active**—not "every setup task completed".
+then **routed, output running and transport active**—not "every setup task completed".
 
 The router still owns acquisition muting and recovery. New codec requests wait
 while recovery owns the card. During recovery the router waits
@@ -179,8 +185,8 @@ These are the current policies, not interchangeable forms of reconnect:
 | A2DP profile | Two-second retry delay within a thirty-second failure window; early exhaustion can restart after control readiness |
 | HFP completion | Optional one-shot; failure does not hold playback |
 | Codec selection | Three attempts, one-second retry delay, five-second callback deadline and five-second graph-confirmation deadline |
-| Output recovery | Router owns park/reset/relink/settle/Start; shared task allows three rebuilds total, verifying active transport 2.5 seconds after each successful Start. Reset/Start failure or router timeout ends recovery |
-| Output health repair | Evidence must persist before repair; cooldown and consecutive-repair limit |
+| Output recovery | Router owns park/reset/relink/settle/Start; shared task allows three attempts total (a direct takeover uses the first), verifying running output and active transport 2.5 seconds after each successful Start. Reset/Start failure or router timeout ends recovery |
+| Output health repair | Three-second stall grace and thirty-second cooldown; admitted repairs use the output recovery task and its attempt budget |
 
 `retry::Task` is used by control setup, A2DP, codec selection and output recovery
 verification. `Policy` selects fixed or staged delay, an attempt-count or
@@ -210,8 +216,8 @@ timeout. Player observations and rebuilds use the same deduplicating resume queu
 Connection intent is decided once for both failure callbacks and ticks; terminal
 background intent is cleared once during session advancement. Its
 Running state covers the router's entire rebuild. A successful Start reply
-begins confirmation; active Bluetooth transport at the 2.5-second check
-completes it. A brief transport blip before that check is insufficient. Players
+begins confirmation; a running output and active Bluetooth transport at the
+2.5-second check complete it. A brief transport blip before that check is insufficient. Players
 resume at Start completion, before confirmation, so verification cannot hold up the
 very playback it needs to observe. Losing the grant, releasing or replacing the
 claim, or losing the audio server retires verification. If the player is paused
@@ -228,7 +234,30 @@ deadline. A continuing playback claim can still open a fresh five-attempt
 operation after the existing 16-second terminal-failure cooldown; background
 intent is cleared on exhaustion and does not renew itself.
 
-Output health repair retains its domain state machine.
+Takeover, steady-playback watchdog and manual output repair share
+`OutputRecovery`: one retry budget, request identity and cancellation owner,
+with the router executing park/reset/relink/settle/Start for every rebuild.
+There is no separate suspend/resume worker or completion path. A new claim
+retires any previous recovery, so its late reset/Start replies cannot advance
+or resume players for the new claim. Already-issued platform operations are
+not undone; the profile commands run in order on the Pulse connection.
+
+Health detects a stall after three seconds and requests recovery, committing
+its thirty-second cooldown only when the router admits a rebuild. It keeps
+no separate retry counter. The watchdog cannot renew an exhausted recovery
+budget. An explicit manual reset can supersede verification only when the
+router is no longer recovering. Each rebuild pauses and later resumes the
+players through the existing session lifetime; a successful Start begins the
+2.5-second playback check rather than proving that sound reached the listener.
+
+The direct takeover path is reserved for outputs without a known node failure.
+Output observations retain an unlinked/error report (`-3`) across subsequent
+suspension until that node runs, disappears, or is replaced (sink name and Pulse
+index identify it). A grant for that failed output immediately parks streams
+and rebuilds it, without spending the 2.5-second direct-path verification wait.
+Ordinary suspension alone still permits direct startup. Lifecycle Streaming
+and takeover verification both require a running output and active transport;
+neither a successful Start command nor transport activity alone proves readiness.
 Optional HFP remains one-shot. There are no unused generic recovery strategies
 or a separate task scheduler; connection launch/join decisions stay in
 `Lifecycle::advance`, and playback recovery stays in session advancement.

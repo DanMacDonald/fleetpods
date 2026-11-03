@@ -3,7 +3,7 @@
 
 const source = Deno.readTextFileSync(new URL("../Model.js", import.meta.url))
 const Model = new Function(
-  source + "; return { pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, rememberPodPlacement, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
+  source + "; return { pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, rememberPodPlacement, casePlacementKnown, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
 )()
 
 const PEERS = {
@@ -21,6 +21,20 @@ function check(name, actual, expected) {
     failures++
     console.log("FAIL " + name + "\n  expected " + JSON.stringify(expected) + "\n  got      " + JSON.stringify(actual))
   }
+}
+
+// Startup animation needs placement evidence, not merely a connected status.
+{
+  const unknown = Model.defaultStatus()
+  check('unknown placement stays settled', Model.casePlacementKnown(unknown), false)
+  check('connection does not imply placement', Model.casePlacementKnown({ ...unknown, connected: true, earReported: true }), false)
+  for (const lid of [Model.LID_OPEN, Model.LID_CLOSED])
+    check('reported lid enables placement animation', Model.casePlacementKnown({ ...unknown, caseLidState: lid }), true)
+  for (const side of ['left', 'right']) {
+    for (const fact of ['inEar', 'inCase', 'outOfCase'])
+      check(side + ' ' + fact + ' is placement evidence', Model.casePlacementKnown({ ...unknown, [side]: { [fact]: true } }), true)
+  }
+  check('headsets need no case evidence', Model.casePlacementKnown({ ...unknown, isHeadset: true }), true)
 }
 
 // The daemon resolves the owner from the pods' reports; daemon/tests/tst_ownership.cpp covers which report wins.

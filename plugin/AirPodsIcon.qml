@@ -16,6 +16,10 @@ Item {
   property string caseState: ""
   property string displayCaseState: ""
   property bool initialized: false
+  // Callers with an asynchronous authoritative state keep this off until
+  // the first real placement has been presented settled.
+  property bool animatePlacement: true
+  property bool _animatePlacement: false
   readonly property int podDepartureMs: 840
   readonly property int emptyCaseConfirmMs: 250
   property bool pairingMode: false
@@ -227,9 +231,17 @@ Item {
   function requestPlacement(animate) {
     if (!animate) {
       confirmEmpty.stop()
+      confirmClosed.stop()
       holdEmpty.stop()
       budsDrop.stop()
       present(caseState, false)
+      return
+    }
+    // A reconnect can briefly report a closed case before the in-ear
+    // placement returns. Confirm it before presenting a case that would
+    // make the following standalone state replay the drop.
+    if (caseState === "closed" && displayCaseState === "" && !isMax) {
+      if (!confirmClosed.running) confirmClosed.start()
       return
     }
     // Confirm a last-pod departure before changing the picture. Repeated
@@ -242,6 +254,7 @@ Item {
     }
     if (caseState === "" && holdEmpty.running) return
     confirmEmpty.stop()
+    confirmClosed.stop()
     holdEmpty.stop()
     present(caseState, true)
   }
@@ -255,9 +268,21 @@ Item {
     return caseExiting ? Math.min(end, artworkTop + caseOut * iconSize) : end
   }
 
-  onCaseStateChanged: if (initialized) requestPlacement(visible)
+  onAnimatePlacementChanged: {
+    if (!animatePlacement) {
+      _animatePlacement = false
+      if (initialized) requestPlacement(false)
+      return
+    }
+    if (!initialized) return
+    // Settle the state that made placement authoritative, then enable
+    // animation on the next turn so its bindings cannot replay it.
+    requestPlacement(false)
+    Qt.callLater(function() { if (root.animatePlacement) root._animatePlacement = true })
+  }
+  onCaseStateChanged: if (initialized) requestPlacement(visible && _animatePlacement)
   onVisibleChanged: if (initialized && !visible) requestPlacement(false)
-  Component.onCompleted: { initialized = true; requestPlacement(false) }
+  Component.onCompleted: { _animatePlacement = animatePlacement; initialized = true; requestPlacement(false) }
 
   Timer {
     id: confirmEmpty
@@ -266,6 +291,11 @@ Item {
       root.present("open-empty", true)
       holdEmpty.start()
     }
+  }
+  Timer {
+    id: confirmClosed
+    interval: root.emptyCaseConfirmMs
+    onTriggered: if (root.caseState === "closed") root.present("closed", true)
   }
   Timer {
     id: holdEmpty

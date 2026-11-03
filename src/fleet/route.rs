@@ -1,7 +1,17 @@
 //! Handoff intent and one fleet admission transaction.
 //! A routing retry never opens a second local Bluetooth attempt.
 
-use crate::types::{Address, MonoMs, SessionId, UnixMs};
+use crate::retry::{Delay, Failure, Limit, Policy, RequestId, Requests, State as TaskState, Task};
+use crate::types::{Address, Generation, MonoMs, SessionId, UnixMs};
+
+/// Peer-busy rebroadcast waits on the shared retry task: a fixed beat,
+/// bounded by the same lifetime the daemon allows a whole route.
+const PEER_BUSY_POLICY: Policy = Policy {
+    delay: Delay::Fixed(1_500),
+    limit: Limit::FailureWindow(super::route_air::LIFETIME_MS),
+    request_timeout_ms: None,
+    confirmation_timeout_ms: None,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -94,8 +104,9 @@ pub struct Routing {
     want_seat: bool,
     handoff_result: &'static str,
     outcome: Option<Outcome>,
-    retry_deadline: Option<MonoMs>,
-    attempt: u8,
+    retry: Task,
+    retry_requests: Requests,
+    retry_id: Option<RequestId>,
     session: SessionId,
     claim_queued: bool,
     helper: bool,
@@ -115,8 +126,9 @@ impl Routing {
             want_seat: false,
             handoff_result: "none",
             outcome: None,
-            retry_deadline: None,
-            attempt: 0,
+            retry: Task::new(PEER_BUSY_POLICY),
+            retry_requests: Requests::default(),
+            retry_id: None,
             session: SessionId(1),
             claim_queued: false,
             helper: false,
@@ -164,7 +176,20 @@ impl Routing {
     }
 
     pub fn retry_deadline(&self) -> Option<MonoMs> {
-        self.retry_deadline
+        match self.retry.state() {
+            TaskState::Backoff { until } | TaskState::Deferred { until } => Some(until),
+            _ => None,
+        }
+    }
+
+    fn reset_retry(&mut self) {
+        self.retry.reset();
+        self.retry_id = None;
+    }
+
+    fn launch_retry(&mut self) {
+        self.reset_retry();
+        self.retry_id = self.retry.launch(&mut self.retry_requests, Generation(self.tx), MonoMs(0));
     }
 
     pub fn session(&self) -> SessionId {
@@ -182,7 +207,7 @@ impl Routing {
             self.phase = Phase::Failed;
             self.error = "interrupted";
         }
-        self.retry_deadline = None;
+        self.reset_retry();
         self.claim_queued = false;
     }
 
@@ -208,8 +233,7 @@ impl Routing {
         self.phase = Phase::WaitingAdmission;
         self.error = "";
         self.admission = "none";
-        self.attempt = 1;
-        self.retry_deadline = None;
+        self.launch_retry();
         self.helper = false;
         Start::Sent { tx: self.tx }
     }
@@ -226,8 +250,7 @@ impl Routing {
         self.phase = Phase::Admitting;
         self.error = "";
         self.admission = "none";
-        self.retry_deadline = None;
-        self.attempt = 1;
+        self.launch_retry();
         self.helper = true;
         true
     }
@@ -247,8 +270,23 @@ impl Routing {
         if tx != self.tx || self.phase != Phase::WaitingAdmission {
             return false;
         }
-        self.attempt = self.attempt.saturating_add(1);
-        self.retry_deadline = Some(now.saturating_add(1_500));
+        // A busy answer fails the current attempt on the shared task;
+        // a repeat while backing off keeps the existing deadline, and a
+        // repeat after it spends a fresh attempt.
+        match self.retry.state() {
+            TaskState::Running { .. } => {
+                if let Some(id) = self.retry_id {
+                    self.retry.fail(id, Failure::Retry, now);
+                }
+            }
+            TaskState::Backoff { until } if now >= until => {
+                if let Some(id) = self.retry.launch(&mut self.retry_requests, Generation(tx), now) {
+                    self.retry_id = Some(id);
+                    self.retry.fail(id, Failure::Retry, now);
+                }
+            }
+            _ => {}
+        }
         self.error = "peer_busy";
         true
     }
@@ -286,7 +324,7 @@ impl Routing {
         };
         self.phase = Phase::Success;
         self.error = "";
-        self.retry_deadline = None;
+        self.reset_retry();
         let result = if self.helper {
             if alongside {
                 "admitted_alongside"
@@ -318,7 +356,7 @@ impl Routing {
         };
         self.phase = Phase::Failed;
         self.error = reason;
-        self.retry_deadline = None;
+        self.reset_retry();
         self.outcome = Some(Outcome { at, result: reason, peer, retain: self.retain });
         true
     }
@@ -340,7 +378,7 @@ impl Routing {
         self.outcome = Some(Outcome { at, result: "joined_alongside", peer, retain: Some(peer) });
         self.phase = Phase::Success;
         self.error = "";
-        self.retry_deadline = None;
+        self.reset_retry();
     }
 
     pub fn queue_claim_until_route_lands(&mut self) -> bool {

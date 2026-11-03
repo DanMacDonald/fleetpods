@@ -4,6 +4,7 @@
 
 use crate::audio::route::Graph;
 use crate::types::{Address, MonoMs};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Output {
@@ -20,21 +21,38 @@ pub struct Output {
 #[derive(Default)]
 pub struct Health {
     pub outputs: Vec<Output>,
+    failed: HashSet<(String, u32)>,
     suspect: Option<(u32, MonoMs)>,
     last_reset: Option<MonoMs>,
-    consecutive: u8,
-    pub resets: u64,
-    pub last_ok: Option<bool>,
 }
 
 impl Health {
+    /// A failed node may subsequently report suspended. Keep that evidence
+    /// until this node runs or disappears; a replacement has its own index.
+    pub fn observe(&mut self, outputs: Vec<Output>) {
+        self.failed.retain(|(name, index)| {
+            outputs.iter().any(|o| o.name == *name && o.index == *index && o.state != 0)
+        });
+        for output in &outputs {
+            if output.state == -3 {
+                self.failed.insert((output.name.clone(), output.index));
+            }
+        }
+        self.outputs = outputs;
+    }
+
+    pub fn failed(&self, address: Address) -> bool {
+        self.output(address).is_some_and(|o| self.failed.contains(&(o.name.clone(), o.index)))
+    }
+
+    pub fn running(&self, address: Address) -> bool {
+        self.output(address).is_some_and(|o| o.state == 0)
+    }
+
     pub fn forget_server(&mut self) {
         self.outputs.clear();
+        self.failed.clear();
         self.suspect = None;
-        self.consecutive = 0;
-        if self.resets > 0 && self.last_ok.is_none() {
-            self.last_ok = Some(false);
-        }
     }
 
     pub fn output(&self, address: Address) -> Option<&Output> {
@@ -67,9 +85,6 @@ impl Health {
         });
         let Some(output) = bad.cloned() else {
             self.suspect = None;
-            if address.and_then(|address| self.output(address)).is_some_and(|o| o.state == 0) {
-                self.consecutive = 0;
-            }
             return None;
         };
         let since = match self.suspect {
@@ -79,22 +94,18 @@ impl Health {
                 now
             }
         };
-        if self.consecutive >= 3
-            || now.saturating_since(since) < 3_000
+        if now.saturating_since(since) < 3_000
             || self.last_reset.is_some_and(|last| now.saturating_since(last) < 30_000)
         {
             return None;
         }
-        self.started(now);
-        self.consecutive += 1;
         Some(output)
     }
 
+    /// Commit the cooldown only once the recovery owner admits a rebuild.
     pub fn started(&mut self, now: MonoMs) {
         self.last_reset = Some(now);
         self.suspect = None;
-        self.resets += 1;
-        self.last_ok = None;
     }
 }
 
@@ -136,18 +147,53 @@ mod tests {
     }
 
     #[test]
+    fn failure_survives_suspension_but_not_running_replacement_or_server_loss() {
+        for end in ["running", "replacement", "removed", "server"] {
+            let (mut health, address, _) = fixture(-3);
+            health.observe(health.outputs.clone());
+            assert!(health.failed(address));
+            let mut output = health.outputs[0].clone();
+            output.state = 2;
+            health.observe(vec![output.clone()]);
+            assert!(health.failed(address), "suspension does not repair the node");
+            assert!(!health.running(address));
+            assert!(!health.failed(Address::parse("11:22:33:44:55:66").unwrap()));
+            match end {
+                "running" => {
+                    output.state = 0;
+                    health.observe(vec![output]);
+                    assert!(health.running(address));
+                }
+                "replacement" => {
+                    output.index += 1;
+                    health.observe(vec![output]);
+                }
+                "removed" => health.observe(vec![]),
+                _ => health.forget_server(),
+            }
+            assert!(!health.failed(address), "{end}");
+        }
+    }
+
+    #[test]
     fn confirmed_failure_has_a_grace_period_and_rate_limit() {
         let (mut health, address, graph) = fixture(2);
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(0)).is_none());
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(2_999)).is_none());
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(3_000)).is_some());
+        // Merely requesting recovery must not consume the cooldown.
+        assert!(health.check(Some(address), Some(&graph), true, MonoMs(3_000)).is_some());
+        health.started(MonoMs(3_000));
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(4_000)).is_none());
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(32_999)).is_none());
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(33_000)).is_some());
+        health.started(MonoMs(33_000));
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(34_000)).is_none());
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(63_000)).is_some());
+        health.started(MonoMs(63_000));
         assert!(health.check(Some(address), Some(&graph), true, MonoMs(64_000)).is_none());
-        assert!(health.check(Some(address), Some(&graph), true, MonoMs(120_000)).is_none());
+        // Attempt budgets belong to the recovery task, not this detector.
+        assert!(health.check(Some(address), Some(&graph), true, MonoMs(120_000)).is_some());
     }
 
     #[test]

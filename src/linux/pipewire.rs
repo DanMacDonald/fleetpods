@@ -33,11 +33,6 @@ pub enum Op {
         id: u64,
         name: String,
     },
-    RearmOutput {
-        id: u64,
-        index: u32,
-        name: String,
-    },
     Mute(StreamTarget),
     Default(String),
     Move {
@@ -606,9 +601,6 @@ fn apply(
     for op in ops {
         match op {
             Op::StartOutput { id, name } => start_output_node(*id, name.clone(), reports.clone()),
-            Op::RearmOutput { id, index, name } => {
-                rearm_output(*id, *index, name.clone(), reports.clone())
-            }
             Op::Default(_) => {}
             Op::Mute(stream) => {
                 if generation_ok(cached, stream) {
@@ -805,53 +797,6 @@ fn close_pw_cli() {
     drop(stdin);
     let _ = child.kill();
     let _ = child.wait();
-}
-
-/// Off the event loop. Always attempt resume, even if suspension fails.
-/// The sink index addresses one output; never pass Pulse's all-sinks sentinel.
-fn rearm_output(id: u64, index: u32, name: String, reports: Sender<Input>) {
-    let failed = reports.clone();
-    let worker = std::thread::Builder::new().name("fleetpods-output-reset".into()).spawn(move || {
-        let ok = index != u32::MAX && {
-            let sink = index.to_string();
-            let suspended = bounded_pactl(&["suspend-sink", &sink, "1"]);
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            let resumed = bounded_pactl(&["suspend-sink", &sink, "0"])
-                || bounded_pactl(&["suspend-sink", &sink, "0"]);
-            eprintln!("fleetpodsd: audio output reset sink={name:?} suspended={suspended} resumed={resumed}");
-            suspended && resumed
-        };
-        let _ = reports.send(Input::OutputRearmed { id, ok });
-    });
-    if worker.is_err() {
-        let _ = failed.send(Input::OutputRearmed { id, ok: false });
-    }
-}
-
-fn bounded_pactl(args: &[&str]) -> bool {
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let Ok(mut child) = Command::new("pactl")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
 }
 
 fn generation_ok(cached: &HashMap<u32, StreamChannels>, stream: &StreamTarget) -> bool {

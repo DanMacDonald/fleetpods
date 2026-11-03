@@ -17,10 +17,6 @@ use crate::daemon::{host_id, Daemon};
 pub enum Input {
     /// Pulse's raw output states, independent of ownership or PCM content.
     Outputs(Vec<crate::audio::health::Output>),
-    OutputRearmed {
-        id: u64,
-        ok: bool,
-    },
     OutputRestarted {
         id: u64,
         ok: bool,
@@ -249,12 +245,6 @@ pub enum Effect {
         id: u64,
         name: String,
     },
-    /// Briefly suspend/resume only this Pulse sink. No Bluetooth unpairing.
-    RearmOutput {
-        id: u64,
-        index: u32,
-        name: String,
-    },
     /// Pause these MPRIS players. The daemon already decided the seat was given away.
     PausePlayers(Vec<String>),
     /// Play these MPRIS players again. They paused themselves while the
@@ -313,14 +303,7 @@ impl Daemon {
     fn apply(&mut self, input: Input, now: Clock) -> Option<String> {
         match input {
             Input::Outputs(outputs) => {
-                self.output_health.outputs = outputs;
-                None
-            }
-            Input::OutputRearmed { id, ok } => {
-                if id == self.output_health.resets {
-                    self.output_health.last_ok = Some(ok);
-                    eprintln!("fleetpodsd: audio output reset {id} completed (ok={ok})");
-                }
+                self.output_health.observe(outputs);
                 None
             }
             Input::Transport { active } => {

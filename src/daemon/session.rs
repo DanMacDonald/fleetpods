@@ -19,6 +19,16 @@ enum PlaybackClaim {
     Active,
 }
 
+/// Why an ownership claim is being written. Callers keep their own gates;
+/// `emit_ownership_claim` is the only writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClaimReason {
+    Playback,
+    IdleActivity,
+    OwnershipReassert,
+    StemContest,
+}
+
 #[derive(Default)]
 pub(super) struct Session {
     /// The pods reset this laptop's link mid-playback with no fleet laptop
@@ -58,7 +68,7 @@ pub(super) struct Session {
 
     resume_output_on_grant: bool,
     rearm_after_loss: bool,
-    verification: OutputVerification,
+    output_recovery: OutputRecovery,
     rebuild_pause_until: Option<MonoMs>,
     resume_players: Vec<String>,
     resumed_players: Vec<String>,
@@ -70,15 +80,24 @@ pub(super) struct Session {
     stem_loss_at: Option<MonoMs>,
     stem_peer: Option<Address>,
     stem_claims_sent: u8,
+    /// Player that paused while this laptop owned the pods, and when.
+    /// A fleet peer's stem blip can ask for it back.
+    stem_paused: Option<(String, MonoMs)>,
+    /// Deadline at which a peer blip becomes a resume of `stem_paused`.
+    stem_resume_at: Option<MonoMs>,
 }
 
-/// The router owns each rebuild; this task owns verification and repeats.
-struct OutputVerification {
+/// One admission, identity and cancellation owner for takeover, watchdog and
+/// manual repairs. The router executes the same park/reset/relink/Start sequence.
+struct OutputRecovery {
     task: Task,
     requests: Requests,
+    repair_requested: bool,
+    resets: u64,
+    last_ok: Option<bool>,
 }
 
-impl Default for OutputVerification {
+impl Default for OutputRecovery {
     fn default() -> Self {
         Self {
             task: Task::new(Policy {
@@ -89,13 +108,32 @@ impl Default for OutputVerification {
                 confirmation_timeout_ms: Some(2_500),
             }),
             requests: Requests::default(),
+            repair_requested: false,
+            resets: 0,
+            last_ok: None,
         }
     }
 }
 
-impl OutputVerification {
+impl OutputRecovery {
     fn cancel(&mut self) {
+        if self.resets > 0 && self.last_ok.is_none() {
+            self.last_ok = Some(false);
+        }
         self.task.reset();
+        self.repair_requested = false;
+    }
+
+    fn request_repair(&mut self) {
+        self.cancel();
+        self.repair_requested = true;
+    }
+
+    // Startup and its bounded retries own recovery through completion. The
+    // steady-playback watchdog must not launch a second reset alongside them,
+    // or replenish their budget once exhausted.
+    fn watchdog_allowed(&self) -> bool {
+        matches!(self.task.state(), TaskState::Idle | TaskState::Succeeded { .. })
     }
 
     /// Start completion begins verification, not proof of audible playback.
@@ -103,12 +141,13 @@ impl OutputVerification {
         if let TaskState::Running { id, .. } = self.task.state() {
             if id.serial == serial {
                 self.task.reply(id, true, now);
+                self.last_ok = Some(true);
             }
         }
     }
 
     /// True when verification calls for another rebuild. An early transport
-    /// blip is insufficient; it must still be running at the check deadline.
+    /// blip is insufficient; sink and transport must both run at the deadline.
     fn retry_due(&mut self, granted: bool, streaming: bool, playing: bool, now: MonoMs) -> bool {
         let checking =
             matches!(self.task.state(), TaskState::Confirming { until, .. } if now >= until);
@@ -125,11 +164,12 @@ impl OutputVerification {
         matches!(self.task.state(), TaskState::Backoff { .. }) && playing
     }
 
-    /// Launch one verification attempt for a grant. A direct attempt
+    /// Admit one output attempt, sharing identity and budget across all triggers.
+    /// A direct attempt
     /// starts its confirmation deadline at once (the router only starts
     /// the existing node); a rebuild attempt confirms only after its
     /// start lands. Silence at the deadline retries as a rebuild.
-    fn begin_claim(
+    fn begin(
         &mut self,
         requested: bool,
         generation: Generation,
@@ -159,7 +199,16 @@ impl OutputVerification {
         {
             self.cancel();
         }
-        self.task.try_launch(&mut self.requests, generation, now, |id| admit(id.serial)).is_some()
+        let began = self
+            .task
+            .try_launch(&mut self.requests, generation, now, |id| admit(id.serial))
+            .is_some();
+        if began {
+            self.repair_requested = false;
+            self.resets += 1;
+            self.last_ok = None;
+        }
+        began
     }
 }
 /// A player that pauses this soon after a rebuilt output came back paused
@@ -199,6 +248,10 @@ const INTENT_AIR_MS: u64 = 15_000;
 /// answer its started reports with bounded ownership contests.
 const STEM_CONTEST_WINDOW_MS: u64 = 5_000;
 const STEM_CONTEST_MAX_CLAIMS: u8 = 3;
+/// Wait after a fleet peer's started report before treating it as a stem
+/// blip: a genuine takeover claims ownership well inside this beat, while
+/// a stem toggle delivered to the peer is re-paused almost immediately.
+const STEM_RESUME_DELAY_MS: u64 = 600;
 
 /// Why an opening attempt must be retired.
 enum ConnectionHold {
@@ -228,7 +281,7 @@ impl Session {
         self.resume_players.clear();
         self.resumed_players.clear();
         self.rebuild_pause_until = None;
-        self.verification.cancel();
+        self.output_recovery.cancel();
     }
 }
 
@@ -255,6 +308,7 @@ impl Daemon {
         // before the final route/setup decision, then publish the final state.
         let mut effects = self.collect_background_effects(now);
         self.expire_intent_hold(now, &mut effects);
+        self.fire_stem_resume(now, &mut effects);
         self.finish_session(now, &mut effects);
         self.announce_session(now, &mut effects);
         effects
@@ -1206,6 +1260,14 @@ impl Daemon {
         self.queue_resume(players);
     }
 
+    fn output_running(&self) -> bool {
+        self.config.accessory.is_some_and(|address| self.output_health.running(address))
+    }
+
+    fn playback_running(&self) -> bool {
+        self.transport_active && self.output_running()
+    }
+
     fn lifecycle_facts(&self, now: MonoMs) -> crate::pods::lifecycle::Facts<'_> {
         crate::pods::lifecycle::Facts {
             accessory: self.config.accessory,
@@ -1213,12 +1275,19 @@ impl Daemon {
             control: self.connection.stage(),
             bluetooth: self.connection.bluez(),
             may_open: self.can_open_link(now),
+            // The router owns output intent: no claim means this attempt
+            // may only join in the background, never pursue audio.
+            intent: if self.output.wants_output() {
+                crate::pods::lifecycle::Intent::TakeAudio
+            } else {
+                crate::pods::lifecycle::Intent::JoinInBackground
+            },
             early_audio_allowed: self.preferred_connection_allowed(),
-            wants_audio: self.output.wants_output(),
             graph: self.last_graph.as_ref(),
             selected_codec: self.audio.selected(),
             routed: self.audio.routed(),
             recovering: self.output.recovering(),
+            output_running: self.output_running(),
             transport_active: self.transport_active,
         }
     }
@@ -1315,14 +1384,32 @@ impl Daemon {
         )
     }
 
+    /// The one place an ownership claim is written to the control link.
+    /// Callers own their gates; this owns the write and its log line.
+    /// Sending CLAIM is not confirmation of playback.
+    pub(crate) fn emit_ownership_claim(&mut self, reason: ClaimReason) {
+        match reason {
+            ClaimReason::Playback => {
+                eprintln!("fleetpodsd: claiming AirPods audio on the existing control link")
+            }
+            ClaimReason::IdleActivity => {
+                eprintln!("fleetpodsd: claiming idle AirPods ownership on desktop activity")
+            }
+            ClaimReason::OwnershipReassert => eprintln!(
+                "fleetpodsd: local playback paused while owning the AirPods; re-asserting ownership"
+            ),
+            ClaimReason::StemContest => {}
+        }
+        self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
+    }
+
     /// Ask on the existing control link. Ownership and source remain observations
     /// from the accessory; sending CLAIM is not confirmation of playback.
     fn request_playback_ownership(&mut self, now: Clock) -> bool {
         if !self.wants_local_confirm(now.mono) {
             return false;
         }
-        self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
-        eprintln!("fleetpodsd: claiming AirPods audio on the existing control link");
+        self.emit_ownership_claim(ClaimReason::Playback);
         self.session.claim_sent_at = Some(now.mono);
         true
     }
@@ -1369,6 +1456,8 @@ impl Daemon {
             // The pods end this laptop's A2DP stream, which can leave its
             // audio node failed. The next grant relinks unless the sink runs.
             self.session.rearm_after_loss = true;
+            self.session.stem_paused = None;
+            self.session.stem_resume_at = None;
             self.yield_to_remote_report(now);
         }
         self.effects.announce_dirty = true;
@@ -1429,7 +1518,7 @@ impl Daemon {
             self.session.stem_claims_sent,
             STEM_CONTEST_MAX_CLAIMS
         );
-        self.effects.control_out.push((self.connection.generation(), setup::ownership(true)));
+        self.emit_ownership_claim(ClaimReason::StemContest);
     }
 
     pub(crate) fn observe_source(
@@ -1542,9 +1631,11 @@ impl Daemon {
     pub(crate) fn output_started(&mut self, id: u64, ok: bool, now: Clock) {
         if self.output.finish_start(id, ok) {
             if ok {
-                self.session.verification.started(id, now.mono);
-            } else if matches!(self.session.verification.task.state(), TaskState::Confirming { .. })
-            {
+                self.session.output_recovery.started(id, now.mono);
+            } else if matches!(
+                self.session.output_recovery.task.state(),
+                TaskState::Confirming { .. }
+            ) {
                 // A direct route's start failed: the confirmation deadline
                 // turns the silent transport into a rebuild on its own.
                 eprintln!("fleetpodsd: direct output start failed; awaiting the rebuild check");
@@ -1597,6 +1688,7 @@ impl Daemon {
             eprintln!("fleetpodsd: player {service:?} paused during the AirPods rebuild; deferring resume until output start");
             self.queue_resume(vec![service.clone()]);
         }
+        let was_playing = self.audio.player_playing(&service);
         let after_yield = self.audio.yielded();
         // Our own Play continues the claim already in progress.
         let resumed = playing == Some(true)
@@ -1617,6 +1709,84 @@ impl Daemon {
             self.claim_playback(now);
             self.effects.announce_dirty = true;
         }
+        if playing == Some(false) && was_playing && !self.audio.local_playing() {
+            self.reassert_ownership_on_pause(&service, now);
+        }
+        if playing == Some(true)
+            && self.session.stem_paused.as_ref().is_some_and(|(name, _)| name == &service)
+        {
+            self.session.stem_paused = None;
+            self.session.stem_resume_at = None;
+        }
+    }
+
+    /// Pausing while this laptop owns the pods (a stem click lands here)
+    /// leaves the roster owner unchanged, yet the pods retarget the next
+    /// stem toggle to another connected host. Refresh ownership with one
+    /// ownership-only claim so the resume toggle stays on this host. A
+    /// later active play elsewhere claims after this and still takes over.
+    /// Also remember the paused player: if the resume toggle lands on a
+    /// fleet peer instead, its blip can ask for this player back.
+    fn reassert_ownership_on_pause(&mut self, service: &str, now: Clock) {
+        if self.connection.stage() != Stage::Ready
+            || !self.output.wants_output()
+            || self.accessory.ownership.as_fresh() != Some(&true)
+        {
+            return;
+        }
+        self.session.stem_paused = Some((service.to_string(), now.mono));
+        self.emit_ownership_claim(ClaimReason::OwnershipReassert);
+    }
+
+    /// A fleet peer started playing while this laptop owns the pods and
+    /// has a player paused on them. The pods deliver stem toggles to the
+    /// peer regardless of ownership, so its brief started report is most
+    /// likely a resume click meant for this host. Give a genuine takeover
+    /// a short beat to claim ownership, then resume the paused player.
+    pub(crate) fn note_peer_stem_relay(&mut self, peer: Address, playing: bool, now: Clock) {
+        if !playing
+            || !self.membership.contains(peer)
+            || self.accessory.ownership.as_fresh() != Some(&true)
+            || self.audio.local_playing()
+            || self.session.stem_paused.is_none()
+        {
+            return;
+        }
+        self.session.stem_resume_at = Some(now.mono.saturating_add(STEM_RESUME_DELAY_MS));
+        eprintln!(
+            "fleetpodsd: fleet peer {} started while this laptop owns the AirPods; treating it as a possible stem blip",
+            peer.display()
+        );
+    }
+
+    /// Fire a scheduled stem relay if the wait confirmed it: ownership
+    /// held, no fleet intent claim is in flight, the peer stopped again,
+    /// and the paused player is still paused.
+    fn fire_stem_resume(&mut self, now: Clock, effects: &mut Vec<Effect>) {
+        let Some(at) = self.session.stem_resume_at else {
+            return;
+        };
+        if now.mono.0 < at.0 {
+            return;
+        }
+        self.session.stem_resume_at = None;
+        let Some((player, _)) = self.session.stem_paused.take() else {
+            return;
+        };
+        if self.accessory.ownership.as_fresh() != Some(&true)
+            || self.audio.local_playing()
+            || self.audio.player_playing(&player)
+            || self.session.intent_until.is_some_and(|until| now.mono.0 < until.0)
+            || self.peer_playback.keys().any(|peer| {
+                self.membership.contains(*peer)
+                    && self.remote_playback(*peer, now).is_some_and(|(playing, _)| playing)
+            })
+        {
+            return;
+        }
+        eprintln!("fleetpodsd: peer stem blip confirmed; resuming paused player {player:?}");
+        self.session.resumed_players = vec![player.clone()];
+        effects.push(Effect::ResumePlayers(vec![player]));
     }
     /// Classify a player reporting Playing after this laptop yielded.
     /// Two replays are not takeover presses and are re-paused here:
@@ -1726,6 +1896,39 @@ impl Daemon {
         }
     }
 
+    pub(super) fn can_repair_output(&self) -> bool {
+        self.connection.stage() == Stage::Ready
+            && !self.suspending
+            && !self.adapter_down
+            && !self.routing.phase().busy()
+            && !self.accessory.both_docked()
+            && self.output.wants_output()
+            && self.output.held_streams().is_empty()
+            && !self.output.holding_takeover()
+            && !self.output.recovering()
+            && self.accessory.ownership.as_fresh() == Some(&true)
+            && !self.session.output_recovery.repair_requested
+    }
+
+    pub(super) fn reset_audio_output(&mut self) -> Response {
+        if !self.can_repair_output() {
+            return Response::line("error: this machine must own the ready AirPods output, with no handoff or reset in progress");
+        }
+        if self.config.accessory.and_then(|a| self.output_health.output(a)).is_none() {
+            return Response::line("error: no AirPods audio output");
+        }
+        self.session.output_recovery.request_repair();
+        Response::line("accepted: rebuilding AirPods audio output")
+    }
+
+    pub(super) fn output_health_status(&self) -> serde_json::Value {
+        serde_json::json!({
+            "state": self.config.accessory.and_then(|a| self.output_health.output(a)).map(|o| o.state),
+            "resets": self.session.output_recovery.resets,
+            "last_reset_ok": self.session.output_recovery.last_ok,
+        })
+    }
+
     /// Final setup/recovery/player work, after admission and intent decisions.
     fn finish_session(&mut self, now: Clock, effects: &mut Vec<Effect>) {
         let accessory = self.config.accessory;
@@ -1775,36 +1978,48 @@ impl Daemon {
         let granted = self.output.wants_output()
             && self.connection.stage() == Stage::Ready
             && self.accessory.ownership.as_fresh() == Some(&true);
-        let retry = self.session.verification.retry_due(
+        let retry = self.session.output_recovery.retry_due(
             granted,
-            self.transport_active,
+            self.playback_running(),
             self.audio.local_playing(),
             now.mono,
         );
-        if granted && self.transport_active {
-            // Pulse's running sink state is insufficient; actual transport
-            // activity tells us an ownership report needs no rebuild.
+        if granted && self.playback_running() {
+            // Neither observation alone proves readiness. The same joint
+            // predicate drives verification and the lifecycle's final gates.
             self.session.rearm_after_loss = false;
             self.session.resume_output_on_grant = false;
         }
-        let requested = self.session.resume_output_on_grant || self.session.rearm_after_loss;
+        let watchdog = self
+            .output_health
+            .check(
+                self.config.accessory,
+                self.last_graph.as_ref(),
+                self.can_repair_output()
+                    && self.audio.local_playing()
+                    && self.session.output_recovery.watchdog_allowed(),
+                now.mono,
+            )
+            .is_some();
+        let repair = self.session.output_recovery.repair_requested || watchdog;
+        let requested =
+            self.session.resume_output_on_grant || self.session.rearm_after_loss || repair;
         if granted && (requested || retry) {
-            // Route directly first: the sink restart on every grant cost
-            // most of a second, and the failed node it protected against
-            // shows up as a silent transport, which the verification
-            // deadline turns into a rebuild. The router owns the
-            // direct-to-rebuild transition; a direct route keeps the
-            // players playing, a rebuild pauses them below.
-            let direct = requested && !retry;
+            // A known failed node needs a rebuild now, even if it subsequently
+            // reported suspended. Other outputs get the direct route and a
+            // bounded check of both sink and transport. The router owns either
+            // path; only the rebuild pauses players below.
+            let failed_output = self.config.accessory.is_some_and(|a| self.output_health.failed(a));
+            let direct = requested && !retry && !failed_output && !repair;
             let began = match (self.config.accessory, self.last_graph.as_ref()) {
-                (Some(address), Some(graph)) => self.session.verification.begin_claim(
+                (Some(address), Some(graph)) => self.session.output_recovery.begin(
                     requested,
                     self.connection.generation(),
                     now.mono,
                     direct,
                     |id| self.output.begin_output(id, direct, address, graph, now.mono),
                 ),
-                _ if direct => self.session.verification.begin_claim(
+                _ if direct => self.session.output_recovery.begin(
                     requested,
                     self.connection.generation(),
                     now.mono,
@@ -1818,9 +2033,10 @@ impl Daemon {
                     self.session.resume_output_on_grant = false;
                     self.session.rearm_after_loss = false;
                     eprintln!(
-                        "fleetpodsd: routing directly after ownership grant; rebuilding only if the transport stays silent"
+                        "fleetpodsd: routing directly after ownership grant; verifying running output and active transport"
                     );
                 } else {
+                    self.output_health.started(now.mono);
                     // Stop the media clock while its output is unavailable.
                     // This pause retains the playback claim, unlike yielding.
                     let players = self.audio.playing_players();
@@ -1830,7 +2046,7 @@ impl Daemon {
                     }
                     self.session.resume_output_on_grant = false;
                     self.session.rearm_after_loss = false;
-                    eprintln!("fleetpodsd: re-arming AirPods playback after ownership grant");
+                    eprintln!("fleetpodsd: rebuilding AirPods playback (failed_node={failed_output}, verification_retry={retry}, repair={repair})");
                 }
             }
         }
@@ -1854,9 +2070,6 @@ impl Daemon {
             })
             .unwrap_or(effects.len());
         effects.splice(setup_at..setup_at, setup);
-        if let Some(effect) = self.pace_output_health(now) {
-            effects.push(effect);
-        }
         // The Router ordered this work; translate it in one place. A quiet
         // still leads the whole step, before any control write.
         for work in self.output.take_work(now.mono, self.audio.local_playing()) {
@@ -1909,11 +2122,23 @@ mod tests {
     use crate::types::Battery;
 
     fn recovery_id(daemon: &Daemon) -> Option<u64> {
-        match daemon.session.verification.task.state() {
+        match daemon.session.output_recovery.task.state() {
             TaskState::Running { id, .. }
             | TaskState::Confirming { id, .. }
             | TaskState::Succeeded { id: Some(id) } => Some(id.serial),
             _ => None,
+        }
+    }
+
+    fn output(state: i32) -> crate::audio::health::Output {
+        crate::audio::health::Output {
+            name: "pods".into(),
+            index: 7,
+            address: Some(addr(3)),
+            profile: Some("a2dp-sink".into()),
+            state,
+            muted: false,
+            audible_volume: true,
         }
     }
 
@@ -2270,6 +2495,115 @@ mod tests {
                 assert!(daemon.reopen_wait);
                 assert!(!daemon.session.background_requested);
             }
+        }
+    }
+
+    #[test]
+    fn pausing_while_owning_the_pods_reasserts_ownership() {
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let mut daemon = Daemon::new("gram");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let service = "org.mpris.MediaPlayer2.brave";
+        let claims_in = |effects: &[Effect]| {
+            effects
+                .iter()
+                .filter(|effect| {
+                    matches!(effect,
+                        Effect::WriteControl { bytes, .. }
+                            if *bytes == crate::pods::setup::ownership(true))
+                })
+                .count()
+        };
+        ready_link(&mut daemon, now);
+        daemon.step(Input::Players(Vec::new()), now);
+        daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+        daemon.step(Input::Observation(Observation::Ownership(true)), at(10));
+
+        // The active host pauses (a stem click lands here): one
+        // ownership-only re-assert, and nothing resumes or re-pauses.
+        let paused =
+            daemon.step(Input::Player { service: service.into(), playing: Some(false) }, at(1_000));
+        assert_eq!(claims_in(&paused.effects), 1, "pause while owner re-asserts ownership");
+        assert!(
+            !paused
+                .effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ResumePlayers(_) | Effect::PausePlayers(_))),
+            "re-asserting ownership must not touch the players"
+        );
+
+        // Pausing while a peer owns the pods asserts nothing.
+        daemon.step(Input::Player { service: service.into(), playing: Some(true) }, at(2_000));
+        daemon.step(Input::Observation(Observation::Ownership(false)), at(2_100));
+        let paused_remote =
+            daemon.step(Input::Player { service: service.into(), playing: Some(false) }, at(2_200));
+        assert_eq!(
+            claims_in(&paused_remote.effects),
+            0,
+            "pause while a peer owns the pods must not claim"
+        );
+    }
+
+    #[test]
+    fn a_fleet_peer_stem_blip_resumes_the_paused_owner_player() {
+        use crate::fleet::members::{Fleet, Member};
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        // (scenario, peer stops again, ownership held) -> expect resume
+        for (scenario, blip, held, expect_resume) in [
+            ("stem blip while owner", true, true, true),
+            ("peer keeps playing", false, true, false),
+            ("ownership taken during the wait", true, false, false),
+        ] {
+            let local = addr(1);
+            let peer = addr(2);
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            let service = "org.mpris.MediaPlayer2.brave";
+            daemon.set_local_address(Some(local));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "lg-gram".into() },
+                    Member { address: peer, label: "omarchy-xps".into() },
+                ],
+            });
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.step(
+                Input::Observation(Observation::PodPeers {
+                    peers: vec![local, peer],
+                    owner: Some(local),
+                }),
+                now,
+            );
+            daemon.step(Input::Player { service: service.into(), playing: Some(true) }, now);
+            daemon.step(Input::Observation(Observation::Ownership(true)), at(10));
+            // Stem pause on the owning laptop.
+            daemon.step(Input::Player { service: service.into(), playing: Some(false) }, at(1_000));
+            // The pods deliver the resume click to the fleet peer instead.
+            daemon.step(
+                Input::Observation(Observation::PeerPlaying { address: peer, playing: true }),
+                at(1_100),
+            );
+            if blip {
+                daemon.step(
+                    Input::Observation(Observation::PeerPlaying { address: peer, playing: false }),
+                    at(1_200),
+                );
+            }
+            if !held {
+                daemon.step(Input::Observation(Observation::Ownership(false)), at(1_300));
+            }
+            let fired = daemon.step(Input::Tick, at(2_000));
+            let resumed = fired.effects.iter().any(|effect| {
+                matches!(effect, Effect::ResumePlayers(names) if names == &[service.to_string()])
+            });
+            assert_eq!(resumed, expect_resume, "{scenario}");
         }
     }
 
@@ -2931,7 +3265,7 @@ mod tests {
                     assert!(daemon.session.resume_players.is_empty());
                     assert!(daemon.session.resumed_players.is_empty());
                     assert_eq!(daemon.session.rebuild_pause_until, None);
-                    assert_eq!(daemon.session.verification.task.state(), TaskState::Idle);
+                    assert_eq!(daemon.session.output_recovery.task.state(), TaskState::Idle);
                 }
                 assert!(!resumed(
                     &daemon
@@ -2997,7 +3331,7 @@ mod tests {
     }
 
     #[test]
-    fn output_verification_retries_only_missing_transport_within_the_live_claim() {
+    fn output_verification_retries_only_missing_playback_within_the_live_claim() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::pods::observe::Observation;
         use crate::step::{Effect, Input};
@@ -3077,11 +3411,12 @@ mod tests {
                     at(base + 20),
                 );
                 if outcome == "reset_failed" {
-                    assert_eq!(daemon.session.verification.task.state(), TaskState::Idle);
+                    assert_eq!(daemon.session.output_recovery.task.state(), TaskState::Idle);
                     continue;
                 }
                 daemon.step(Input::Audio(playing.clone()), at(base + 30));
                 daemon.step(Input::Transport { active: streamed }, at(base + 40));
+                daemon.step(Input::Outputs(vec![output(0)]), at(base + 40));
                 let early = daemon.step(Input::Tick, at(base + 280));
                 assert!(
                     !early.effects.iter().any(|e| matches!(e, Effect::StartOutput { .. })),
@@ -3093,7 +3428,7 @@ mod tests {
                 "Start is issued once after settling, regardless of which input advances routing");
                 // Transport activity before Start must not retire router work.
                 assert!(matches!(
-                    daemon.session.verification.task.state(),
+                    daemon.session.output_recovery.task.state(),
                     TaskState::Running { .. }
                 ));
                 daemon.step(
@@ -3101,11 +3436,11 @@ mod tests {
                     at(base + 610),
                 );
                 if outcome == "start_failed" {
-                    assert_eq!(daemon.session.verification.task.state(), TaskState::Idle);
+                    assert_eq!(daemon.session.output_recovery.task.state(), TaskState::Idle);
                     continue;
                 }
                 assert!(matches!(
-                    daemon.session.verification.task.state(),
+                    daemon.session.output_recovery.task.state(),
                     TaskState::Confirming { .. }
                 ));
                 if outcome == "transient" {
@@ -3131,7 +3466,10 @@ mod tests {
                             };
                             daemon.step(input, at(1_100));
                             daemon.step(Input::OutputStarted { id: serial, ok: true }, at(1_200));
-                            assert_eq!(daemon.session.verification.task.state(), TaskState::Idle);
+                            assert_eq!(
+                                daemon.session.output_recovery.task.state(),
+                                TaskState::Idle
+                            );
                         }
                         "no_parking" => {
                             let mut unavailable = playing.clone();
@@ -3221,7 +3559,7 @@ mod tests {
     }
 
     #[test]
-    fn a_grant_routes_directly_and_rebuilds_only_if_the_transport_stays_silent() {
+    fn a_grant_routes_directly_and_rebuilds_only_if_playback_stays_silent() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::pods::observe::Observation;
         use crate::step::{Effect, Input};
@@ -3272,7 +3610,7 @@ mod tests {
                 "a grant must not restart the sink or pause players first (silent={silent})"
             );
             assert!(matches!(
-                daemon.session.verification.task.state(),
+                daemon.session.output_recovery.task.state(),
                 TaskState::Confirming { .. }
             ));
             assert!(!daemon.session.rearm_after_loss);
@@ -3301,14 +3639,343 @@ mod tests {
                     .iter()
                     .any(|e| matches!(e, Effect::RestartOutput { .. } | Effect::PausePlayers(_))));
                 daemon.step(Input::Transport { active: true }, at(500));
+                daemon.step(Input::Outputs(vec![output(0)]), at(500));
                 daemon.step(Input::Tick, at(2_600));
                 assert!(matches!(
-                    daemon.session.verification.task.state(),
+                    daemon.session.output_recovery.task.state(),
                     TaskState::Succeeded { .. }
                 ));
             }
         }
     }
+    #[test]
+    fn a_failed_output_is_rebuilt_on_the_grant_without_waiting_for_verification() {
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        // Both captured takeovers: node error, then suspension while Gram owns
+        // playback. Also check a healthy/new node retains the direct path.
+        for prior in ["failed", "replaced", "running", "suspended"] {
+            let (mut daemon, playing, now) = takeover_fixture();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            if prior != "suspended" {
+                daemon.step(Input::Outputs(vec![output(-3)]), at(10));
+            }
+            let mut current = output(if prior == "running" { 0 } else { 2 });
+            if prior == "replaced" {
+                current.index += 1;
+            }
+            daemon.step(Input::Outputs(vec![current]), at(20));
+            daemon.output.claim();
+            daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(true));
+            let grant = daemon.step(Input::Observation(Observation::Ownership(true)), at(30));
+            assert_eq!(
+                grant.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))),
+                prior == "failed",
+                "{prior}"
+            );
+            if prior == "failed" {
+                let id = recovery_id(&daemon).unwrap();
+                assert!(matches!(
+                    daemon.session.output_recovery.task.state(),
+                    TaskState::Running { .. }
+                ));
+                let mut parked = playing;
+                parked.streams[0].mute = true;
+                parked.streams[0].sink = "speakers".into();
+                let next = daemon.step(Input::Audio(parked), at(40));
+                assert!(next
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RestartOutput { id: got, .. } if *got == id)));
+                assert!(next.effects.iter().all(|e| !matches!(e, Effect::StartOutput { .. })));
+            } else {
+                assert!(matches!(
+                    daemon.session.output_recovery.task.state(),
+                    TaskState::Confirming { .. }
+                ));
+            }
+        }
+    }
+
+    fn takeover_fixture() -> (Daemon, crate::audio::route::Graph, Clock) {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::Input;
+        let now = clock();
+        let mut daemon = Daemon::new("xps");
+        ready_link(&mut daemon, now);
+        let graph = Graph {
+            default_sink: "pods".into(),
+            sinks: vec![
+                Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                },
+                Sink { name: "speakers".into(), address: None, profile: None },
+            ],
+            cards: vec![],
+            streams: vec![LiveStream {
+                id: 1,
+                generation: 10,
+                sink: "pods".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                volume: 1.0,
+                corked: false,
+            }],
+        };
+        daemon.step(Input::Audio(graph.clone()), now);
+        daemon.step(Input::Observation(Observation::Ownership(false)), now);
+        (daemon, graph, now)
+    }
+
+    fn streaming_fixture() -> (Daemon, crate::audio::route::Graph, Clock) {
+        use crate::pods::observe::Observation;
+        use crate::step::Input;
+        let (mut daemon, graph, now) = takeover_fixture();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.step(Input::Bonded { address: addr(3), saved: true }, now);
+        daemon.output.claim();
+        daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(true));
+        daemon.step(Input::Outputs(vec![output(0)]), now);
+        daemon.step(Input::Observation(Observation::Ownership(true)), now);
+        let id = recovery_id(&daemon).unwrap();
+        daemon.step(Input::Tick, at(300));
+        daemon.step(Input::OutputStarted { id, ok: true }, at(400));
+        daemon.step(Input::Transport { active: true }, at(500));
+        daemon.step(Input::Tick, at(2_600));
+        assert!(matches!(daemon.session.output_recovery.task.state(), TaskState::Succeeded { .. }));
+        (daemon, graph, at(2_600))
+    }
+
+    #[test]
+    fn watchdog_and_manual_repairs_share_takeover_cancellation_and_ids() {
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for trigger in ["watchdog", "manual"] {
+            for end in ["takeover", "release", "server_lost", "suspend", "success"] {
+                let (mut daemon, playing, now) = streaming_fixture();
+                let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+                daemon.step(Input::Outputs(vec![output(-3)]), at(10));
+                let start = if trigger == "manual" {
+                    let result = daemon.step(Input::Command(Command::AudioReset), at(3_010));
+                    assert!(result.reply.as_ref().unwrap().starts_with("accepted:"));
+                    result
+                } else {
+                    daemon.step(Input::Tick, at(3_010))
+                };
+                assert!(start.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+                let old = recovery_id(&daemon).unwrap();
+                let mut parked = playing.clone();
+                parked.streams[0].mute = true;
+                parked.streams[0].sink = "speakers".into();
+                let restart = daemon.step(Input::Audio(parked.clone()), at(3_020));
+                assert!(restart
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RestartOutput { id, .. } if *id == old)));
+                let duplicate = daemon.step(Input::Command(Command::AudioReset), at(3_030));
+                assert!(duplicate.reply.unwrap().starts_with("error:"));
+                assert_eq!(daemon.session.output_recovery.resets, 1);
+                assert_eq!(recovery_id(&daemon), Some(old));
+                assert!(!duplicate
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::RestartOutput { .. })));
+
+                match end {
+                    "success" => {
+                        daemon.step(Input::OutputRestarted { id: old, ok: true }, at(3_040));
+                        daemon.step(Input::Audio(playing), at(3_050));
+                        daemon.step(Input::Outputs(vec![output(0)]), at(3_060));
+                        let mut starts = daemon.step(Input::Tick, at(3_310)).effects;
+                        starts.extend(daemon.step(Input::Tick, at(3_610)).effects);
+                        assert_eq!(
+                            starts
+                                .iter()
+                                .filter(|e| matches!(e,
+                            Effect::StartOutput { id, .. } if *id == old))
+                                .count(),
+                            1
+                        );
+                        let started =
+                            daemon.step(Input::OutputStarted { id: old, ok: true }, at(3_620));
+                        assert!(started
+                            .effects
+                            .iter()
+                            .any(|e| matches!(e, Effect::ResumePlayers(_))));
+                        assert_eq!(daemon.output_health_status()["last_reset_ok"], true);
+                        daemon.step(Input::Tick, at(6_120));
+                        assert!(matches!(
+                            daemon.session.output_recovery.task.state(),
+                            TaskState::Succeeded { .. }
+                        ));
+                        continue;
+                    }
+                    "takeover" => {
+                        daemon.step(Input::Observation(Observation::Ownership(false)), at(3_040));
+                        daemon.step(Input::Tick, at(3_400));
+                        daemon.claim_playback(at(3_410));
+                        daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(true));
+                        daemon.step(Input::Transport { active: false }, at(3_420));
+                        daemon.step(Input::Observation(Observation::Ownership(true)), at(3_430));
+                        daemon.step(Input::Audio(parked), at(3_440));
+                        let new = recovery_id(&daemon).unwrap();
+                        assert_ne!(new, old, "a new claim cannot reuse the retired repair's ID");
+                    }
+                    "release" => {
+                        daemon.step(Input::Command(Command::HandoffRelease), at(3_040));
+                    }
+                    "server_lost" => {
+                        daemon.step(Input::AudioLost, at(3_040));
+                    }
+                    _ => {
+                        daemon.step(Input::Suspend, at(3_040));
+                    }
+                }
+                let state = daemon.session.output_recovery.task.state();
+                let stats = daemon.output_health_status();
+                // The old reset is still outstanding when the new claim starts.
+                // Neither success nor failure from it may advance the new work.
+                for input in [
+                    Input::OutputRestarted { id: old, ok: true },
+                    Input::OutputStarted { id: old, ok: true },
+                    Input::OutputRestarted { id: old, ok: false },
+                ] {
+                    let stale = daemon.step(input, at(3_450));
+                    assert_eq!(
+                        daemon.session.output_recovery.task.state(),
+                        state,
+                        "{trigger}/{end}"
+                    );
+                    assert_eq!(daemon.output_health_status(), stats);
+                    assert!(!stale.effects.iter().any(|e| matches!(
+                        e,
+                        Effect::ResumePlayers(_)
+                            | Effect::StartOutput { .. }
+                            | Effect::RestartOutput { .. }
+                    )));
+                }
+                assert_eq!(daemon.config.accessory, Some(addr(3)));
+                assert_eq!(daemon.status_value(at(3_450))["bluetooth_bonded"], true);
+                assert!(!start.effects.iter().chain(restart.effects.iter()).any(|e| matches!(
+                    e,
+                    Effect::RemoveDevice { .. }
+                        | Effect::Disconnect { .. }
+                        | Effect::WriteSecret { .. }
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn watchdog_requires_local_playback_and_repair_admission() {
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for condition in ["healthy", "paused", "peer", "sleep", "no_parking"] {
+            let (mut daemon, mut graph, now) = streaming_fixture();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.step(
+                Input::Outputs(vec![output(if condition == "healthy" { 0 } else { 2 })]),
+                now,
+            );
+            match condition {
+                "paused" => {
+                    daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(false));
+                }
+                "peer" => {
+                    daemon.step(Input::Observation(Observation::Ownership(false)), now);
+                }
+                "sleep" => {
+                    daemon.step(Input::Suspend, now);
+                }
+                "no_parking" => {
+                    graph.sinks.retain(|sink| sink.address.is_some());
+                    daemon.step(Input::Audio(graph.clone()), now);
+                }
+                _ => {}
+            }
+            for ms in [3_100, 3_200, 3_300] {
+                let result = daemon.step(Input::Tick, at(ms));
+                assert!(
+                    !result.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })),
+                    "{condition}"
+                );
+                assert_eq!(daemon.session.output_recovery.resets, 0, "{condition}");
+            }
+            if condition == "no_parking" {
+                // Refused admission consumes neither an attempt nor cooldown.
+                graph.sinks.push(crate::audio::route::Sink {
+                    name: "speakers".into(),
+                    address: None,
+                    profile: None,
+                });
+                daemon.step(Input::Audio(graph), at(3_400));
+                assert_eq!(daemon.session.output_recovery.resets, 1);
+                assert!(daemon.output.recovering());
+            } else if condition == "healthy" {
+                let manual = daemon.step(Input::Command(Command::AudioReset), at(3_400));
+                assert!(manual.reply.unwrap().starts_with("accepted:"));
+                assert_eq!(daemon.session.output_recovery.resets, 1);
+                assert!(daemon.output.recovering());
+            }
+        }
+    }
+
+    #[test]
+    fn an_active_transport_on_a_suspended_output_has_one_recovery_owner() {
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        let (mut daemon, playing, now) = takeover_fixture();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.step(Input::Outputs(vec![output(2)]), now);
+        daemon.output.claim();
+        daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(true));
+        daemon.step(Input::Observation(Observation::Ownership(true)), now);
+        let direct = recovery_id(&daemon).unwrap();
+        daemon.step(Input::Tick, at(300));
+        daemon.step(Input::OutputStarted { id: direct, ok: true }, at(400));
+        daemon.step(Input::Transport { active: true }, at(800));
+        assert_eq!(daemon.lifecycle.progress().state, crate::pods::lifecycle::State::Routing);
+        assert_eq!(daemon.lifecycle.progress().waiting_for, "output_running");
+        let mut effects = daemon.step(Input::Tick, at(2_499)).effects;
+        assert_eq!(recovery_id(&daemon), Some(direct));
+        effects.extend(daemon.step(Input::Tick, at(2_500)).effects);
+        let rebuild = recovery_id(&daemon).unwrap();
+        assert_ne!(rebuild, direct, "transport activity alone cannot satisfy verification");
+        assert!(effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+        effects.extend(daemon.step(Input::Tick, at(3_300)).effects);
+        assert!(
+            effects.iter().all(|e| !matches!(e, Effect::RestartOutput { .. })),
+            "the watchdog cannot launch a competing reset"
+        );
+        assert_eq!(daemon.session.output_recovery.resets, 1);
+        assert_eq!(recovery_id(&daemon), Some(rebuild));
+
+        let mut parked = playing.clone();
+        parked.streams[0].mute = true;
+        parked.streams[0].sink = "speakers".into();
+        let reset = daemon.step(Input::Audio(parked), at(3_310));
+        assert!(reset
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::RestartOutput { id, .. } if *id == rebuild)));
+        daemon.step(Input::OutputRestarted { id: rebuild, ok: true }, at(3_320));
+        daemon.step(Input::Audio(playing), at(3_330));
+        let mut current = output(0);
+        current.index += 1;
+        daemon.step(Input::Outputs(vec![current]), at(3_340));
+        daemon.step(Input::Tick, at(3_600));
+        daemon.step(Input::Tick, at(3_900));
+        daemon.step(Input::OutputStarted { id: rebuild, ok: true }, at(3_910));
+        assert_eq!(daemon.lifecycle.progress().state, crate::pods::lifecycle::State::Streaming);
+        let verified = daemon.step(Input::Tick, at(6_500));
+        assert!(matches!(daemon.session.output_recovery.task.state(), TaskState::Succeeded { .. }));
+        assert!(verified.effects.iter().all(|e| !matches!(e, Effect::RestartOutput { .. })));
+    }
+
     #[test]
     fn a_new_audio_output_is_routed_without_restarting_it_for_an_old_ownership_loss() {
         use crate::audio::route::{Graph, LiveStream, Sink};
@@ -3362,10 +4029,7 @@ mod tests {
             graph.sinks.push(pods);
             let arrived = daemon.step(Input::Audio(graph.clone()), now);
             assert!(
-                !arrived.effects.iter().any(|e| matches!(
-                    e,
-                    Effect::RestartOutput { .. } | Effect::RearmOutput { .. }
-                )),
+                !arrived.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })),
                 "old_output={old_output}: {:?}",
                 arrived.effects
             );

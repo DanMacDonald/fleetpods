@@ -152,7 +152,6 @@ pub struct Daemon {
     pub(crate) output: crate::audio::route::Router,
     pub(crate) last_graph: Option<crate::audio::route::Graph>,
     pub(crate) output_health: crate::audio::health::Health,
-    pub(crate) rearm_output: Option<crate::audio::health::Output>,
     /// Whether the accessory's A2DP transport is streaming.
     pub(crate) transport_active: bool,
     /// When each pod (left, right) last advertised while sending the frame.
@@ -364,7 +363,6 @@ impl Daemon {
             output: crate::audio::route::Router::new(),
             last_graph: None,
             output_health: crate::audio::health::Health::default(),
-            rearm_output: None,
             transport_active: false,
             advertised_self_at: [None, None],
             radio_inbox: crate::fleet::radio::Inbox::new(),
@@ -569,11 +567,7 @@ impl Daemon {
         value["connection_lifecycle"] = status::lifecycle(&self.lifecycle.progress());
         value["audio_transport_active"] = serde_json::json!(self.transport_active);
         value["nearby_airpods"] = self.nearby_pods.status(now.mono);
-        value["audio_output_health"] = serde_json::json!({
-            "state": self.config.accessory.and_then(|a| self.output_health.output(a)).map(|o| o.state),
-            "resets": self.output_health.resets,
-            "last_reset_ok": self.output_health.last_ok,
-        });
+        value["audio_output_health"] = self.output_health_status();
         value["pairing_candidates"] = serde_json::json!(if self.config.accessory.is_none() {
             self.nearby_pods.pairing_count(now.mono)
         } else {
@@ -625,7 +619,7 @@ impl Daemon {
             Command::FleetReset => Response::line("error: fleet reset requires the keyring worker"),
             Command::Activity => self.activity(now),
             Command::Connect => self.connect(now),
-            Command::AudioReset => self.reset_audio_output(now),
+            Command::AudioReset => self.reset_audio_output(),
             Command::ReconnectPeer => self.reconnect_peer(now),
             Command::HandoffRelease => self.release(now),
             Command::HandoffClaim => self.claim_handoff(now),
@@ -1575,6 +1569,7 @@ impl Daemon {
         }
         self.peer_playback.insert(peer, (playing, now.mono));
         self.contest_started_outside_playback(peer, playing, now);
+        self.note_peer_stem_relay(peer, playing, now);
         self.effects.announce_dirty = true;
     }
 
@@ -3301,16 +3296,23 @@ impl Daemon {
                 .then_some(peer)
             });
             let Some(peer) = peer else { return false };
-            if let Some((false, _)) = self.remote_playback(peer, now) {
+            if let Some((false, reported_at)) = self.remote_playback(peer, now) {
+                // A device outside the fleet that only just reported not
+                // playing is still joining, not idle: desktop activity is
+                // permission to be connected, not to interrupt its join.
+                // Fleet members report deliberately and stay on the fast path.
+                const OUTSIDE_JOIN_IDLE_MS: u64 = 10_000;
+                if !self.membership.contains(peer)
+                    && now.mono.saturating_since(reported_at) < OUTSIDE_JOIN_IDLE_MS
+                {
+                    return false;
+                }
                 if self.idle_claimed.is_none_or(|(previous, requested)| {
                     previous != peer || now.mono.saturating_since(requested) >= 2_000
                 }) {
                     self.activity_at = None;
                     self.idle_claimed = Some((peer, now.mono));
-                    self.effects
-                        .control_out
-                        .push((self.connection.generation(), crate::pods::setup::ownership(true)));
-                    eprintln!("fleetpodsd: claiming idle AirPods ownership on desktop activity");
+                    self.emit_ownership_claim(session::ClaimReason::IdleActivity);
                     return true;
                 }
             }
@@ -3375,33 +3377,6 @@ impl Daemon {
         }
     }
 
-    fn can_rearm_output(&self) -> bool {
-        self.connection.stage() == Stage::Ready
-            && !self.suspending
-            && !self.adapter_down
-            && !self.routing.phase().busy()
-            && !self.accessory.both_docked()
-            && self.output.wants_output()
-            && self.output.held_streams().is_empty()
-            && !self.output.holding_takeover()
-            && self.accessory.ownership.as_fresh() == Some(&true)
-            && !(self.output_health.resets > 0 && self.output_health.last_ok.is_none())
-    }
-
-    fn reset_audio_output(&mut self, now: Clock) -> Response {
-        if !self.can_rearm_output() {
-            return Response::line("error: this machine must own the ready AirPods output, with no handoff or reset in progress");
-        }
-        let Some(output) =
-            self.config.accessory.and_then(|a| self.output_health.output(a)).cloned()
-        else {
-            return Response::line("error: no AirPods audio output");
-        };
-        self.output_health.started(now.mono);
-        self.rearm_output = Some(output);
-        Response::line("accepted: reopening AirPods audio output")
-    }
-
     /// The accessory's card and its active A2DP playback profile.
     pub(crate) fn playback_card(&self) -> Option<(String, String)> {
         let address = self.config.accessory?;
@@ -3409,27 +3384,6 @@ impl Daemon {
             self.last_graph.as_ref()?.cards.iter().find(|card| card.address == Some(address))?;
         let profile = card.active.as_deref().filter(|profile| profile.starts_with("a2dp-sink"))?;
         Some((card.name.clone(), profile.to_string()))
-    }
-
-    pub(crate) fn pace_output_health(&mut self, now: Clock) -> Option<crate::step::Effect> {
-        let eligible = self.can_rearm_output() && self.audio.local_playing();
-        let output = self.rearm_output.take().or_else(|| {
-            self.output_health.check(
-                self.config.accessory,
-                self.last_graph.as_ref(),
-                eligible,
-                now.mono,
-            )
-        })?;
-        eprintln!(
-            "fleetpodsd: reopening audio output sink={:?} state={} reset={}",
-            output.name, output.state, self.output_health.resets
-        );
-        Some(crate::step::Effect::RearmOutput {
-            id: self.output_health.resets,
-            index: output.index,
-            name: output.name,
-        })
     }
 
     fn fleet(&mut self, command: FleetCommand, now: Clock) -> Response {
@@ -6462,123 +6416,6 @@ mod tests {
             0x45, 0x85,
         ]);
         frame
-    }
-
-    #[test]
-    fn output_recovery_is_local_bounded_and_preserves_pairing() {
-        use crate::audio::health::Output;
-        use crate::audio::route::{Graph, LiveStream, Sink};
-        use crate::step::{Effect, Input};
-        for scenario in ["fault", "healthy", "paused", "peer", "sleep"] {
-            let mut daemon = Daemon::new("xps");
-            let now = clock();
-            ready_link(&mut daemon, now);
-            daemon.step(Input::Bonded { address: addr(3), saved: true }, now);
-            daemon
-                .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
-            daemon.step(
-                Input::Player {
-                    service: "org.mpris.MediaPlayer2.brave".into(),
-                    playing: Some(false),
-                },
-                now,
-            );
-            daemon.step(
-                Input::Player {
-                    service: "org.mpris.MediaPlayer2.brave".into(),
-                    playing: Some(true),
-                },
-                now,
-            );
-            let graph = Graph {
-                default_sink: "pods".into(),
-                sinks: vec![Sink {
-                    name: "pods".into(),
-                    address: Some(addr(3)),
-                    profile: Some("a2dp-sink".into()),
-                }],
-                cards: vec![],
-                streams: vec![LiveStream {
-                    id: 9,
-                    generation: 9,
-                    sink: "pods".into(),
-                    role: "".into(),
-                    node: "Brave".into(),
-                    mute: false,
-                    volume: 1.0,
-                    corked: false,
-                }],
-            };
-            daemon.step(Input::Audio(graph), now);
-            assert!(daemon.can_rearm_output());
-            daemon.step(
-                Input::Outputs(vec![Output {
-                    name: "pods".into(),
-                    index: 7,
-                    address: Some(addr(3)),
-                    profile: Some("a2dp-sink".into()),
-                    state: if scenario == "healthy" { 0 } else { 2 },
-                    muted: false,
-                    audible_volume: true,
-                }]),
-                now,
-            );
-            match scenario {
-                "paused" => {
-                    daemon.audio.update_player("org.mpris.MediaPlayer2.brave", Some(false));
-                }
-                "peer" => {
-                    daemon.step(
-                        Input::Observation(crate::pods::observe::Observation::Ownership(false)),
-                        now,
-                    );
-                }
-                "sleep" => {
-                    daemon.step(Input::Suspend, now);
-                }
-                _ => {}
-            }
-            daemon.step(Input::Tick, now);
-            let later = Clock::new(now.mono.0 + 3_100, now.unix.0 + 3_100);
-            let result = daemon.step(Input::Tick, later);
-            assert_eq!(
-                result.effects.iter().any(|e| matches!(e, Effect::RearmOutput { index: 7, .. })),
-                scenario == "fault",
-                "{scenario}"
-            );
-            assert!(
-                !result.effects.iter().any(|e| matches!(
-                    e,
-                    Effect::RemoveDevice { .. }
-                        | Effect::Disconnect { .. }
-                        | Effect::WriteSecret { .. }
-                )),
-                "{scenario}"
-            );
-            assert_eq!(daemon.config.accessory, Some(addr(3)));
-            assert_eq!(daemon.status_value(later)["bluetooth_bonded"], true);
-            if scenario == "healthy" {
-                let manual = daemon.step(Input::Command(Command::AudioReset), later);
-                assert!(manual.reply.unwrap().starts_with("accepted:"));
-                assert!(manual
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::RearmOutput { index: 7, .. })));
-                assert!(!manual
-                    .effects
-                    .iter()
-                    .any(|e| matches!(e, Effect::Disconnect { .. } | Effect::RemoveDevice { .. })));
-            }
-            if scenario == "fault" {
-                let duplicate = daemon.step(Input::Command(Command::AudioReset), later);
-                assert!(duplicate.reply.unwrap().starts_with("error:"));
-                assert!(!duplicate.effects.iter().any(|e| matches!(e, Effect::RearmOutput { .. })));
-                daemon.step(Input::OutputRearmed { id: 99, ok: true }, later);
-                assert_eq!(daemon.output_health.last_ok, None);
-                daemon.step(Input::OutputRearmed { id: 1, ok: true }, later);
-                assert_eq!(daemon.output_health.last_ok, Some(true));
-            }
-        }
     }
 
     pub(super) fn ready_link(daemon: &mut Daemon, now: Clock) {
@@ -10792,12 +10629,18 @@ mod tests {
 
     #[test]
     fn a_peer_pause_quiets_status_and_activity_claims_only_the_idle_owner() {
+        use crate::fleet::members::Fleet;
         use crate::step::{Effect, Input};
         let mut daemon = Daemon::new("xps");
         let mut now = clock();
         let local = addr(2);
         let gram = addr(4);
         daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![Member { address: gram, label: "lg-gram".into() }],
+        });
         ready_link(&mut daemon, now);
         daemon.note_pod_peers(vec![local, gram], now.unix);
         let generation = daemon.connection.generation();
@@ -10867,6 +10710,54 @@ mod tests {
         assert_eq!(daemon.status_value(now)["audio_owner"]["playing"], false);
         daemon.drop_reports();
         assert!(daemon.peer_playback.is_empty());
+    }
+
+    #[test]
+    fn activity_does_not_interrupt_an_outside_device_that_just_joined() {
+        use crate::step::{Effect, Input};
+        let mut daemon = Daemon::new("xps");
+        let mut now = clock();
+        let local = addr(2);
+        let phone = addr(7);
+        daemon.set_local_address(Some(local));
+        ready_link(&mut daemon, now);
+        daemon.note_pod_peers(vec![local, phone], now.unix);
+        // The phone just took the roster and has not started playing yet:
+        // it is joining, not idle.
+        daemon.step(
+            Input::Observation(crate::pods::observe::Observation::Source {
+                local: false,
+                kind: 2,
+                remote: Some(phone),
+            }),
+            now,
+        );
+        daemon.note_peer_playback(phone, false, now);
+        let claims = |outcome: &crate::step::StepOutcome| {
+            outcome
+                .effects
+                .iter()
+                .filter(|effect| {
+                    matches!(effect,
+                        Effect::WriteControl { bytes, .. }
+                            if *bytes == crate::pods::setup::ownership(true))
+                })
+                .count()
+        };
+        assert_eq!(
+            claims(&daemon.step(Input::Command(Command::Activity), now)),
+            0,
+            "desktop activity must not snatch the pods from a device still joining"
+        );
+        // Once the phone has been idle well past the join window, activity
+        // may claim as before.
+        now.mono.0 += 10_001;
+        now.unix.0 += 10_001;
+        assert_eq!(
+            claims(&daemon.step(Input::Command(Command::Activity), now)),
+            1,
+            "an outside device idle past the join window can be claimed"
+        );
     }
 
     #[test]
@@ -11157,6 +11048,7 @@ mod tests {
 
     #[test]
     fn fresh_activity_waits_for_peer_pause_but_expires_without_claiming() {
+        use crate::fleet::members::{Fleet, Member};
         use crate::step::{Effect, Input};
         for delay in [3_500, 5_001] {
             let mut daemon = Daemon::new("xps");
@@ -11164,6 +11056,11 @@ mod tests {
             let local = addr(2);
             let gram = addr(4);
             daemon.set_local_address(Some(local));
+            daemon.restore_fleet(Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![Member { address: gram, label: "lg-gram".into() }],
+            });
             ready_link(&mut daemon, now);
             daemon.note_pod_peers(vec![local, gram], now.unix);
             daemon.step(
@@ -11196,12 +11093,18 @@ mod tests {
 
     #[test]
     fn startup_roster_owner_allows_idle_activity_without_replaying_satisfied_input() {
+        use crate::fleet::members::Fleet;
         use crate::step::{Effect, Input};
         let local = addr(2);
         let peer = addr(4);
         let mut daemon = Daemon::new("xps");
         let mut now = clock();
         daemon.set_local_address(Some(local));
+        daemon.restore_fleet(Fleet {
+            id: FleetId::new([3; 16]),
+            key: GroupKey::new([0x11; 32]),
+            members: vec![Member { address: peer, label: "lg-gram".into() }],
+        });
         ready_link(&mut daemon, now);
         let generation = daemon.connection.generation();
         let roster = |owner| {

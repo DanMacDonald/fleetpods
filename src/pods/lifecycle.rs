@@ -109,14 +109,26 @@ pub struct Facts<'a> {
     pub control: Stage,
     pub bluetooth: Option<bool>,
     pub may_open: bool,
+    pub intent: Intent,
     pub early_audio_allowed: bool,
-    pub wants_audio: bool,
     pub graph: Option<&'a Graph>,
     pub selected_codec: Option<&'a str>,
     pub routed: bool,
     pub recovering: bool,
+    pub output_running: bool,
     pub transport_active: bool,
 }
+/// What this connection attempt is allowed to do. Opening the control
+/// link (background join) is not permission to take audio; only a
+/// playback claim carries that intent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Intent {
+    /// Open the control link and stop at control-ready.
+    JoinInBackground,
+    /// Open the link and pursue audio through routing to streaming.
+    TakeAudio,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     OpenLink(Generation),
@@ -206,7 +218,7 @@ impl Lifecycle {
         if f.bluetooth == Some(false) {
             self.profiles = None;
         }
-        if !f.wants_audio {
+        if f.intent != Intent::TakeAudio {
             self.reset_audio();
         }
         // Cancellation and retry admission are owned by the link subtask.
@@ -247,7 +259,7 @@ impl Lifecycle {
         }
 
         self.state = State::PreparingPaths;
-        if !f.wants_audio {
+        if f.intent != Intent::TakeAudio {
             if ready {
                 self.state = State::ControlReady;
             } else {
@@ -300,6 +312,8 @@ impl Lifecycle {
         self.state = State::Routing;
         self.waiting_for = if !f.routed || f.recovering {
             "stream_route"
+        } else if !f.output_running {
+            "output_running"
         } else if !f.transport_active {
             "transport_active"
         } else {
@@ -359,7 +373,7 @@ impl Lifecycle {
         if self.codec.target.as_ref().is_some_and(|target| target.profile != profile) {
             self.codec = Codec::default();
         }
-        if f.control != Stage::Ready || !f.wants_audio || f.recovering {
+        if f.control != Stage::Ready || f.intent != Intent::TakeAudio || f.recovering {
             return;
         }
         let Some(card) = card(f) else { return };
@@ -413,12 +427,13 @@ mod tests {
             control: Stage::Connecting,
             bluetooth: Some(false),
             may_open: true,
+            intent: Intent::TakeAudio,
             early_audio_allowed: true,
-            wants_audio: true,
             graph: None,
             selected_codec: None,
             routed: false,
             recovering: false,
+            output_running: true,
             transport_active: false,
         }
     }
@@ -663,10 +678,10 @@ mod tests {
         f.selected_codec = Some("aac");
         let first = codec_request(l.advance(&f, MonoMs(0))).unwrap();
         l.note_codec(first, false, MonoMs(1));
-        f.wants_audio = false;
+        f.intent = Intent::JoinInBackground;
         assert!(codec_request(l.advance(&f, MonoMs(1_001))).is_none());
         assert!(codec_request(l.advance(&f, MonoMs(60_000))).is_none());
-        f.wants_audio = true;
+        f.intent = Intent::TakeAudio;
         let second = codec_request(l.advance(&f, MonoMs(60_001))).unwrap();
         assert!(!l.note_codec(first, true, MonoMs(60_002)));
         let mut replacement = g.clone();
@@ -750,7 +765,7 @@ mod tests {
         f.transport_active = true;
         assert!(l.advance(&f, MonoMs(4)).is_empty());
         assert_eq!(l.progress().state, State::Streaming);
-        f.wants_audio = false;
+        f.intent = Intent::JoinInBackground;
         l.advance(&f, MonoMs(5));
         assert!(!l.note_audio(id, TransportReply::Connected, MonoMs(6)));
         assert_ne!(l.progress().state, State::Streaming);
@@ -788,13 +803,13 @@ mod tests {
     fn background_links_and_cancellation_do_not_start_audio() {
         let mut l = Lifecycle::default();
         let mut f = facts();
-        f.wants_audio = false;
+        f.intent = Intent::JoinInBackground;
         assert_eq!(l.advance(&f, MonoMs(0)), vec![Action::OpenLink(f.generation)]);
         f.control = Stage::Ready;
         f.bluetooth = Some(true);
         assert!(l.advance(&f, MonoMs(1)).is_empty());
         assert_eq!(l.progress().state, State::ControlReady);
-        f.wants_audio = true;
+        f.intent = Intent::TakeAudio;
         let actions = l.advance(&f, MonoMs(2));
         let [Action::ConnectAudio(id)] = actions.as_slice() else { panic!("{actions:?}") };
         f.control = Stage::Interrupted;

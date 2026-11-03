@@ -151,6 +151,8 @@ Item {
   property bool conversationalAwareness: false
   property int earDetectionBehavior: Model.EAR_PAUSE_ONE_OUT
   property string caseIconState: "closed"
+  // The initial "closed" is a placeholder until actual placement is known.
+  property bool caseIconReady: false
   property bool lastAnyInEar: false
   property var rememberedPlacement: ({ left: null, right: null })
   property bool schemaUnsupported: false
@@ -197,6 +199,7 @@ Item {
   // The daemon removes the file when it stops, so an absent file is a stopped daemon.
   function resetConnectionState() {
     caseIconState = "closed"
+    caseIconReady = false
     lastAnyInEar = false
     rememberedPlacement = { left: null, right: null }
     _queued = null
@@ -220,6 +223,7 @@ Item {
       if (activityHold && routeFailedSinceRequest()) releaseActivityHold()
     }
     tickCaseIcon()
+    caseIconReady = caseIconReady || Model.casePlacementKnown(view)
     if (status.earReported) lastAnyInEar = status.left.inEar || status.right.inEar
     noiseMode = _settle("noiseMode", status.noiseMode)
     adaptiveNoiseLevel = _settle("adaptiveNoiseLevel", status.adaptiveNoiseLevel)
@@ -320,12 +324,6 @@ Item {
       view.left, view.right, caseIconState, lastAnyInEar,
       view.lastAdvertisementMs, caseIconNowMs(view.lastAdvertisementMs), 20000, view.connected, view.earReported,
       (!view.bluetoothPaired || !view.pairingKeysReady), rememberedPlacement)
-  }
-
-  // Make another known pair the selected one (multi-accessory switcher).
-  function selectAccessory(address) {
-    if (!address) return
-    _send("select:" + address)
   }
 
   // The status log holds the optimistic claim and release from the send event.
