@@ -2456,6 +2456,21 @@ check('restored membership clears the keyring wait',
     connectedPeers: [address], audioOwner: LOCAL_PLAYING }
   state = Model.statusLog(state, { ev: 'status', t: 3000, status: ready })
   check('control readiness does not replace Playing', state.subtitle, 'Omarchy fleet · omarchy-xps · Playing')
+  // Switching from buds to an already-streaming Max still needs a new
+  // connection row. Suppressing setup progress must not hide ready evidence.
+  const pro = { ...ready, audioTransportActive: false, modelName: "AirPods Pro 3",
+    accessories: [{ address: "02:00:00:00:00:11", selected: true }] }
+  const max = { ...ready, modelName: "AirPods Max 2", isHeadset: true,
+    accessories: [{ address: "02:00:00:00:00:12", selected: true }] }
+  let switched = Model.statusLog(null, { ev: "status", t: 4000, status: pro })
+  switched = Model.statusLog(switched, { ev: "status", t: 5000, status: max })
+  check("streaming accessory switch preserves and labels both connection rows",
+    switched.rows.filter(r => r.event && r.event.kind === "connected").map(r => [r.accessory, r.message]),
+    [["AirPods Pro 3", "AirPods Pro 3 connected."], ["AirPods Max 2", "AirPods Max 2 connected."]])
+  const rowCount = switched.rows.length
+  switched = Model.statusLog(switched, { ev: "status", t: 6000, status: max })
+  check("streaming connection refresh does not duplicate history", switched.rows.length, rowCount)
+
   for (const [label, patch] of [
     ['transport stops', { audioTransportActive: false }],
     ['Bluetooth drops', { bluezConnected: false }],

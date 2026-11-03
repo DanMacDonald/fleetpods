@@ -1923,8 +1923,10 @@ function statusLogInputs(s, now) {
   var fleetView = seat.fleetView, previous = seat.previousConnection
   var inCase = pods.caseConfirmedDocked || confirmedInCase(pods.iconLidState, pods.leftPod, pods.rightPod)
   var caseClosed = podsInClosedCase(pods)
-  var control = pods.transportPlaybackConfirmed ? null
-    : caseQuietConnection(pods.controlConnection, inCase && pods.iconLidState !== LID_OPEN)
+  var control = caseQuietConnection(pods.controlConnection, inCase && pods.iconLidState !== LID_OPEN)
+  // Playback hides setup progress, not a completed connection. A new accessory
+  // can already be streaming when its first ready status reaches the panel.
+  if (pods.transportPlaybackConfirmed && control && (control.stage !== "ready" || control.peer_reconnect)) control = null
   // A link lost during admission belongs to the fleet switch.
   if (s.seatHandoff && control && control.stage === "interrupted") control = null
   var controlDescription = controlConnectionLabel(control)
