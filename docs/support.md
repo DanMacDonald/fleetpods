@@ -43,8 +43,13 @@ zero errors. Popping continued after stopping both FleetPods daemons with playba
 uninterrupted, then settled. This does not establish whether earlier setup caused
 it, but removal/resume and ongoing daemon traffic are not required for it to
 continue. Replaying the affected passage reproduced pops at the same timestamps,
-which points toward the source recording or content-dependent playback; a speaker
-comparison is still needed. No codec or buffer workaround was applied.
+which points toward the source recording or content-dependent playback. The user
+did not notice the pops on PC speakers, so a recording-only explanation remains
+unconfirmed. No codec or buffer workaround was applied.
+
+A later Max 2 capture confirmed separate left/right cup readings in the control
+wear report. The parser now preserves both, allowing the existing one-part
+removal policy to pause on either lift. See the [capture and validation status](wear-transitions.md#max-2-cup-capture-2026-11-03).
 
 ## Microphone and case display
 

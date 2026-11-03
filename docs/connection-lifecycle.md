@@ -83,15 +83,26 @@ that uncertain slot preserves the failed registration's budget. Cleanup replies
 are tagged so an old success cannot remove a replacement registration.
 
 Max 2 wear is an observation, not another connection lifecycle. `pods::air` decodes
-the model-specific bits; headset control placement reports feed the same aggregate
-observation. `Accessory` owns that observation and source precedence: after a control
+the model-specific aggregate bits; headset control reports preserve both cup
+readings. `Accessory` owns that observation and source precedence: after a control
 wear report arrives, advertisements cannot overwrite it until the link ends or the
 selected accessory changes. Battery-only reports do not invent wear. `Accessory`
 answers wear/availability queries. Existing saved-address and IRK checks
 gate updates to a saved accessory. Tracked wear feeds the existing selection gates;
 selected wear feeds the existing insertion and owned-player pause/resume debounce.
-Headset removal settles after 100 ms; earbud reports and re-wear retain 400 ms.
-Both use the same pending deadline and pause/resume owner.
+Lifting either headset cup settles after 100 ms; earbud reports and full re-wear
+retain 400 ms. Both cups feed the existing configurable one/two-part removal
+policy on Max 2; one cup still worn does not permit the off-head speaker fallback.
+Older and unidentified headsets retain the primary-reading policy until their
+two-cup layout is verified. Accessory owns that model decision and keeps both raw
+readings; setup does not acquire a separate model lifetime.
+Both use the same pending deadline and pause/resume owner. Wear events apply one
+action from `Audio::ears`; timer ticks settle outstanding debounce deadlines.
+A subsequent manual Play while the Max is confirmed off-head uses the existing
+speaker fallback, just like Play while buds are docked. `Accessory::playback_blocked`
+owns that decision for playback, deferred claims, peer intent and output repair;
+removal alone still pauses without rerouting. See the [wear transition audit](wear-transitions.md)
+for equivalent behavior, deliberate case-only rules and remaining display gaps.
 A new accessory's first report is not an insertion, and removal retires pending
 insertion intent. No timer, retry loop or connection launch lives in the BLE
 handler. Background admission uses the same availability query as preferred-host

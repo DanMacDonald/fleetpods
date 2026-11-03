@@ -101,6 +101,26 @@
       "pattern": "^Connecting to AirPods\\.\\.\\.(?! Connected!)",
       "why": "Name the laptop initiating the connection (2026-10-13).",
       "with": "Connecting omarchy-xps to AirPods..."
+    },
+    {
+      "pattern": "^AirPods(?= (?:connected|audio|connection retry))",
+      "with": "AirPods Pro 3",
+      "why": "Connection and audio events use the known accessory model instead of the scrubbed generic name (2026-11-03)."
+    },
+    {
+      "pattern": "^(Connected to |Connecting to |Connecting (?:omarchy-xps|lg-gram) to )AirPods(?=\\.| alongside)",
+      "with": "$1AirPods Pro 3",
+      "why": "Connection and audio events use the known accessory model instead of the scrubbed generic name (2026-11-03)."
+    },
+    {
+      "pattern": "^(.+) is not connected to the AirPods\\.$",
+      "with": "$1 is not connected to AirPods Pro 3.",
+      "why": "Connection and audio events use the known accessory model instead of the scrubbed generic name (2026-11-03)."
+    },
+    {
+      "pattern": "^(Connected elsewhere\\.|.+ is connected\\.) The AirPods are available\\.$",
+      "with": "$1 AirPods Pro 3 are available.",
+      "why": "Connection and audio events use the known accessory model instead of the scrubbed generic name (2026-11-03)."
     }
   ],
   "replace": [
@@ -208,8 +228,8 @@
   "amend": [
     {
       "t": 1791426144043,
-      "message": "Connecting to AirPods... Connected!",
-      "with": "Connected to AirPods alongside lg-gram.",
+      "message": "Connecting to AirPods Pro 3... Connected!",
+      "with": "Connected to AirPods Pro 3 alongside lg-gram.",
       "kind": "success",
       "why": "The late fleet confirmation identifies the retained laptop and completes the existing success message."
     },
@@ -218,28 +238,28 @@
       "message": "Waiting for lg-gram to disconnect...",
       "live": true,
       "why": "Admission advances the existing row before the next control snapshot.",
-      "with": "Connecting omarchy-xps to AirPods..."
+      "with": "Connecting omarchy-xps to AirPods Pro 3..."
     },
     {
       "t": 1791426285741,
       "message": "Waiting for lg-gram to disconnect...",
       "live": true,
       "why": "Admission advances the existing row before the next control snapshot.",
-      "with": "Connecting omarchy-xps to AirPods..."
+      "with": "Connecting omarchy-xps to AirPods Pro 3..."
     },
     {
       "t": 1791426309961,
       "message": "Waiting for lg-gram to disconnect...",
       "live": true,
       "why": "Admission advances the existing row before the next control snapshot.",
-      "with": "Connecting omarchy-xps to AirPods..."
+      "with": "Connecting omarchy-xps to AirPods Pro 3..."
     },
     {
       "t": 1791426401982,
-      "message": "Connecting omarchy-xps to AirPods... (Retrying)",
+      "message": "Connecting omarchy-xps to AirPods Pro 3... (Retrying)",
       "live": false,
       "why": "The visible attempt ends when BlueZ reports failure.",
-      "with": "Connecting omarchy-xps to AirPods... (Retrying)"
+      "with": "Connecting omarchy-xps to AirPods Pro 3... (Retrying)"
     }
   ],
   "start": [

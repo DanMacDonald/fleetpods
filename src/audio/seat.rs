@@ -55,8 +55,8 @@ pub struct Inputs<'a> {
     pub routed_here: bool,
     /// Playback observed on this machine, when a player reported it.
     pub observed_local: Option<bool>,
-    /// Both buds docked silences any playing reading.
-    pub both_docked: bool,
+    /// Confirmed docking or off-head wear silences any playing reading.
+    pub playback_blocked: bool,
 }
 
 /// How long an explicit user switch outranks a remote resumption.
@@ -207,7 +207,7 @@ impl Seat {
     }
 
     /// Interpret who holds audio, including observed playback and the
-    /// docked silence. `observed_remote` is looked up only when the
+    /// confirmed removal. `observed_remote` is looked up only when the
     /// resolved holder names a peer.
     pub fn resolve(
         &self,
@@ -236,7 +236,7 @@ impl Seat {
             }
             _ => {}
         }
-        if inputs.both_docked {
+        if inputs.playback_blocked {
             match &mut resolved.holder {
                 Holder::Local { playing } | Holder::Remote { playing, .. } => *playing = false,
                 Holder::Unknown => {}
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn docked_buds_silence_the_resolved_holder() {
+    fn blocked_playback_silences_the_resolved_holder() {
         let seat = Seat::new();
         let resolved = seat.resolve(
             Inputs {
@@ -574,7 +574,7 @@ mod tests {
                 local_playing: true,
                 routed_here: true,
                 observed_local: None,
-                both_docked: true,
+                playback_blocked: true,
             },
             &|_| None,
         );

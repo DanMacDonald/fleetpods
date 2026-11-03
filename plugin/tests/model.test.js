@@ -371,9 +371,25 @@ check("elideError copes with nothing", Model.elideError(null), "")
 const max = Model.parseStatus('{"connected":true,"device_name":"AirPods Max","headset":{"available":true,"charging":false,"level":100},"is_headset":true,"model_name":"AirPods Max","noise_mode":1,"schema_version":1}')
 check("max line parses", max.ok, true)
 check("max is flagged a headset", max.isHeadset, true)
-check("max headset level", max.headset, { level: 100, charging: false })
+check("max headset level", max.headset, { level: 100, charging: false, worn: null })
 check("max has no pods", max.left.level, Model.LEVEL_UNKNOWN)
 check("max has no case", max.caseBattery.level, Model.LEVEL_UNKNOWN)
+
+// Wear is independent of battery availability, and unknown is not removal.
+for (const worn of [true, false, null, undefined, 0, 1, "false"]) {
+  const expected = typeof worn === "boolean" ? worn : null
+  const status = Model.parseStatus(JSON.stringify({ schema_version: 1, connected: true,
+    is_headset: true, headset: { available: false, worn } }))
+  check("headset wear parses strictly: " + worn, status.headset.worn, expected)
+  const log = Model.statusLog(null, { ev: "status", t: 1000, status })
+  check("headset wear reaches panel: " + worn, log.view.headset.worn, expected)
+  check("wear alone does not invent battery: " + worn, log.view.headset.level, Model.LEVEL_UNKNOWN)
+  check("off-head retains connection: " + worn, log.view.connected, true)
+  check("off-head has no case: " + worn, Model.confirmedInCase(log.view), false)
+  check("off-head unavailable output is not a fault: " + worn,
+    Model.localAudioLabel("unavailable", "", log.view.headset.worn),
+    worn === false ? "Connected" : "Audio unavailable")
+}
 
 // Between connect and the first battery packet the daemon sends the flag with no headset object at all.
 const maxFresh = Model.parseStatus('{"connected":true,"is_headset":true,"noise_mode":1,"schema_version":1}')
@@ -2492,8 +2508,8 @@ check('restored membership clears the keyring wait',
     bluetoothPaired: true, pairingKeysReady: true, isHeadset: true,
     localName: 'omarchy-xps', controlConnection: { stage: 'ready' } }
   for (const [deviceName, modelName, expected] of [
-    ['AirPods Max 2', 'AirPods Max', 'AirPods Max 2'],
-    ["Owner’s headphones", 'AirPods Max', "Owner’s headphones"],
+    ['AirPods Max 2', 'AirPods Max', 'AirPods Max'],
+    ["Owner’s headphones", 'AirPods Max', "AirPods Max"],
     ['', 'AirPods Max 2', 'AirPods Max 2'],
     ['  ', '', 'AirPods Max']
   ]) {
@@ -2526,6 +2542,41 @@ check('restored membership clears the keyring wait',
   check('audio handoff identifies accessory and host',
     Model.statusText({ kind: 'audioTaken', accessory: 'AirPods Max 2', device: 'lg-gram' }),
     'AirPods Max 2 audio moved to lg-gram.')
+}
+
+
+// An attempt can begin before identity arrives; its completed row must use
+// the now-known model, including the alongside confirmation.
+{
+  const local = '02:00:00:00:00:01', peer = '02:00:00:00:00:02'
+  const base = { ...Model.defaultStatus(), ok: true, bluetoothPaired: true, pairingKeysReady: true,
+    accessories: [{ address: '70:F9:4A:BA:19:81', selected: true }],
+    localAddress: local, localName: 'omarchy-xps',
+    devices: { [peer]: { kind: 'omarchy', label: 'lg-gram' } } }
+  let log = Model.statusLog(null, { ev: 'status', t: 1000,
+    status: { ...base, controlConnection: { stage: 'connecting' } } })
+  const attemptId = log.rows.find(r => r.live).id
+  const ready = { ...base, connected: true, bluezConnected: true, isHeadset: true,
+    deviceName: 'Dan’s AirPods Max', modelName: 'AirPods Max 2',
+    controlConnection: { stage: 'ready' }, connectedPeers: [local, peer], peerListUpdated: 2000 }
+  log = Model.statusLog(log, { ev: 'status', t: 2000, status: ready })
+  const completed = log.rows.find(r => r.id === attemptId)
+  check('late identity completes the same connection attempt', completed.live, false)
+  check('late identity names the model in alongside success', completed.message,
+    'Connected to AirPods Max 2 alongside lg-gram.')
+  check('console keeps the completed model', completed.accessory, 'AirPods Max 2')
+}
+
+// Audio handoffs use the same selected model as connection rows.
+{
+  const identity = { modelName: 'AirPods Max 2', deviceName: 'Dan’s AirPods Max', isHeadset: true }
+  let log = Model.statusLog(null, { ev: 'status', t: 1000,
+    status: { ...Model.defaultStatus(), ...podsOutput, ...identity, ok: true } })
+  log = Model.statusLog(log, { ev: 'status', t: 2000,
+    status: { ...Model.defaultStatus(), ...phonePlayback, ...identity, ok: true } })
+  const moved = log.rows.find(r => r.event && r.event.kind === 'audioTaken')
+  check('phone takeover log names the selected model', moved && moved.message,
+    'AirPods Max 2 audio moved to iPhone.')
 }
 
 if (failures > 0) {

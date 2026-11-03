@@ -30,10 +30,11 @@ pub struct Placement {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct HeadWear {
-    worn: bool,
-    /// Control reports stand until link loss; advertisements are only a fallback.
-    control: bool,
+enum HeadWear {
+    /// BLE confirms aggregate wear, not how many cups are worn.
+    Advertised(bool),
+    /// Control reports stand until link loss and preserve both cup readings.
+    Control { primary: Option<bool>, secondary: Option<bool> },
 }
 
 #[derive(Clone, Debug)]
@@ -51,7 +52,7 @@ pub struct Accessory {
     pub right_placement: Evidence<Placement>,
     pub case_battery: Evidence<Battery>,
     pub headset: Evidence<Battery>,
-    /// Aggregate head wear, separate from earbud placement and battery.
+    /// Head wear and its source, separate from earbud placement and battery.
     head_worn: Evidence<HeadWear>,
     pub lid: Lid,
     pub noise: Evidence<NoiseMode>,
@@ -167,36 +168,60 @@ impl Accessory {
 
     pub fn note_head_worn(&mut self, worn: bool, at: MonoMs) {
         if !self.control_head_wear() {
-            self.head_worn = Evidence::fresh(HeadWear { worn, control: false }, at);
+            self.head_worn = Evidence::fresh(HeadWear::Advertised(worn), at);
             self.ear_reported = true;
         }
     }
 
-    pub fn note_control_head_worn(&mut self, worn: bool, at: MonoMs) {
-        self.head_worn = Evidence::fresh(HeadWear { worn, control: true }, at);
+    pub fn note_control_head_wear(
+        &mut self,
+        primary: Option<bool>,
+        secondary: Option<bool>,
+        at: MonoMs,
+    ) {
+        self.head_worn = Evidence::fresh(HeadWear::Control { primary, secondary }, at);
         self.ear_reported = true;
     }
 
     pub fn head_worn(&self) -> Option<bool> {
-        self.head_worn.as_fresh().map(|wear| wear.worn)
+        let (primary, secondary) = self.head_wear_state()?;
+        any_worn(primary, secondary)
+    }
+
+    fn head_wear_state(&self) -> Option<(Option<bool>, Option<bool>)> {
+        match self.head_worn.as_fresh()? {
+            HeadWear::Advertised(worn) => Some((Some(*worn), Some(*worn))),
+            HeadWear::Control { primary, secondary } => {
+                // Only Max 2 has verified independent cup reports. Older and
+                // unidentified headsets retain their primary-only wear policy.
+                let secondary = if self.model == Model::AirPodsMax2 { secondary } else { primary };
+                Some((*primary, *secondary))
+            }
+        }
     }
 
     fn control_head_wear(&self) -> bool {
-        self.head_worn.as_fresh().is_some_and(|wear| wear.control)
+        matches!(self.head_worn.as_fresh(), Some(HeadWear::Control { .. }))
     }
 
-    /// One wear observation for selection and insertion policy. Missing or
-    /// stale evidence stays unknown; a headset never invents earbud placement.
-    pub fn wearing(&self) -> Option<bool> {
+    /// Inputs for the existing two-part pause policy. Aggregate BLE wear cannot
+    /// distinguish one-cup removal; only control reports supply that detail.
+    pub fn wear_state(&self) -> (Option<bool>, Option<bool>) {
+        if let Some(wear) = self.head_wear_state() {
+            return wear;
+        }
         if self.model.is_headset() {
-            return self.head_worn();
+            return (None, None);
         }
         let ear = |pod: &Evidence<Placement>| pod.as_fresh().and_then(|pod| pod.in_ear);
-        match (ear(&self.left_placement), ear(&self.right_placement)) {
-            (Some(true), _) | (_, Some(true)) => Some(true),
-            (Some(false), Some(false)) => Some(false),
-            _ => None,
-        }
+        (ear(&self.left_placement), ear(&self.right_placement))
+    }
+
+    /// At least one bud/cup is worn. Missing or stale evidence stays unknown;
+    /// a headset never invents earbud placement.
+    pub fn wearing(&self) -> Option<bool> {
+        let (primary, secondary) = self.wear_state();
+        any_worn(primary, secondary)
     }
 
     pub fn note_lid(&mut self, state: LidState, at: MonoMs) {
@@ -228,6 +253,14 @@ impl Accessory {
                     .as_fresh()
                     .is_some_and(|pod| pod.in_ear == Some(true) || pod.in_case == Some(false))
         })
+    }
+
+    /// Positive evidence that a new play belongs on the speakers, even if
+    /// Bluetooth stays connected. Unknown wear does not reject a ready link.
+    pub fn playback_blocked(&self) -> bool {
+        self.stowed()
+            || self.both_docked()
+            || (self.model.is_headset() && self.head_worn() == Some(false))
     }
 
     /// A closed case stops advertising. Keep the connection hold until a newer
@@ -312,6 +345,14 @@ impl Accessory {
     }
 }
 
+fn any_worn(primary: Option<bool>, secondary: Option<bool>) -> Option<bool> {
+    match (primary, secondary) {
+        (Some(true), _) | (_, Some(true)) => Some(true),
+        (Some(false), Some(false)) => Some(false),
+        _ => None,
+    }
+}
+
 impl Default for Accessory {
     fn default() -> Self {
         Self::new()
@@ -323,11 +364,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn independent_cups_require_a_verified_model() {
+        // Compatibility policy, not captures from these older models: an
+        // unverified second reading must not disable their primary wear signal.
+        for sku in ["A2096", "A3184", ""] {
+            let mut accessory = Accessory::new();
+            accessory.set_identity("Max", sku);
+            for secondary in [None, Some(true), Some(false)] {
+                for primary in [Some(true), Some(false), None] {
+                    accessory.note_control_head_wear(primary, secondary, MonoMs(0));
+                    assert_eq!(accessory.wear_state(), (primary, primary));
+                    assert_eq!(accessory.head_worn(), primary);
+                }
+            }
+        }
+        let mut accessory = Accessory::new();
+        accessory.note_control_head_wear(Some(false), Some(true), MonoMs(0));
+        assert_eq!(accessory.head_worn(), Some(false));
+        accessory.set_identity("Max", "A3454");
+        assert_eq!(accessory.wear_state(), (Some(false), Some(true)));
+        assert_eq!(accessory.head_worn(), Some(true), "late identity keeps both raw readings");
+        assert!(!accessory.playback_blocked());
+        accessory.note_control_head_wear(Some(false), None, MonoMs(1));
+        assert_eq!(accessory.head_worn(), None, "unknown second cup is not full removal");
+        assert!(!accessory.playback_blocked());
+    }
+
+    #[test]
     fn control_wear_stands_until_link_loss_then_advertisements_take_over() {
         let mut accessory = Accessory::new();
         accessory.set_identity("Max", "A3454");
         accessory.note_head_worn(true, MonoMs(0));
-        accessory.note_control_head_worn(false, MonoMs(1));
+        accessory.note_control_head_wear(Some(false), Some(false), MonoMs(1));
         accessory.note_head_worn(true, MonoMs(2));
         accessory.expire(MonoMs(REPORT_TTL_MS + 3), true);
         assert_eq!(accessory.wearing(), Some(false));

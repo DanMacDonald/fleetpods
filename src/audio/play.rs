@@ -441,7 +441,7 @@ impl Audio {
             return EarAction::Hold;
         }
         if !self.ears.pending.is_some_and(|(pending, _)| pending == removal) {
-            let delay = if headset && removal == Removal::Both {
+            let delay = if headset && removal != Removal::None {
                 HEAD_REMOVAL_DEBOUNCE_MS
             } else {
                 EAR_DEBOUNCE_MS

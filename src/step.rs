@@ -567,17 +567,6 @@ impl Daemon {
         match bud {
             crate::pods::setup::Bud::Headset => {
                 self.accessory.note_headset(battery, now);
-                if let Some(worn) = in_ear {
-                    let changed = self.accessory.head_worn() != Some(worn);
-                    self.accessory.note_control_head_worn(worn, now);
-                    self.note_ears(None, None, now, now);
-                    if changed {
-                        eprintln!(
-                            "fleetpodsd: {} control head wear worn={worn}",
-                            self.accessory.model.display_name()
-                        );
-                    }
-                }
             }
             crate::pods::setup::Bud::Left => {
                 self.note_pod(false, Pod { battery, in_ear, in_case }, now);
@@ -627,6 +616,16 @@ impl Daemon {
             Observation::Bud { bud, level, charging, place } => {
                 let (in_ear, in_case) = place_of(place);
                 self.note_bud(bud, level, charging, in_ear, in_case, now.mono);
+            }
+            Observation::HeadWear { primary, secondary } => {
+                let previous = self.accessory.wear_state();
+                self.accessory.note_control_head_wear(primary, secondary, now.mono);
+                self.note_ears(now.mono);
+                if previous != self.accessory.wear_state() {
+                    self.effects.announce_dirty = true;
+                    eprintln!("fleetpodsd: {} control head wear primary={primary:?} secondary={secondary:?}",
+                        self.accessory.model.display_name());
+                }
             }
             Observation::CaseBattery { level, charging } => {
                 self.note_battery(PodSlot::Case, level, charging, now.mono);

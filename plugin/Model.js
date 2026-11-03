@@ -99,7 +99,7 @@ function defaultStatus() {
     left: defaultPod(),
     right: defaultPod(),
     caseBattery: { level: LEVEL_UNKNOWN, charging: false },
-    headset: { level: LEVEL_UNKNOWN, charging: false },
+    headset: { level: LEVEL_UNKNOWN, charging: false, worn: null },
     // An older daemon omits the key. Absence is not "still learning".
     pairingKeysReady: true,
     bluetoothPaired: true,
@@ -403,7 +403,8 @@ function parseStatus(raw) {
   var caseRaw = podFrom(parsed["case"])
   status.caseBattery = { level: caseRaw.level, charging: caseRaw.charging }
   var headsetRaw = podFrom(parsed.headset)
-  status.headset = { level: headsetRaw.level, charging: headsetRaw.charging }
+  status.headset = { level: headsetRaw.level, charging: headsetRaw.charging,
+    worn: parsed.headset && typeof parsed.headset.worn === "boolean" ? parsed.headset.worn : null }
   return status
 }
 
@@ -1838,7 +1839,7 @@ function deviceNameMarkup(text, names, color) {
 // Capture the selected accessory on each row; history must not follow later selections.
 function accessoryLabel(status) {
   status = status || {}
-  return String(status.deviceName || "").trim() || String(status.modelName || "").trim()
+  return String(status.modelName || "").trim() || String(status.deviceName || "").trim()
     || (status.isHeadset ? "AirPods Max" : "AirPods")
 }
 
@@ -1944,7 +1945,8 @@ function statusLogInputs(s, now) {
   var guidanceVisible = pairingRequired || (caseClosed ? !pods.connected && !pods.bluezConnected : !connectionVisible)
   var idle = !taking && !pods.connecting && !pods.holdingOmarchySeat
   var localAudioResult = localAudio(pods.localAudioState, pods.localAudioFailure,
-    pods.isHeadset || pods.leftPod.inEar || pods.rightPod.inEar, pods.localPlaybackConfirmed, hostLabel(pods.localName),
+    pods.isHeadset ? pods.headset.worn : pods.leftPod.inEar || pods.rightPod.inEar,
+    pods.localPlaybackConfirmed, hostLabel(pods.localName),
     audioOwner(pods).holder === "local" && !audioOwner(pods).playing)
   // The local output can disappear before an ownership handoff completes.
   // Keep the seat's known owner in the header unless an actual failure is reported.
@@ -2084,7 +2086,7 @@ function statusLogNote(s, event, kind, live, detail) {
 }
 
 function statusLogReword(row, event, fields) {
-  event = accessoryEvent(event, row.accessory)
+  event = accessoryEvent(event, fields && fields.accessory || row.accessory)
   Object.assign(row, fields, { message: statusText(event), event: event })
 }
 
@@ -2099,6 +2101,9 @@ function statusLogConnection(s, control, current, fleetRetry, connectionHold, al
   if (control && control.stage === "failed" && !control.peer_reconnect && !s.caseRecoveryQuiet) s.connectionFailed = true
   var open = -1
   for (var i = s.rows.length - 1; i >= 0; --i) if (s.rows[i].live) { open = i; break }
+  // Identity can arrive during setup. This is still the same attempt; the
+  // accessory-switch path has already retired rows for a different device.
+  if (open >= 0) s.rows[open].accessory = accessoryLabel(s.status)
   // Keep the first step while the helper's empty roster arrives. Only admission
   // (or an actual local attempt) advances it to Connecting, not that withdrawal.
   var openEvent = open >= 0 ? s.rows[open].event : null
@@ -2208,7 +2213,7 @@ function statusLogRecord(s, input) {
     for (var i = s.rows.length - 1; i >= 0; --i) {
       var shown = s.rows[i].event
       if (shown && (shown.kind === "connected" || shown.kind === "joinedAlongside")) {
-        statusLogReword(s.rows[i], s.joinSuccess, { kind: "success" })
+        statusLogReword(s.rows[i], s.joinSuccess, { kind: "success", accessory: accessoryLabel(s.status) })
         break
       }
     }

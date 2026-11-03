@@ -391,6 +391,18 @@ impl Setup {
             return;
         };
         self.saw_ears = true;
+        if primary_bud == Bud::Headset {
+            // Max 2 capture: left lift 01 00, right lift 00 01, off 01 01.
+            // Battery has one headset entry; it does not limit wear to one cup.
+            let worn = |byte| match byte {
+                0 => Some(true),
+                1 => Some(false),
+                _ => None,
+            };
+            events
+                .push(Observation::HeadWear { primary: worn(primary), secondary: worn(secondary) });
+            return;
+        }
         // The report lists the pods by role, and the order comes from the last
         // battery report. Taking a pod out or docking it can hand the primary
         // role to the other pod before a battery report says so. Read with the
@@ -704,6 +716,37 @@ mod tests {
         packet.extend_from_slice(&[0x02, 0x01, 60, 0x01, 0x01]);
         packet.extend_from_slice(&[0x08, 0x01, 40, 0x02, 0x01]);
         packet
+    }
+
+    #[test]
+    fn max_cup_reports_survive_battery_order_and_battery_refreshes() {
+        let battery = [4, 0, 4, 0, 4, 0, 1, 1, 1, 80, 2, 1];
+        for ears_first in [false, true] {
+            let mut setup = Setup::new();
+            let ears = [4, 0, 4, 0, 6, 0, 0, 1]; // captured right-cup lift
+            let (first, second): (&[u8], &[u8]) =
+                if ears_first { (&ears, &battery) } else { (&battery, &ears) };
+            setup.observe(first, None, None);
+            let (_, events) = setup.observe(second, None, None);
+            assert!(events
+                .contains(&Observation::HeadWear { primary: Some(true), secondary: Some(false) }));
+            let (_, refreshed) = setup.observe(&battery, None, None);
+            assert!(
+                !refreshed.iter().any(|e| matches!(e, Observation::HeadWear { .. })),
+                "battery refresh must not synthesize aggregate wear over the cup report"
+            );
+            for (primary, secondary) in [(1, 0), (1, 1), (0, 0)] {
+                let (_, events) =
+                    setup.observe(&[4, 0, 4, 0, 6, 0, primary, secondary], None, None);
+                assert_eq!(
+                    events,
+                    vec![Observation::HeadWear {
+                        primary: Some(primary == 0),
+                        secondary: Some(secondary == 0),
+                    }]
+                );
+            }
+        }
     }
 
     #[test]

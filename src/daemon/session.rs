@@ -464,8 +464,8 @@ impl Daemon {
             Some("another laptop is preferred")
         } else if self.outside_device_playing(now) {
             Some("a device outside the fleet is playing")
-        } else if self.accessory.stowed() || self.accessory.both_docked() {
-            Some("the buds are docked")
+        } else if self.accessory.playback_blocked() {
+            Some("the selected accessory is stowed or removed")
         } else {
             None
         };
@@ -695,8 +695,7 @@ impl Daemon {
         if let PlaybackClaim::Deferred(at) = self.session.claim {
             if now.mono.saturating_since(at) > 30_000 || !self.audio.local_playing() {
                 self.session.claim = PlaybackClaim::Idle;
-            } else if !self.accessory.stowed()
-                && !self.accessory.both_docked()
+            } else if !self.accessory.playback_blocked()
                 && self.preferred_connection_allowed()
                 // Setup can complete with battery and roster reports alone.
                 // That says nothing about whether a docked bud has come out.
@@ -749,7 +748,7 @@ impl Daemon {
         self.session.background_requested = false;
         self.seat.note_failure(reason, now);
         if self.background_connection_allowed(now.mono)
-            && !self.accessory.both_docked()
+            && !self.accessory.playback_blocked()
             && self.enforce_connection_admission(now.mono)
         {
             // One delayed operation owns all attempts. The session supplies
@@ -779,7 +778,7 @@ impl Daemon {
     /// Player snapshots and new streams may use directly confirmed local
     /// ownership. Neither can turn an explicit release into a takeover.
     fn route_owned_playback(&mut self, new_stream: bool, now: Clock) {
-        if new_stream && self.accessory.both_docked() {
+        if new_stream && self.accessory.playback_blocked() {
             self.return_to_speakers(now);
             return;
         }
@@ -787,7 +786,7 @@ impl Daemon {
             || self.output.wants_output()
             || self.connection.stage() != Stage::Ready
             || self.audio.yielded()
-            || self.accessory.both_docked()
+            || self.accessory.playback_blocked()
             || (!new_stream
                 && (!self.accessory.model.is_headset()
                     || !self.audio.local_playing()
@@ -993,7 +992,9 @@ impl Daemon {
             PlaybackClaim::Deferred(at) => now.mono.saturating_since(at) <= INTENT_AIR_MS,
             PlaybackClaim::Idle => false,
         };
-        pending && self.accessory.ownership.as_fresh() != Some(&true) && !self.accessory.stowed()
+        pending
+            && self.accessory.ownership.as_fresh() != Some(&true)
+            && !self.accessory.playback_blocked()
     }
 
     /// A fleet peer announced it intends to claim this accessory. If this
@@ -1123,12 +1124,11 @@ impl Daemon {
         }
     }
 
-    /// Docked pods in an open case stay connected for a while (XPS,
-    /// 2026-10-23: 23 s), and a play went to them in the case. Docking alone
-    /// only pauses; a play while docked belongs on the speakers. The deferred
-    /// claim still takes the pods back once a bud comes out.
+    /// Removal pauses without rerouting. A subsequent play while the pods
+    /// are docked or a headset is off-head belongs on the speakers; re-wearing
+    /// can take them back through the existing insertion/deferred claim path.
     fn return_to_speakers(&mut self, now: Clock) {
-        eprintln!("fleetpodsd: both pods are in the case; playing on the speakers");
+        eprintln!("fleetpodsd: selected accessory is stowed or removed; playing on the speakers");
         self.release_playback(Release::Speakers, now);
     }
 
@@ -1161,11 +1161,9 @@ impl Daemon {
             self.cancel_connection_attempt(ConnectionHold::Pairing);
             return;
         }
-        // Pods stowed in a closed case cannot take audio, and no link will
-        // be opened for them. Claiming anyway would soft-mute the speaker
-        // streams for the whole takeover hold while nothing can arrive, so
-        // local playback would sit silent for seconds before falling back.
-        if self.accessory.stowed() || self.accessory.both_docked() {
+        // Confirmed docking or off-head wear overrides connection readiness.
+        // Claiming here would mute speakers for an accessory the user removed.
+        if self.accessory.playback_blocked() {
             self.session.claim = PlaybackClaim::Deferred(now.mono);
             self.return_to_speakers(now);
 
@@ -1921,7 +1919,7 @@ impl Daemon {
             && !self.suspending
             && !self.adapter_down
             && !self.routing.phase().busy()
-            && !self.accessory.both_docked()
+            && !self.accessory.playback_blocked()
             && self.output.wants_output()
             && self.output.held_streams().is_empty()
             && !self.output.holding_takeover()
@@ -3880,6 +3878,40 @@ mod tests {
         daemon.step(Input::Tick, at(2_600));
         assert!(matches!(daemon.session.output_recovery.task.state(), TaskState::Succeeded { .. }));
         (daemon, graph, at(2_600))
+    }
+
+    #[test]
+    fn confirmed_removal_blocks_output_repairs_and_silences_owner_status() {
+        use crate::pods::observe::Observation;
+        use crate::step::{Effect, Input};
+        for headset in [false, true] {
+            let (mut daemon, _, now) = streaming_fixture();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            if headset {
+                daemon.set_identity("Max", "A3454");
+                daemon.accessory.note_control_head_wear(Some(true), Some(true), now.mono);
+            }
+            assert!(daemon.can_repair_output());
+            let removed = if headset {
+                Input::Observation(Observation::HeadWear {
+                    primary: Some(false),
+                    secondary: Some(false),
+                })
+            } else {
+                Input::Accessory {
+                    generation: daemon.connection.generation(),
+                    packet: vec![4, 0, 4, 0, 6, 0, 2, 2],
+                }
+            };
+            daemon.step(removed, at(10));
+            assert!(!daemon.can_repair_output());
+            assert_eq!(daemon.status_value(at(10))["audio_owner"]["playing"], false);
+            daemon.step(Input::Outputs(vec![output(-3)]), at(20));
+            let tick = daemon.step(Input::Tick, at(4_000));
+            assert!(!tick.effects.iter().any(|e| matches!(e, Effect::RestartOutput { .. })));
+            let reset = daemon.step(Input::Command(Command::AudioReset), at(4_010));
+            assert!(reset.reply.as_ref().unwrap().starts_with("error:"));
+        }
     }
 
     #[test]

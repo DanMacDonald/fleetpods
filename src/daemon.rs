@@ -24,7 +24,7 @@ use crate::panel::ipc::{Command, FleetCommand, Response};
 use crate::panel::status::{self, Snapshot};
 use crate::pods::link::{Connection, FailReason, Stage};
 use crate::pods::prefs::Config;
-use crate::pods::reports::{Accessory, Placement, Pod};
+use crate::pods::reports::{Accessory, Pod};
 use crate::types::{
     code, Address, Clock, Code, FleetId, Generation, HostId, InvitationId, LidState, Model, MonoMs,
     NoiseMode, UnixMs,
@@ -860,11 +860,7 @@ impl Daemon {
         if self.accessory.both_docked() != was_docked {
             self.effects.announce_dirty = true;
         }
-        let ear =
-            |pod: &crate::types::Evidence<Placement>| pod.as_fresh().and_then(|pod| pod.in_ear);
-        let (left, right) =
-            (ear(&self.accessory.left_placement), ear(&self.accessory.right_placement));
-        self.note_ears(left, right, at, at);
+        self.note_ears(at);
         self.enforce_connection_admission(at);
     }
 
@@ -1644,7 +1640,7 @@ impl Daemon {
         }
         self.peer_media_sent.retain(|peer, _| self.pod_peers.contains(peer));
         self.introduced_peers.1.retain(|peer| self.pod_peers.contains(peer));
-        let playing = self.audio.local_playing() && !self.accessory.both_docked();
+        let playing = self.audio.local_playing() && !self.accessory.playback_blocked();
         for peer in &self.pod_peers {
             if *peer == local {
                 continue;
@@ -2615,7 +2611,7 @@ impl Daemon {
             let previous = self.accessory.head_worn();
             self.accessory.note_head_worn(worn, now.mono);
             let changed = previous != self.accessory.head_worn();
-            self.note_ears(None, None, now.mono, now.mono);
+            self.note_ears(now.mono);
             if changed {
                 eprintln!("fleetpodsd: advertised head wear address={owner} worn={worn}");
             }
@@ -2649,7 +2645,7 @@ impl Daemon {
             let (right_ear, right_case) = decode(self, true);
             self.accessory.note_placement(false, left_ear, left_case, now.mono);
             self.accessory.note_placement(true, right_ear, right_case, now.mono);
-            self.note_ears(left_ear, right_ear, now.mono, now.mono);
+            self.note_ears(now.mono);
             if decision.encrypted {
                 if let Some(keys) = &keys {
                     let plain = crate::pods::air::open_block(&keys.encryption, &sight.encrypted);
@@ -2880,19 +2876,12 @@ impl Daemon {
         }
     }
 
-    pub fn note_ears(&mut self, left: Option<bool>, right: Option<bool>, at: MonoMs, now: MonoMs) {
-        // Both signal sources feed the same aggregate policy input, without
-        // inventing per-earcup telemetry. Accessory owns source precedence.
-        let (left, right) = match self.accessory.head_worn() {
-            Some(worn) => (Some(worn), Some(worn)),
-            None => (left, right),
-        };
+    pub fn note_ears(&mut self, now: MonoMs) {
+        let (left, right) = self.accessory.wear_state();
         let action =
-            self.audio.ears(left, right, self.config.ear, self.accessory.model.is_headset(), at);
+            self.audio.ears(left, right, self.config.ear, self.accessory.model.is_headset(), now);
         self.apply_ear_action(action);
-        let action = self.audio.ears_tick(self.config.ear, now);
-        self.apply_ear_action(action);
-        self.note_wearing(at);
+        self.note_wearing(now);
     }
 
     /// Settle a removal or reinsertion that has waited out its debounce
@@ -3265,7 +3254,7 @@ impl Daemon {
         if self.connection.stage() != Stage::Ready
             || self.routing.phase().busy()
             || self.connection.apple_reconnect()
-            || self.accessory.both_docked()
+            || self.accessory.playback_blocked()
             || self.audio.local_playing()
         {
             return false;
@@ -3497,7 +3486,7 @@ impl Daemon {
         if self.connection.stage() != Stage::Ready
             || self.routing.phase().busy()
             || self.connection.apple_reconnect()
-            || self.accessory.both_docked()
+            || self.accessory.playback_blocked()
         {
             return;
         }
@@ -3780,7 +3769,7 @@ impl Daemon {
                 local_playing: self.audio.local_playing(),
                 routed_here: self.audio.routed(),
                 observed_local: self.audio.observed_playback(),
-                both_docked: self.accessory.both_docked(),
+                playback_blocked: self.accessory.playback_blocked(),
             },
             &|peer| self.remote_playback(peer, now).map(|(observed, _)| observed),
         )
@@ -6689,7 +6678,16 @@ mod tests {
             vec![0x01, 0x00, 0x04, 0x00, 0x01],
             vec![0x04, 0x00, 0x04, 0x00, 0x2b, 0x00, 0x01],
             battery,
-            vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, 0x00, 0x02],
+            vec![
+                0x04,
+                0x00,
+                0x04,
+                0x00,
+                0x06,
+                0x00,
+                0x00,
+                if daemon.accessory.model.is_headset() { 0 } else { 2 },
+            ],
         ] {
             effects.extend(daemon.step(Input::Accessory { generation, packet }, now).effects);
         }
@@ -7158,16 +7156,21 @@ mod tests {
     }
 
     #[test]
-    fn docked_play_returns_an_unclaimed_airpods_default_to_speakers() {
+    fn unavailable_play_returns_an_unclaimed_airpods_default_to_speakers() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::step::{Effect, Input};
 
-        for mpris in [true, false] {
+        for (headset, mpris) in [(false, true), (false, false), (true, true), (true, false)] {
             let mut daemon = Daemon::new("gram");
             let now = clock();
             daemon.select_accessory(Some(addr(3)));
-            for right in [false, true] {
-                daemon.accessory.note_placement(right, Some(false), Some(true), now.mono);
+            if headset {
+                daemon.set_identity("Max", "A3454");
+                daemon.accessory.note_control_head_wear(Some(false), Some(false), now.mono);
+            } else {
+                for right in [false, true] {
+                    daemon.accessory.note_placement(right, Some(false), Some(true), now.mono);
+                }
             }
             let mut graph = Graph {
                 default_sink: "pods".into(),
@@ -7211,17 +7214,18 @@ mod tests {
             });
             effects.extend(daemon.step(Input::Audio(graph), now).effects);
             assert!(!daemon.output.wants_output());
+            assert!(!daemon.roster_intent(now), "speaker playback cannot ask peers to yield");
             assert!(
                 effects.iter().any(|e| matches!(e,
                     Effect::SetDefaultSink { name } if name == "speakers"
                 )),
-                "mpris={mpris}: {effects:?}"
+                "headset={headset} mpris={mpris}: {effects:?}"
             );
             assert!(
                 effects.iter().any(|e| matches!(e,
                     Effect::MoveStreams(moved) if moved.sink == "speakers"
                 )),
-                "mpris={mpris}: {effects:?}"
+                "headset={headset} mpris={mpris}: {effects:?}"
             );
             assert!(!effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))));
         }
@@ -7316,15 +7320,25 @@ mod tests {
 
     #[test]
     fn wear_removal_pauses_and_reinsertion_resumes_owned_playback() {
-        for signal in ["buds", "advertisement", "headset-control"] {
+        for signal in [
+            "buds",
+            "advertisement",
+            "headset-left",
+            "headset-right",
+            "headset-both",
+            "headset-legacy",
+        ] {
             use crate::audio::route::{Graph, LiveStream, Sink};
             use crate::step::{Effect, Input};
             let brave = "org.mpris.MediaPlayer2.brave";
             let mut daemon = Daemon::new("xps");
             let now = clock();
             let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
-            if signal == "headset-control" {
-                daemon.set_identity("Max", "A3454");
+            if signal.starts_with("headset-") {
+                daemon.set_identity(
+                    "Max",
+                    if signal == "headset-legacy" { "A2096" } else { "A3454" },
+                );
             }
             ready_link(&mut daemon, now);
             let generation = daemon.connection().generation();
@@ -7337,7 +7351,22 @@ mod tests {
                 } else {
                     Input::Accessory {
                         generation,
-                        packet: vec![4, 0, 4, 0, 6, 0, u8::from(removed), 0],
+                        packet: vec![
+                            4,
+                            0,
+                            4,
+                            0,
+                            6,
+                            0,
+                            u8::from(removed && signal != "headset-right"),
+                            if signal == "headset-legacy" {
+                                2
+                            } else {
+                                u8::from(
+                                    removed && matches!(signal, "headset-right" | "headset-both"),
+                                )
+                            },
+                        ],
                     }
                 }
             };
@@ -7378,7 +7407,7 @@ mod tests {
             feed(&mut daemon, wear(false), at(100));
             feed(&mut daemon, Input::Tick, at(600));
             feed(&mut daemon, wear(true), at(1_000));
-            if signal == "headset-control" {
+            if signal.starts_with("headset-") && signal != "headset-legacy" {
                 // A lagging advertisement must not cancel the control removal.
                 feed(
                     &mut daemon,
@@ -7394,6 +7423,17 @@ mod tests {
             assert!(
                 matches!(&paused[0], Effect::PausePlayers(players) if players == &[brave.to_string()])
             );
+            if signal.starts_with("headset-") {
+                assert_eq!(
+                    daemon.accessory.head_worn(),
+                    Some(!matches!(signal, "headset-both" | "headset-legacy"))
+                );
+                assert_eq!(
+                    daemon.accessory.playback_blocked(),
+                    matches!(signal, "headset-both" | "headset-legacy"),
+                    "lifting one cup must not enable speaker fallback"
+                );
+            }
             effects.clear();
             let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
                 effects.extend(daemon.step(input, clock).effects);
@@ -7403,6 +7443,21 @@ mod tests {
                 Input::Player { service: brave.into(), playing: Some(false) },
                 at(1_600),
             );
+            if signal == "headset-both" {
+                feed(
+                    &mut daemon,
+                    Input::Accessory { generation, packet: vec![4, 0, 4, 0, 6, 0, 0, 1] },
+                    at(2_000),
+                );
+                feed(&mut daemon, Input::Tick, at(2_500));
+                assert!(
+                    !effects.iter().any(|e| matches!(e, Effect::ResumePlayers(_))),
+                    "replacing only one cup must not resume a two-cup pause"
+                );
+            }
+            let mut feed = |daemon: &mut Daemon, input: Input, clock: Clock| {
+                effects.extend(daemon.step(input, clock).effects);
+            };
             feed(&mut daemon, wear(false), at(3_000));
             feed(&mut daemon, Input::Tick, at(3_500));
             let resumed = effects
@@ -7425,7 +7480,7 @@ mod tests {
     }
 
     #[test]
-    fn a_play_with_both_pods_docked_in_an_open_case_goes_to_the_speakers() {
+    fn play_after_docking_or_headset_removal_uses_speakers_until_worn_again() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::step::{Effect, Input};
         // XPS, 2026-10-23 14:47: playing on the pods, both docked with the lid
@@ -7455,50 +7510,92 @@ mod tests {
                 corked,
             }],
         };
-        let mut daemon = Daemon::new("xps");
-        let now = clock();
-        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
-        ready_link(&mut daemon, now);
-        let generation = daemon.connection().generation();
-        daemon.step(Input::Accessory { generation, packet: ears(0x00, 0x00) }, now);
-        daemon.step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
-        daemon.step(Input::Audio(graph("omarchy_speaker_tuning", false)), now);
-        daemon.step(Input::Players(Vec::new()), now);
-        daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
-        daemon.step(Input::Audio(graph("pods", false)), at(100));
-        assert!(daemon.output.wants_output());
-        // Both docked: the ear pause pauses Brave and nothing else moves.
-        daemon.step(Input::Accessory { generation, packet: ears(0x02, 0x02) }, at(1_000));
-        let docked = daemon.step(Input::Tick, at(1_500));
-        assert!(docked.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
-        assert!(!docked.effects.iter().any(|e| matches!(e, Effect::SetDefaultSink { .. })));
-        daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, at(1_600));
-        daemon.step(Input::Audio(graph("pods", true)), at(1_700));
-        // Play: back to the speakers, both the default and Brave's stream.
-        let mut effects = daemon
-            .step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_000))
-            .effects;
-        effects.extend(daemon.step(Input::Audio(graph("pods", false)), at(3_100)).effects);
-        assert!(!daemon.output.wants_output());
-        assert!(
-            effects.iter().any(|e| matches!(e,
-            Effect::SetDefaultSink { name } if name == "omarchy_speaker_tuning")),
-            "{effects:?}"
-        );
-        assert!(
-            effects.iter().any(|e| matches!(e,
-            Effect::MoveStreams(moved) if moved.sink == "omarchy_speaker_tuning"
-                && moved.streams.iter().any(|s| s.generation == 7554))),
-            "{effects:?}"
-        );
-        assert!(!effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))), "{effects:?}");
-        daemon.step(Input::Audio(graph("omarchy_speaker_tuning", false)), at(3_200));
-        let settled = daemon.step(Input::Tick, at(4_500));
-        assert!(!settled.effects.iter().any(|e| matches!(e, Effect::MoveStreams(_))));
-        // A bud out of the case takes the pods back for the waiting play.
-        daemon.step(Input::Accessory { generation, packet: ears(0x00, 0x02) }, at(6_000));
-        daemon.step(Input::Tick, at(6_500));
-        assert!(daemon.output.wants_output());
+        for (headset, lifted) in
+            [(false, None), (true, None), (true, Some(false)), (true, Some(true))]
+        {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            if headset {
+                daemon.set_identity("Max", "A3454");
+            }
+            ready_link(&mut daemon, now);
+            let generation = daemon.connection().generation();
+            daemon.step(Input::Accessory { generation, packet: ears(0x00, 0x00) }, now);
+            daemon
+                .step(Input::Observation(crate::pods::observe::Observation::Ownership(true)), now);
+            daemon.step(Input::Audio(graph("omarchy_speaker_tuning", false)), now);
+            daemon.step(Input::Players(Vec::new()), now);
+            daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, now);
+            daemon.step(Input::Audio(graph("pods", false)), at(100));
+            assert!(daemon.output.wants_output());
+            // Removal pauses Brave without rerouting or starting output setup.
+            daemon.step(
+                Input::Accessory {
+                    generation,
+                    packet: match lifted {
+                        Some(right) => ears(u8::from(!right), u8::from(right)),
+                        None if headset => ears(1, 1),
+                        None => ears(2, 2),
+                    },
+                },
+                at(1_000),
+            );
+            if lifted.is_none() {
+                assert!(!daemon.can_repair_output(), "removal must disable output repair");
+                assert_eq!(
+                    daemon.status_value(at(1_000))["audio_owner"]["playing"],
+                    false,
+                    "removal overrides a stale playing report without losing the owner"
+                );
+            }
+            let docked = daemon.step(Input::Tick, at(1_500));
+            assert!(docked.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+            assert!(!docked.effects.iter().any(|e| matches!(e, Effect::SetDefaultSink { .. })));
+            daemon.step(Input::Player { service: brave.into(), playing: Some(false) }, at(1_600));
+            daemon.step(Input::Audio(graph("pods", true)), at(1_700));
+            // Manual Play stays on a partially worn Max, otherwise uses speakers.
+            let mut effects = daemon
+                .step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_000))
+                .effects;
+            effects.extend(daemon.step(Input::Audio(graph("pods", false)), at(3_100)).effects);
+            if lifted.is_some() {
+                assert!(daemon.output.wants_output(), "one cup still worn retains pods output");
+                assert!(!effects.iter().any(|e| matches!(e,
+                    Effect::SetDefaultSink { name } if name == "omarchy_speaker_tuning")));
+                assert!(!effects.iter().any(|e| matches!(e,
+                    Effect::MoveStreams(moved) if moved.sink == "omarchy_speaker_tuning")));
+                assert!(!effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+                let settled = daemon.step(Input::Tick, at(4_500));
+                assert!(daemon.output.wants_output());
+                assert!(!settled.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
+                continue;
+            }
+            assert!(!daemon.output.wants_output());
+            assert!(
+                effects.iter().any(|e| matches!(e,
+                Effect::SetDefaultSink { name } if name == "omarchy_speaker_tuning")),
+                "{effects:?}"
+            );
+            assert!(
+                effects.iter().any(|e| matches!(e,
+                Effect::MoveStreams(moved) if moved.sink == "omarchy_speaker_tuning"
+                    && moved.streams.iter().any(|s| s.generation == 7554))),
+                "{effects:?}"
+            );
+            assert!(!effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))), "{effects:?}");
+            daemon.step(Input::Audio(graph("omarchy_speaker_tuning", false)), at(3_200));
+            let settled = daemon.step(Input::Tick, at(4_500));
+            assert!(!settled.effects.iter().any(|e| matches!(e, Effect::MoveStreams(_))));
+            assert!(!daemon.output.wants_output(), "ticks cannot reclaim off-head playback");
+            // Re-wearing takes the pods back for the waiting play.
+            daemon.step(
+                Input::Accessory { generation, packet: ears(0x00, if headset { 0 } else { 2 }) },
+                at(6_000),
+            );
+            daemon.step(Input::Tick, at(6_500));
+            assert!(daemon.output.wants_output());
+        }
     }
 
     #[test]

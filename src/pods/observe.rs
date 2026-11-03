@@ -15,6 +15,7 @@ use crate::types::{Address, MonoMs, NoiseMode};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Observation {
     Bud { bud: crate::pods::setup::Bud, level: u8, charging: bool, place: Option<Place> },
+    HeadWear { primary: Option<bool>, secondary: Option<bool> },
     CaseBattery { level: u8, charging: bool },
     Ownership(bool),
     Source { local: bool, kind: u8, remote: Option<Address> },
