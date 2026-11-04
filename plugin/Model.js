@@ -1822,16 +1822,19 @@ function escapeMarkup(text) {
 }
 
 // A log line as styled text with each whole device name in its own colour, so names stand apart from the words around
-// them. The longest name wins where two overlap, and a name inside a longer word is left alone.
-function deviceNameMarkup(text, names, color) {
+// them; the accessory name is bold instead. The longest name wins where two overlap,
+// and a name inside a longer word is left alone.
+function deviceNameMarkup(text, names, color, boldName) {
   var safe = escapeMarkup(text)
-  var pattern = (names || []).map(function (name) { return escapeMarkup(String(name || "").trim()) })
+  var bold = escapeMarkup(String(boldName || "").trim())
+  var pattern = (names || []).concat(boldName || []).map(function (name) { return escapeMarkup(String(name || "").trim()) })
     .filter(function (name, i, all) { return name && all.indexOf(name) === i })
     .sort(function (a, b) { return b.length - a.length })
     .map(function (name) { return name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") })
   if (!pattern.length) return safe
   var names = new RegExp("(^|[^A-Za-z0-9_-])(" + pattern.join("|") + ")(?![A-Za-z0-9_-])", "g")
   return safe.replace(names, function (match, before, name) {
+    if (name === bold) return before + "<b>" + name + "</b>"
     return before + '<font color="' + color + '">' + name + "</font>"
   })
 }

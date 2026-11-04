@@ -108,13 +108,13 @@ TestCase {
     compare(label.entranceProgress, 1)
     item.nowMs = now + 3000
     item.dots = 3
-    compare(label.text, "Retrying AirPods connection...")
+    compare(label.text, "Retrying <b>AirPods</b> connection...")
     item.expanded = true
-    verify(lineTexts(item).indexOf("Retrying AirPods connection...") >= 0)
+    verify(lineTexts(item).indexOf("Retrying <b>AirPods</b> connection...") >= 0)
     rows.setProperty(0, "live", false)
     rows.setProperty(0, "eventKind", "connected")
     rows.setProperty(0, "message", "Connecting to AirPods... Connected!")
-    compare(label.text, "Connected to AirPods")
+    compare(label.text, "Connected to <b>AirPods</b>")
     compare(findChild(item, "headerSymbol").stateName, "success")
   }
 
@@ -123,7 +123,7 @@ TestCase {
     append({ time: "16:00:00", message: "AirPods Max 2 connected.", kind: "connection",
       eventKind: "connected", accessory: "AirPods Max 2", live: false, detail: "" })
     var item = createTemporaryObject(consoleView, this)
-    compare(findChild(item, "latestStatus").text, "Connected to AirPods Max 2")
+    compare(findChild(item, "latestStatus").text, "Connected to <b>AirPods Max 2</b>")
     rows.setProperty(0, "live", true)
     rows.setProperty(0, "eventKind", "connecting")
     compare(item.messageText(rows.get(0)), "Connecting to AirPods Max 2...")
@@ -146,7 +146,7 @@ TestCase {
     rows.setProperty(0, "device", "omarchy-xps")
     rows.setProperty(0, "eventKind", "connecting")
     rows.setProperty(0, "message", "Connecting to AirPods...")
-    compare(label.text, "Connecting omarchy-xps to AirPods...")
+    compare(label.text, "Connecting omarchy-xps to <b>AirPods</b>...")
     compare(rows.count, 1)
   }
 
@@ -188,10 +188,10 @@ TestCase {
     item.dots = 1
     tryCompare(item, "dots", 1)
     var texts = lineTexts(item)
-    verify(texts.indexOf("Connecting to AirPods.&nbsp;&nbsp;&nbsp;(Retrying 1 of 2)") >= 0, JSON.stringify(texts))
-    verify(texts.indexOf("Connected to AirPods") >= 0, JSON.stringify(texts))
+    verify(texts.indexOf("Connecting to <b>AirPods</b>.&nbsp;&nbsp;&nbsp;(Retrying 1 of 2)") >= 0, JSON.stringify(texts))
+    verify(texts.indexOf("Connected to <b>AirPods</b>") >= 0, JSON.stringify(texts))
     item.dots = 2
-    verify(lineTexts(item).indexOf("Connecting to AirPods..&nbsp;&nbsp;(Retrying 1 of 2)") >= 0)
+    verify(lineTexts(item).indexOf("Connecting to <b>AirPods</b>..&nbsp;&nbsp;(Retrying 1 of 2)") >= 0)
   }
 
   function test_activeConnectionIconSpinsAndStops() {
@@ -245,7 +245,7 @@ TestCase {
     wait(50)
     var restingY = latest.mapToItem(item, 0, 0).y
     append({ time: "16:00:01", message: "AirPods audio moved to iPhone.", kind: "audio", live: false, detail: "", eventKind: "audioTaken" })
-    compare(latest.text, "AirPods audio moved to iPhone.")
+    compare(latest.text, "<b>AirPods</b> audio moved to iPhone.")
     verify(latest.opacity < 1, "A changed message should fade in")
     verify(latest.mapToItem(item, 0, 0).y > restingY, "A changed message should slide up into place")
     tryCompare(latest, "opacity", 1)
@@ -363,7 +363,7 @@ TestCase {
     compare(latest.text, "No recent activity")
     append({ time: "16:00:00", message: "Connecting", kind: "connection", live: true, detail: "(Retrying)" })
     item.dots = 1
-    compare(latest.text, "Connecting to AirPods.&nbsp;&nbsp;&nbsp;(Retrying)")
+    compare(latest.text, "Connecting to <b>AirPods</b>.&nbsp;&nbsp;&nbsp;(Retrying)")
     var lineWidth = latest.contentWidth
     item.dots = 2
     compare(latest.contentWidth, lineWidth)

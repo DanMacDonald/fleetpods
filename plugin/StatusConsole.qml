@@ -57,7 +57,8 @@ Rectangle {
   function styledText(row) {
     // StyledText collapses ordinary padding spaces. Preserve the three dot
     // positions so the retry count stays put throughout the animation.
-    var text = Model.deviceNameMarkup(messageText(row), root.deviceNames, root.deviceColor)
+    var text = Model.deviceNameMarkup(messageText(row), root.deviceNames, root.deviceColor,
+      row ? row.accessory || "AirPods" : "")
     if (row && row.live && row.detail && !row.retryPeer)
       text = text.replace(/ {2,}/g, function (spaces) { return "&nbsp;".repeat(spaces.length) })
     return text
