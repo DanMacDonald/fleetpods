@@ -628,6 +628,7 @@ Panel {
             screenFill: Commons.Color.popups.background
             fontFamily: root.fontFamily
             podsVariant: root.podsVariant
+            headsetWorn: pods.view.headset.worn
             connectionSpinVisible: root.connectionSpinVisible
             connectionComplete: Model.localSeatConnected(pods.view)
             caseState: root.barCaseState

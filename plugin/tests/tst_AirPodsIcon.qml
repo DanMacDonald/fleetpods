@@ -21,6 +21,39 @@ TestCase {
   Component { id: gatedPopup; Pods.AirPodsIcon { iconSize: 128; variant: "pro"; pixelArt: true; animatePlacement: false } }
   Component { id: motionMarker; Rectangle { x: 2; y: 96; width: 3; height: 3; color: "#ff00ff" } }
 
+  function test_maxWearAndAccessorySwitch() {
+    var item = createTemporaryObject(popup, this, { variant: "max", headsetWorn: false })
+    verify(item.usesMeshMax)
+    var mesh = findChild(item, "maxMeshArtwork")
+    verify(mesh !== null)
+    compare(mesh.rest, 1, "initial off-head presentation is settled")
+    var top = item.artworkTop
+    item.headsetWorn = true
+    tryCompare(mesh, "rest", 0, 700)
+    item.headsetWorn = false
+    wait(40)
+    verify(mesh.rest > 0 && mesh.rest < 1, "wear changes animate")
+    item.headsetWorn = true
+    tryCompare(mesh, "rest", 0, 700)
+    compare(item.artworkTop, top, "wear animation keeps the connector anchored")
+    item.headsetWorn = null
+    compare(mesh.rest, 0, "unknown wear does not claim the headset is off-head")
+    item.variant = "pro"
+    verify(!item.usesMeshMax)
+    verify(findChild(item, "budsMeshArtwork") !== null)
+    item.headsetWorn = false
+    item.variant = "max"
+    mesh = findChild(item, "maxMeshArtwork")
+    verify(mesh !== null)
+    compare(mesh.rest, 1)
+  }
+
+  function test_maxBarKeepsOutline() {
+    var item = createTemporaryObject(icon, this, { variant: "max", headsetWorn: false })
+    verify(!item.usesPixelArt)
+    verify(findChild(item, "maxMeshArtwork") === null)
+  }
+
   function test_standaloneDescentUsesConstantScreenVelocity_data() {
     return [{tag: "dark", background: "#1a1b26"}, {tag: "light", background: "#ffffff"}]
   }

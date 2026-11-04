@@ -15,6 +15,24 @@ TestCase {
   SignalSpy { id: release; signalName: "appleClicked" }
   SignalSpy { id: enroll; signalName: "enrollClicked" }
 
+  function test_maxWearIsIndependentOfConnectionOwner() {
+    var item = createTemporaryObject(view, this, {
+      podsVariant: "max", headsetWorn: false, connectedToOmarchy: true,
+      animatePlacement: false
+    })
+    var art = findChild(item, "seatPodsArtwork")
+    var mesh = findChild(art, "maxMeshArtwork")
+    verify(mesh !== null)
+    compare(mesh.rest, 1)
+    item.connectedToOmarchy = false
+    compare(mesh.rest, 1, "ownership alone cannot open the cups")
+    item.headsetWorn = true
+    compare(mesh.rest, 0)
+    item.headsetWorn = null
+    compare(mesh.rest, 0)
+    verify(item.connectorEndY > item.linkY, "connector reaches the mesh headband")
+  }
+
   function test_caseExitRevealsRestingPodsConnectors() {
     var item = createTemporaryObject(view, this, { podsVariant: "pro", caseState: "open-empty" })
     var art = findChild(item, "seatPodsArtwork")

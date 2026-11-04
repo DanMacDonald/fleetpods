@@ -68,12 +68,18 @@ function frame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, right
 // The painter selects background-to-ink versus shadow-to-light dot colors.
 // Smoothed dark frames also carry coverage, applied after palette selection.
 function renderFrame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, rightLift, zoom, leftLift, budsArrival, smoothSampling, podTurns) {
-  var renderer = ink ? Light : Dark
   var scene = parts(geometry, state, lid, time, rightLift, leftLift, budsArrival, podTurns)
   var view = {
     state: state, lid: lid, yaw: yaw, pitch: pitch, columns: columns, rows: rows,
     scale: Math.min(columns, rows) / (state === "" ? 2.95 : 3.6) * (zoom === undefined ? 1 : zoom)
   }
+  return renderScene(scene, view, ink, smoothSampling)
+}
+
+// Shared sampling for artwork scenes; scene assembly owns the accessory pose.
+function renderScene(scene, view, ink, smoothSampling) {
+  var renderer = ink ? Light : Dark
+  var columns = view.columns, rows = view.rows
   if (!smoothSampling) return renderer.render(scene, view)
   // Integrate a small footprint per grid cell before palette quantization.
   // Every sample uses the same renderer and depth rules.

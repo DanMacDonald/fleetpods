@@ -39,11 +39,22 @@ Item {
   // full travel finishes, instead of removing it when caseState changes.
   property real rightLift: caseState === "open-left" || caseState === "open-empty" ? 1 : 0
   property real leftLift: caseState === "open-right" || caseState === "open-empty" ? 1 : 0
-  readonly property real artworkTop: height * 0.17
+  property real artworkTop: height * 0.17
   readonly property var geometry: AirPods.geometry
   readonly property bool animationRunning: ticker.running
   implicitWidth: 128
   implicitHeight: 128
+
+  // Other accessory artwork can supply a scene while retaining the panel's
+  // physical dot grid, palette, coverage and Canvas painter unchanged.
+  function renderFrame(columns, rows) {
+    return Mesh.renderFrame(root.geometry, root.caseState, root.lid, root.time,
+      root.yaw + Math.sin(root.time * 0.45) * 0.22, root.pitch, columns, rows, root.lightBackground,
+      root.rightLift, root.zoom, root.leftLift, root.budsArrival, root.smoothSampling,
+      { left: root.leftTurn, right: root.rightTurn })
+  }
+
+  function requestPaint() { canvas.requestPaint() }
 
   Behavior on lid {
     enabled: root.visible
@@ -117,9 +128,7 @@ Item {
       var pitch = root.effectiveDotPitch
       var columns = Math.max(1, Math.floor(root.width / pitch))
       var rows = Math.max(1, Math.floor(root.height / pitch))
-      var frame = Mesh.renderFrame(root.geometry, root.caseState, root.lid, root.time,
-        root.yaw + Math.sin(root.time * 0.45) * 0.22, root.pitch, columns, rows, root.lightBackground, root.rightLift, root.zoom, root.leftLift, root.budsArrival, root.smoothSampling,
-        { left: root.leftTurn, right: root.rightTurn })
+      var frame = root.renderFrame(columns, rows)
       var values = frame.values
       var style = Mesh.dotStyle(frame.tonal, pitch, root.backgroundColor,
         root.litForeground, root.shadowColor)

@@ -50,6 +50,7 @@ Item {
   property color screenFill: "#1a1a1e"
   property string fontFamily: ""
   property string podsVariant: "buds"
+  property var headsetWorn: null
   property string caseState: ""
   property bool animatePlacement: true
   property bool pairingMode: false
@@ -251,6 +252,7 @@ Item {
     pixelArt: true
     color: root.foreground
     variant: root.podsVariant
+    headsetWorn: root.headsetWorn
     caseState: root.caseState
     animatePlacement: root.animatePlacement
     pairingMode: root.pairingMode

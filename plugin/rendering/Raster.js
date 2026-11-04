@@ -39,7 +39,7 @@ function turn(out, x, y, z, r) {
 function projection(part, view, vertexTone) {
   var a = part.angle, at = part.at
   var key = [a[0], a[1], a[2], at[0], at[1], at[2], part.mirror, part.scale, part.shade,
-    view.pitch, view.yaw, view.columns, view.rows, view.scale].join(",")
+    view.pitch, view.yaw, view.roll || 0, view.columns, view.rows, view.scale].join(",")
   // Both pods share one mesh, mirrored, so keep a few placements per mesh.
   // The cache is derived data, so it stays non-enumerable: copying or
   // comparing the shared geometry never sees it.
@@ -58,6 +58,7 @@ function projection(part, view, vertexTone) {
 function projectPart(part, view, vertexTone, key) {
   var columns = view.columns, rows = view.rows, scale = view.scale, a = part.angle
   var local = turns(a[0], a[1], a[2]), camera = turns(view.pitch, view.yaw, 0)
+  var roll = view.roll || 0, rollCos = Math.cos(roll), rollSin = Math.sin(roll)
   var pos = [0, 0, 0], n = [0, 0, 0], points = []
   var vertices = part.mesh.vertices, matte = !!part.mesh.matte, cavity = part.mesh.cavity
   for (var k = 0; k < vertices.length; k++) {
@@ -66,6 +67,15 @@ function projectPart(part, view, vertexTone, key) {
     turn(n, v[3] * part.mirror, v[4], v[5], local)
     turn(pos, pos[0] + part.at[0], pos[1] + part.at[1], pos[2] + part.at[2], camera)
     turn(n, n[0], n[1], n[2], camera)
+    // Camera roll follows yaw/pitch, before projection. Rotate the geometry
+    // and lighting normals while the physical dot grid remains upright.
+    if (roll) {
+      var px = pos[0], nx = n[0]
+      pos[0] = px * rollCos - pos[1] * rollSin
+      pos[1] = px * rollSin + pos[1] * rollCos
+      n[0] = nx * rollCos - n[1] * rollSin
+      n[1] = nx * rollSin + n[1] * rollCos
+    }
     var perspective = 6 / (6 - pos[2])
     var brightness = vertexTone([n[0], n[1], n[2]], part.shade, matte)
     points.push([columns / 2 + pos[0] * scale * perspective,

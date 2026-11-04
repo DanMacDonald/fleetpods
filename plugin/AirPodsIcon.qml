@@ -25,6 +25,8 @@ Item {
   property bool pairingMode: false
   property bool pixelArt: false
   property bool highlighted: true
+  // Positive off-head evidence closes the Max; unknown stays neutral/upright.
+  property var headsetWorn: null
 
   width: iconSize
   height: iconSize
@@ -41,11 +43,12 @@ Item {
     || displayCaseState === "open-left" || displayCaseState === "open-right" || displayCaseState === "open-empty")
   readonly property bool hiResCase: iconSize >= 32
   readonly property bool pixelCase: pixelArt && isCase && (dotted || displayCaseState === "closed")
-  readonly property bool usesPixelArt: pixelCase || (pixelArt && dotted && !isCase)
+  readonly property bool usesPixelArt: pixelCase || usesMeshBuds || usesMeshMax
   // Keep one renderer through either pod's departure, including the second
   // pod leaving. open-left/open-right name the pod still seated in the case.
   readonly property bool usesMeshCase: pixelCase
   readonly property bool usesMeshBuds: pixelArt && dotted && !isCase
+  readonly property bool usesMeshMax: pixelArt && isMax
   readonly property real podsArtworkScale: 1.38
   function restingPodsTop(size) {
     return pixelArtwork.item && pixelArtwork.item.restingPodsTop
@@ -506,7 +509,7 @@ Item {
 
   Loader {
     id: artworkPalette
-    active: root.pixelArt && (root.dotted || root.isCase)
+    active: root.usesPixelArt
     sourceComponent: PopupPalette { foregroundColor: root.color }
   }
 
@@ -522,7 +525,21 @@ Item {
       height: root.iconSize
       y: root.isCase ? root.caseOut * root.iconSize : 0
       sourceComponent: root.usesMeshCase ? meshCaseComponent
+        : root.usesMeshMax ? meshMaxComponent
         : root.usesMeshBuds ? meshBudsComponent : pixelComponent
+    }
+  }
+
+  Component {
+    id: meshMaxComponent
+    MaxArtwork {
+      objectName: "maxMeshArtwork"
+      highlighted: root.highlighted
+      rest: root.headsetWorn === false ? 1 : 0
+      animatePose: root._animatePlacement
+      poseDuration: Commons.Style.duration(240)
+      foregroundColor: artworkPalette.item.foreground
+      backgroundColor: artworkPalette.item.backgroundColor
     }
   }
 
@@ -569,7 +586,7 @@ Item {
   }
 
   Shape {
-    visible: !root.isCase && !(root.pixelArt && root.dotted)
+    visible: !root.isCase && !root.usesPixelArt
     width: root.isPro ? 38 : root.isMax ? 34 : 56
     height: root.isPro ? 56 : root.isMax ? 54 : 56
     // Ink origin to zero, then scale about zero, then centre: applied in list order.
