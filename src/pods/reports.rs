@@ -255,12 +255,17 @@ impl Accessory {
         })
     }
 
-    /// Positive evidence that a new play belongs on the speakers, even if
-    /// Bluetooth stays connected. Unknown wear does not reject a ready link.
+    /// Placement gates playback even if Bluetooth stays connected. Max 2
+    /// must positively report a worn cup: an incomplete off-head report must
+    /// not let a browser seek take audio back from the speakers.
     pub fn playback_blocked(&self) -> bool {
         self.stowed()
             || self.both_docked()
-            || (self.model.is_headset() && self.head_worn() == Some(false))
+            || if self.model == Model::AirPodsMax2 {
+                self.head_worn() != Some(true)
+            } else {
+                self.model.is_headset() && self.head_worn() == Some(false)
+            }
     }
 
     /// A closed case stops advertising. Keep the connection hold until a newer
@@ -387,7 +392,28 @@ mod tests {
         assert!(!accessory.playback_blocked());
         accessory.note_control_head_wear(Some(false), None, MonoMs(1));
         assert_eq!(accessory.head_worn(), None, "unknown second cup is not full removal");
-        assert!(!accessory.playback_blocked());
+        assert!(accessory.playback_blocked(), "unknown wear cannot take speaker playback");
+    }
+
+    #[test]
+    fn max2_playback_requires_positive_wear_evidence() {
+        let mut accessory = Accessory::new();
+        accessory.set_identity("Max", "A3454");
+        assert!(accessory.playback_blocked());
+        for primary in [None, Some(false), Some(true)] {
+            for secondary in [None, Some(false), Some(true)] {
+                accessory.note_control_head_wear(primary, secondary, MonoMs(0));
+                assert_eq!(
+                    accessory.playback_blocked(),
+                    primary != Some(true) && secondary != Some(true),
+                    "primary={primary:?} secondary={secondary:?}"
+                );
+            }
+        }
+        accessory.drop_control_reports();
+        assert!(accessory.playback_blocked(), "link loss retires positive control evidence");
+        accessory.note_head_worn(true, MonoMs(1));
+        assert!(!accessory.playback_blocked(), "fresh on-head advertising also permits playback");
     }
 
     #[test]

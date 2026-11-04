@@ -465,7 +465,7 @@ impl Daemon {
         } else if self.outside_device_playing(now) {
             Some("a device outside the fleet is playing")
         } else if self.accessory.playback_blocked() {
-            Some("the selected accessory is stowed or removed")
+            Some("the selected accessory is not available for playback")
         } else {
             None
         };
@@ -1128,7 +1128,11 @@ impl Daemon {
     /// are docked or a headset is off-head belongs on the speakers; re-wearing
     /// can take them back through the existing insertion/deferred claim path.
     fn return_to_speakers(&mut self, now: Clock) {
-        eprintln!("fleetpodsd: selected accessory is stowed or removed; playing on the speakers");
+        eprintln!(
+            "fleetpodsd: {} cannot take playback (wear={:?}); playing on the speakers",
+            self.accessory.model.display_name(),
+            self.accessory.wearing()
+        );
         self.release_playback(Release::Speakers, now);
     }
 
@@ -1161,7 +1165,7 @@ impl Daemon {
             self.cancel_connection_attempt(ConnectionHold::Pairing);
             return;
         }
-        // Confirmed docking or off-head wear overrides connection readiness.
+        // Playback placement requirements override connection readiness.
         // Claiming here would mute speakers for an accessory the user removed.
         if self.accessory.playback_blocked() {
             self.session.claim = PlaybackClaim::Deferred(now.mono);
@@ -1169,16 +1173,17 @@ impl Daemon {
 
             return;
         }
-        if self.connection.stage() != Stage::Ready
-            && self.connection.bluez() == Some(false)
-            && !self.accessory.playback_available(now.mono)
+        if !self.accessory.playback_available(now.mono)
+            && (self.accessory.model == crate::types::Model::Unknown
+                || (self.connection.stage() != Stage::Ready
+                    && self.connection.bluez() == Some(false)))
         {
-            // A historical sighting or an open case is not evidence that the
-            // buds can play. Stay on the speakers without probing the link:
-            // absent pods only fail Host is down and cycle the adapter.
-            // Advertisements alone make a bud available, and tick then
-            // claims independently of control readiness. No seat yield:
-            // playback stays local so the deferred claim can still fire.
+            // A connected but unidentified accessory is not permission to
+            // take speaker playback. Pairing snapshots and player events
+            // share this wait for identity/placement evidence. Absent pods
+            // also wait here instead of probing a link that cannot play.
+            // Keep local intent; the existing deferred claim advances as
+            // soon as availability is confirmed.
             self.session.claim = PlaybackClaim::Deferred(now.mono);
             self.release_playback(Release::AwaitAvailability, now);
 
@@ -4350,6 +4355,7 @@ mod tests {
         use crate::step::{Effect, Input};
         let now = clock();
         let mut daemon = Daemon::new("xps");
+        daemon.set_identity("AirPods", "A3064");
         daemon.select_accessory(Some(addr(9)));
         ready(&mut daemon, now.mono);
         daemon.note_ownership(false, now.mono);

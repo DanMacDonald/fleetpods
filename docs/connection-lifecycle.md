@@ -100,8 +100,16 @@ Both use the same pending deadline and pause/resume owner. Wear events apply one
 action from `Audio::ears`; timer ticks settle outstanding debounce deadlines.
 A subsequent manual Play while the Max is confirmed off-head uses the existing
 speaker fallback, just like Play while buds are docked. `Accessory::playback_blocked`
-owns that decision for playback, deferred claims, peer intent and output repair;
-removal alone still pauses without rerouting. See the [wear transition audit](wear-transitions.md)
+owns that decision for playback, deferred claims, peer intent and output repair.
+Max 2 requires positive evidence that at least one cup is worn, even on an
+already-ready link. An incomplete control report (off/unknown after off/off)
+does not grant playback permission: browser seek/resume events stay on speakers
+until positive wear returns. Unknown telemetry remains unknown; no separate
+off-head latch or retry worker is introduced. Pairing snapshots and new player
+events share the session's claim admission: an unidentified accessory without
+placement evidence waits through the existing deferred claim, even if Bluetooth
+is connected. Discovering a saved pairing alone must not move speaker playback.
+Removal alone still pauses without rerouting. See the [wear transition audit](wear-transitions.md)
 for equivalent behavior, deliberate case-only rules and remaining display gaps.
 A new accessory's first report is not an insertion, and removal retires pending
 insertion intent. No timer, retry loop or connection launch lives in the BLE
