@@ -19,14 +19,15 @@ use libpulse_binding::context::subscribe::InterestMaskSet;
 use libpulse_binding::context::{Context, FlagSet as ContextFlagSet, State};
 use libpulse_binding::mainloop::standard::Mainloop;
 use libpulse_binding::operation::Operation;
-use libpulse_binding::volume::{ChannelVolumes, Volume, VolumeLinear};
+use libpulse_binding::volume::{Volume, VolumeLinear};
 
 use crate::audio::health::Output;
 use crate::audio::play::StreamSnap;
 use crate::audio::route::{Card, Graph, LiveStream, Sink, StreamTarget};
 use crate::linux::wake::Wake;
+use crate::retry::{Delay, Limit, Policy, Requests, Task};
 use crate::step::Input;
-use crate::types::Address;
+use crate::types::{Address, Generation, MonoMs};
 
 pub enum Op {
     StartOutput {
@@ -88,16 +89,118 @@ impl Handle {
     }
 }
 
-struct StreamChannels {
+struct StreamIdentity {
     generation: u64,
     object_id: Option<u32>,
-    channels: u8,
+}
+
+struct TemporaryMute {
+    object_id: u32,
+    confirmed: bool,
+    release: Option<Task>,
+}
+
+/// The audio worker owns every possibly-applied soft mute until it is released
+/// or a complete stream inventory proves that its node no longer exists.
+struct TemporaryMutes {
+    held: HashMap<u64, TemporaryMute>,
+    requests: Requests,
+    origin: std::time::Instant,
+}
+
+impl Default for TemporaryMutes {
+    fn default() -> Self {
+        Self {
+            held: HashMap::new(),
+            requests: Requests::default(),
+            origin: std::time::Instant::now(),
+        }
+    }
+}
+
+impl TemporaryMutes {
+    fn now(&self) -> MonoMs {
+        MonoMs(self.origin.elapsed().as_millis() as u64)
+    }
+    fn hold(
+        &mut self,
+        stream: StreamTarget,
+        object_id: u32,
+        mut set: impl FnMut(u32, bool) -> bool,
+    ) {
+        let held = self.held.entry(stream.generation).or_insert(TemporaryMute {
+            object_id,
+            confirmed: false,
+            release: None,
+        });
+        // A new hold cancels pending cleanup. Record ownership before either
+        // pw-cli can apply the command: failed confirmation is not failed mute.
+        held.release = None;
+        held.confirmed |= set(object_id, true);
+    }
+
+    fn release(&mut self, stream: StreamTarget) {
+        if let Some(held) = self.held.get_mut(&stream.generation) {
+            held.release.get_or_insert_with(|| {
+                Task::new(Policy {
+                    delay: Delay::Staged(&[100, 250, 1_000, 5_000]),
+                    limit: Limit::UntilCancelled,
+                    request_timeout_ms: None, // The command itself has a bounded timeout.
+                    confirmation_timeout_ms: None,
+                })
+            });
+        }
+    }
+
+    fn release_all(&mut self) {
+        let targets: Vec<_> =
+            self.held.keys().map(|&generation| StreamTarget { id: 0, generation }).collect();
+        for target in targets {
+            self.release(target);
+        }
+    }
+
+    fn confirmed(&self, stream: &LiveStream) -> bool {
+        self.held.get(&stream.generation).is_some_and(|held| held.confirmed)
+    }
+
+    fn observe(&mut self, cached: &HashMap<u32, StreamIdentity>) {
+        self.held.retain(|&generation, held| {
+            cached.values().any(|stream| {
+                stream.generation == generation && stream.object_id == Some(held.object_id)
+            })
+        });
+    }
+
+    fn clean_up(
+        &mut self,
+        cached: &HashMap<u32, StreamIdentity>,
+        now: MonoMs,
+        mut set: impl FnMut(u32, bool) -> bool,
+    ) {
+        self.held.retain(|&generation, held| {
+            let Some(release) = &mut held.release else { return true };
+            // Never address a recycled node, or act while the Pulse connection
+            // has no current inventory. A later observation resumes cleanup.
+            if !cached.values().any(|stream| {
+                stream.generation == generation && stream.object_id == Some(held.object_id)
+            }) {
+                return true;
+            }
+            let Some(id) = release.launch(&mut self.requests, Generation(generation), now) else {
+                return true;
+            };
+            let ok = set(held.object_id, false);
+            release.reply(id, ok, now);
+            !ok
+        });
+    }
 }
 
 struct Sample {
     graph: Graph,
     outputs: Vec<Output>,
-    cache: HashMap<u32, StreamChannels>,
+    cache: HashMap<u32, StreamIdentity>,
     levels: HashMap<String, SinkLevel>,
 }
 
@@ -158,7 +261,6 @@ struct RawStream {
     mute: bool,
     volume: f64,
     corked: bool,
-    channels: u8,
 }
 
 struct RawSink {
@@ -184,6 +286,7 @@ struct Picture {
     cards: Vec<RawCard>,
     sinks_done: bool,
     streams_done: bool,
+    streams_valid: bool,
     server_done: bool,
     cards_done: bool,
 }
@@ -197,6 +300,7 @@ impl Picture {
             cards: Vec::new(),
             sinks_done: false,
             streams_done: false,
+            streams_valid: true,
             server_done: false,
             cards_done: false,
         }
@@ -268,7 +372,11 @@ impl Query {
             };
             match item {
                 ListResult::Item(info) => picture.streams.push(raw_stream(info)),
-                ListResult::End | ListResult::Error => picture.streams_done = true,
+                ListResult::End => picture.streams_done = true,
+                ListResult::Error => {
+                    picture.streams_done = true;
+                    picture.streams_valid = false;
+                }
             }
         });
         let card_op = context.introspect().get_card_info_list(move |item| {
@@ -318,7 +426,7 @@ impl Query {
 
     fn finish(self) -> Option<Sample> {
         let picture = self.picture.lock().ok()?;
-        if !picture.ready() {
+        if !picture.ready() || !picture.streams_valid {
             return None;
         }
         let names: HashMap<u32, String> =
@@ -328,15 +436,13 @@ impl Query {
             .streams
             .iter()
             .filter_map(|stream| {
-                let sink = names.get(&stream.sink_index)?.clone();
                 cache.insert(
                     stream.id,
-                    StreamChannels {
-                        generation: stream.generation,
-                        channels: stream.channels,
-                        object_id: stream.object_id,
-                    },
+                    StreamIdentity { generation: stream.generation, object_id: stream.object_id },
                 );
+                // An output rebuild can hide the sink while the muted stream
+                // still exists. Keep its identity available for cleanup.
+                let sink = names.get(&stream.sink_index)?.clone();
                 Some(LiveStream {
                     id: stream.id,
                     generation: stream.generation,
@@ -344,6 +450,7 @@ impl Query {
                     role: stream.role.clone(),
                     node: stream.node.clone(),
                     mute: stream.mute,
+                    temporarily_muted: false,
                     volume: stream.volume,
                     corked: stream.corked,
                 })
@@ -419,8 +526,8 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
     arm_subscribe(&mut pulse.context, &dirty);
     let mut subscribed = false;
     let mut server_up = true;
-    let mut cached: HashMap<u32, StreamChannels> = HashMap::new();
-    let mut soft_mutes = HashMap::new();
+    let mut cached: HashMap<u32, StreamIdentity> = HashMap::new();
+    let mut soft_mutes = TemporaryMutes::default();
     let mut last: Option<Graph> = None;
     let mut last_outputs: Vec<Output> = Vec::new();
     let mut refreshed = std::time::Instant::now();
@@ -467,7 +574,8 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
                     let _ = reports.send(Input::AudioLost);
                 }
                 subscribed = false;
-                soft_mutes.clear();
+                soft_mutes.release_all();
+                cached.clear();
                 last_outputs.clear();
                 last = None;
                 media_trace = MediaTrace::default();
@@ -502,8 +610,10 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
                     let _ = reports.send(Input::Outputs(sample.outputs));
                 }
                 cached = sample.cache;
+                soft_mutes.observe(&cached);
+                soft_mutes.clean_up(&cached, soft_mutes.now(), set_soft_mute);
                 for stream in &mut sample.graph.streams {
-                    stream.mute |= soft_mutes.contains_key(&(stream.id, stream.generation));
+                    stream.temporarily_muted = soft_mutes.confirmed(stream);
                 }
                 if last.as_ref() != Some(&sample.graph) {
                     last = Some(sample.graph.clone());
@@ -530,12 +640,23 @@ fn run(jobs: Receiver<Job>, reports: Sender<Input>, wake: Wake) {
             break;
         }
     }
-    for ((id, generation), object_id) in soft_mutes {
-        if generation_ok(&cached, &StreamTarget { id, generation }) {
-            soft_mute_once(object_id, false);
+    soft_mutes.release_all();
+    // Normal shutdown gives failed releases a bounded chance to recover. Stop
+    // the fast writer first so no buffered mute can arrive after cleanup.
+    close_pw_cli();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(7);
+    while !soft_mutes.held.is_empty() && std::time::Instant::now() < until {
+        soft_mutes.clean_up(&cached, soft_mutes.now(), soft_mute_once);
+        if !soft_mutes.held.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
-    close_pw_cli();
+    if !soft_mutes.held.is_empty() {
+        eprintln!(
+            "fleetpodsd: {} temporary stream mutes could not be released before shutdown",
+            soft_mutes.held.len()
+        );
+    }
 }
 
 extern "C" fn poll_with_wake(
@@ -563,10 +684,10 @@ extern "C" fn poll_with_wake(
 fn drain(
     jobs: &Receiver<Job>,
     context: &mut Context,
-    cached: &HashMap<u32, StreamChannels>,
+    cached: &HashMap<u32, StreamIdentity>,
     reports: &Sender<Input>,
     profile_op: &mut Option<ProfileOp>,
-    soft_mutes: &mut HashMap<(u32, u64), u32>,
+    soft_mutes: &mut TemporaryMutes,
     dirty: &AtomicBool,
 ) -> bool {
     loop {
@@ -583,13 +704,20 @@ fn drain(
 
 fn apply(
     context: &mut Context,
-    cached: &HashMap<u32, StreamChannels>,
+    cached: &HashMap<u32, StreamIdentity>,
     reports: &Sender<Input>,
     profile_op: &mut Option<ProfileOp>,
-    soft_mutes: &mut HashMap<(u32, u64), u32>,
+    soft_mutes: &mut TemporaryMutes,
     ops: &[Op],
 ) {
+    // Cleanup intent survives a lost Pulse connection and a one-shot release
+    // from a cancelled route. It never writes the user's persistent mute/gain.
     if context.get_state() != State::Ready {
+        for op in ops {
+            if let Op::Restore(snap) = op {
+                soft_mutes.release(StreamTarget { id: snap.id, generation: snap.generation });
+            }
+        }
         return;
     }
     for op in ops {
@@ -603,11 +731,9 @@ fn apply(
             Op::StartOutput { id, name } => start_output_node(*id, name.clone(), reports.clone()),
             Op::Default(_) => {}
             Op::Mute(stream) => {
-                if generation_ok(cached, stream) {
+                if stream.generation != 0 && generation_ok(cached, stream) {
                     if let Some(object_id) = cached.get(&stream.id).and_then(|s| s.object_id) {
-                        if set_soft_mute(object_id, true) {
-                            soft_mutes.insert((stream.id, stream.generation), object_id);
-                        }
+                        soft_mutes.hold(*stream, object_id, set_soft_mute);
                     }
                 }
             }
@@ -664,25 +790,8 @@ fn apply(
                 );
             }
             Op::Restore(snap) => {
-                let Some(saved) = cached.get(&snap.id) else {
-                    continue;
-                };
-                if saved.generation != snap.generation {
-                    continue;
-                }
-                let key = (snap.id, snap.generation);
-                if let Some(object_id) = soft_mutes.get(&key).copied() {
-                    if !set_soft_mute(object_id, false) {
-                        continue;
-                    }
-                    soft_mutes.remove(&key);
-                }
-                let channels = if saved.channels == 0 { 2 } else { saved.channels };
-                eprintln!("fleetpodsd: media command source=fleetpods restore id={} generation={} mute={} linear_gain={} channels={channels} sent", snap.id, snap.generation, snap.mute, snap.volume);
-                let mut volumes = ChannelVolumes::default();
-                volumes.set(channels, Volume::from(VolumeLinear(snap.volume)));
-                let _ = intro.set_sink_input_mute(snap.id, snap.mute, None);
-                let _ = intro.set_sink_input_volume(snap.id, &volumes, None);
+                soft_mutes.release(StreamTarget { id: snap.id, generation: snap.generation });
+                soft_mutes.clean_up(cached, soft_mutes.now(), set_soft_mute);
             }
         }
     }
@@ -690,7 +799,8 @@ fn apply(
 
 /// A Pulse mute is saved as the application's future mute setting. PipeWire's
 /// softMute only silences this node. Pulse doesn't report it, so the worker
-/// overlays confirmed holds on its graph and clears them before shutting down.
+/// overlays confirmed holds on its graph. Possible mutes remain owned even
+/// when confirmation fails; release retries belong to this same worker.
 ///
 /// A takeover mutes a stream that may already be playing on the speakers.
 /// The command first goes to a pw-cli kept open, which applies it within a
@@ -799,7 +909,7 @@ fn close_pw_cli() {
     let _ = child.wait();
 }
 
-fn generation_ok(cached: &HashMap<u32, StreamChannels>, stream: &StreamTarget) -> bool {
+fn generation_ok(cached: &HashMap<u32, StreamIdentity>, stream: &StreamTarget) -> bool {
     cached.get(&stream.id).is_some_and(|saved| saved.generation == stream.generation)
 }
 
@@ -1026,13 +1136,129 @@ fn raw_stream(info: &SinkInputInfo) -> RawStream {
         mute: info.mute,
         volume: VolumeLinear::from(info.volume.avg()).0,
         corked: info.corked,
-        channels: info.volume.len(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mute_target() -> StreamTarget {
+        StreamTarget { id: 7, generation: 70 }
+    }
+
+    fn mute_inventory() -> HashMap<u32, StreamIdentity> {
+        HashMap::from([(7, StreamIdentity { generation: 70, object_id: Some(17) })])
+    }
+
+    #[test]
+    fn unconfirmed_mute_is_owned_and_a_one_shot_release_retries_until_success() {
+        let mut mutes = TemporaryMutes::default();
+        let cached = mute_inventory();
+        let mut node_muted = false;
+        mutes.hold(mute_target(), 17, |_, muted| {
+            node_muted = muted; // The fast writer succeeded, but confirmation failed.
+            false
+        });
+        assert!(node_muted);
+        assert_eq!(mutes.held.len(), 1);
+        assert!(!mutes.held[&70].confirmed);
+        mutes.release(mute_target()); // The cancelled route never sends another request.
+        let mut calls = 0;
+        for now in [0, 100, 350, 1_350, 6_350, 11_350, 16_350] {
+            mutes.clean_up(&cached, MonoMs(now), |node, muted| {
+                assert_eq!(node, 17);
+                assert!(!muted);
+                calls += 1;
+                false
+            });
+            assert_eq!(mutes.held.len(), 1, "cleanup failure cannot abandon our mute");
+        }
+        assert_eq!(calls, 7, "required cleanup does not exhaust after five failures");
+        mutes.clean_up(&cached, MonoMs(16_351), |_, _| panic!("backoff must hold"));
+        mutes.clean_up(&cached, MonoMs(21_350), |_, muted| {
+            node_muted = muted;
+            true
+        });
+        assert!(!node_muted);
+        assert!(mutes.held.is_empty());
+    }
+
+    #[test]
+    fn renewed_hold_cancels_release_without_repeated_release_resetting_backoff() {
+        let mut mutes = TemporaryMutes::default();
+        let cached = mute_inventory();
+        mutes.hold(mute_target(), 17, |_, _| true);
+        mutes.release(mute_target());
+        mutes.clean_up(&cached, MonoMs(0), |_, _| false);
+        mutes.release(mute_target());
+        mutes.clean_up(&cached, MonoMs(99), |_, _| panic!("duplicate release reset backoff"));
+        mutes.hold(mute_target(), 17, |_, muted| muted);
+        mutes.clean_up(&cached, MonoMs(1_000), |_, _| panic!("new hold cancelled old cleanup"));
+        mutes.release(mute_target());
+        mutes.clean_up(&cached, MonoMs(1_000), |_, muted| !muted);
+        assert!(mutes.held.is_empty());
+    }
+
+    #[test]
+    fn cleanup_waits_for_inventory_and_never_unmutes_a_recycled_node() {
+        for survives in [false, true] {
+            let mut mutes = TemporaryMutes::default();
+            mutes.hold(mute_target(), 17, |_, _| true);
+            mutes.release_all();
+            mutes.clean_up(&HashMap::new(), MonoMs(0), |_, _| panic!("no live inventory"));
+            assert_eq!(mutes.held.len(), 1);
+            let mut current = mute_inventory();
+            if !survives {
+                current.get_mut(&7).unwrap().generation = 71;
+            }
+            mutes.observe(&current);
+            let mut releases = 0;
+            mutes.clean_up(&current, MonoMs(1_000), |_, muted| {
+                assert!(survives, "the replacement shares an ID, not mute ownership");
+                assert!(!muted);
+                releases += 1;
+                true
+            });
+            assert_eq!(releases, usize::from(survives));
+            assert!(mutes.held.is_empty());
+        }
+    }
+
+    #[test]
+    fn release_received_while_pulse_is_down_is_not_lost() {
+        let mainloop = Mainloop::new().unwrap();
+        let mut context = Context::new(&mainloop, "mute-test").unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let mut mutes = TemporaryMutes::default();
+        mutes.hold(mute_target(), 17, |_, _| true);
+        apply(
+            &mut context,
+            &HashMap::new(),
+            &tx,
+            &mut None,
+            &mut mutes,
+            &[Op::Restore(StreamSnap { id: 7, generation: 70, mute: false, volume: 1.0 })],
+        );
+        let current = mute_inventory();
+        mutes.observe(&current);
+        mutes.clean_up(&current, MonoMs(0), |_, muted| !muted);
+        assert!(mutes.held.is_empty());
+    }
+
+    #[test]
+    fn a_changed_pulse_index_keeps_the_same_native_mute_owner() {
+        let mut mutes = TemporaryMutes::default();
+        mutes.hold(mute_target(), 17, |_, _| true);
+        let current = HashMap::from([(8, StreamIdentity { generation: 70, object_id: Some(17) })]);
+        mutes.observe(&current);
+        mutes.release(StreamTarget { id: 8, generation: 70 });
+        mutes.clean_up(&current, MonoMs(0), |node, muted| {
+            assert_eq!(node, 17);
+            !muted
+        });
+        assert!(mutes.held.is_empty());
+    }
 
     #[test]
     fn unknown_sink_states_are_read_as_integers_without_constructing_an_enum() {

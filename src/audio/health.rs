@@ -79,6 +79,7 @@ impl Health {
                         stream.sink == output.name
                             && !stream.corked
                             && !stream.mute
+                            && !stream.temporarily_muted
                             && stream.volume > 0.0
                     })
                 })
@@ -139,6 +140,7 @@ mod tests {
                 role: "".into(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             }],
@@ -205,6 +207,7 @@ mod tests {
             "peer",
             "paused",
             "muted",
+            "temporarily_muted",
             "zero",
             "sink_muted",
             "sink_zero",
@@ -219,6 +222,7 @@ mod tests {
                 "unknown" => health.outputs[0].state = 99,
                 "paused" => graph.streams[0].corked = true,
                 "muted" => graph.streams[0].mute = true,
+                "temporarily_muted" => graph.streams[0].temporarily_muted = true,
                 "zero" => graph.streams[0].volume = 0.0,
                 "sink_muted" => health.outputs[0].muted = true,
                 "sink_zero" => health.outputs[0].audible_volume = false,

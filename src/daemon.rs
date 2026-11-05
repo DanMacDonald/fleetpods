@@ -5643,6 +5643,7 @@ mod tests {
                         role: String::new(),
                         node: "Brave".into(),
                         mute: false,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
                     }],
@@ -6606,6 +6607,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 0.4,
                     corked: false,
                 }],
@@ -7103,6 +7105,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             }],
@@ -7209,6 +7212,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             });
@@ -7266,6 +7270,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 0.5,
                     corked: false,
                 }],
@@ -7393,6 +7398,7 @@ mod tests {
                         role: "".into(),
                         node: "Brave".into(),
                         mute: false,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
                     }],
@@ -7506,6 +7512,7 @@ mod tests {
                 role: "".into(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked,
             }],
@@ -7688,6 +7695,7 @@ mod tests {
                         role: String::new(),
                         node: "Brave".into(),
                         mute: false,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: owner == "silent speakers",
                     }],
@@ -8126,6 +8134,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 0.8,
                 corked: false,
             }],
@@ -8328,6 +8337,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             }],
@@ -8399,6 +8409,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 })
@@ -8512,6 +8523,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -8540,7 +8552,7 @@ mod tests {
             daemon.step(Input::Tick, Clock::new(now.mono.0 + 100, now.unix.0 + 100));
             daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_600, now.unix.0 + 2_600));
             let mut muted = graph;
-            muted.streams[0].mute = true;
+            muted.streams[0].temporarily_muted = true;
             let reset = daemon.step(Input::Audio(muted), now);
             let card = reset.effects.iter().find_map(|effect| match effect {
                 Effect::RestartOutput { card, .. } => Some(card.clone()),
@@ -8584,6 +8596,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             }],
@@ -8619,7 +8632,7 @@ mod tests {
         assert!(!grant.effects.iter().any(|effect| matches!(effect, Effect::RestartOutput { .. })));
         assert!(!grant.effects.iter().any(|effect| matches!(effect, Effect::MoveStreams(_))));
         let mut muted = graph;
-        muted.streams[0].mute = true;
+        muted.streams[0].temporarily_muted = true;
         daemon.step(Input::Tick, Clock::new(now.mono.0 + 100, now.unix.0 + 100));
         daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_600, now.unix.0 + 2_600));
         let reset = daemon.step(Input::Audio(muted), now);
@@ -8724,6 +8737,7 @@ mod tests {
                         role: String::new(),
                         node: "Brave".into(),
                         mute: true,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
                     }],
@@ -9402,6 +9416,7 @@ mod tests {
                     role: String::new(),
                     node: String::new(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 },
@@ -9412,6 +9427,7 @@ mod tests {
                     role: String::new(),
                     node: String::new(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 0.4,
                     corked: false,
                 },
@@ -9423,7 +9439,7 @@ mod tests {
             Effect::MuteStreams(streams) if streams == &vec![StreamTarget { id: 1, generation: 8 }]
         )));
         let mut muted = graph;
-        muted.streams[0].mute = true;
+        muted.streams[0].temporarily_muted = true;
         let switching = daemon.step(Input::Audio(muted.clone()), now);
         assert!(switching.effects.iter().any(|effect| matches!(
             effect,
@@ -9514,6 +9530,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -10887,6 +10904,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -10969,6 +10987,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             }],
@@ -11096,6 +11115,7 @@ mod tests {
                             role: String::new(),
                             node: "Brave".into(),
                             mute: false,
+                            temporarily_muted: false,
                             volume: 1.0,
                             corked: false,
                         }],
@@ -11835,6 +11855,7 @@ mod tests {
                 role: "video".into(),
                 node: "Brave second process".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 0.6,
                 corked: false,
             });
@@ -12059,13 +12080,14 @@ mod tests {
                     role: "".into(),
                     node: "test".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 0.7,
                     corked: false,
                 }],
             };
             let held = a.step(Input::Audio(graph.clone()), now);
             assert!(held.effects.iter().any(|e| matches!(e, Effect::MuteStreams(_))));
-            graph.streams[0].mute = true;
+            graph.streams[0].temporarily_muted = true;
             a.step(Input::Audio(graph), now);
             let mut b = peer(2, now);
             b.step(Input::Command(Command::Activity), now);

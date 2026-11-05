@@ -2294,6 +2294,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -3314,6 +3315,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -3336,7 +3338,7 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::PausePlayers(_) | Effect::RestartOutput { .. })));
             assert!(!resumed(&grant.effects));
-            graph.streams[0].mute = true;
+            graph.streams[0].temporarily_muted = true;
             graph.streams[0].corked = true;
             graph.streams[0].sink = "speakers".into();
             let reset = daemon.step(Input::Audio(graph.clone()), at(2_600));
@@ -3364,7 +3366,7 @@ mod tests {
                 graph.streams[0].sink = "pods".into();
                 let linked = daemon.step(Input::Audio(graph.clone()), at(2_680));
                 assert!(!resumed(&linked.effects));
-                graph.streams[0].mute = false;
+                graph.streams[0].temporarily_muted = false;
                 // The relink entered Settling on the linked snapshot and
                 // this un-muted one lands more than 250 ms later, so the
                 // router starts the output here.
@@ -3506,12 +3508,13 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
             };
             let mut parked = playing.clone();
-            parked.streams[0].mute = true;
+            parked.streams[0].temporarily_muted = true;
             parked.streams[0].sink = "speakers".into();
             daemon.step(Input::Audio(playing.clone()), now);
             daemon.step(Input::Observation(Observation::Ownership(false)), now);
@@ -3665,6 +3668,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -3681,7 +3685,7 @@ mod tests {
             let grant = daemon.step(Input::Observation(Observation::Ownership(true)), now);
             // Recovery parks the muted stream on the speakers before restarting.
             let mut parked = graph.clone();
-            parked.streams[0].mute = true;
+            parked.streams[0].temporarily_muted = true;
             parked.streams[0].sink = "speakers".into();
             let settled = daemon.step(Input::Audio(parked), now);
             let restarted = [&grant.effects, &settled.effects].iter().any(|effects| {
@@ -3723,12 +3727,13 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
             };
             let mut parked = playing.clone();
-            parked.streams[0].mute = true;
+            parked.streams[0].temporarily_muted = true;
             parked.streams[0].sink = "speakers".into();
             daemon.step(Input::Audio(playing.clone()), now);
             daemon.step(Input::Observation(Observation::Ownership(false)), now);
@@ -3815,7 +3820,7 @@ mod tests {
                     TaskState::Running { .. }
                 ));
                 let mut parked = playing;
-                parked.streams[0].mute = true;
+                parked.streams[0].temporarily_muted = true;
                 parked.streams[0].sink = "speakers".into();
                 let next = daemon.step(Input::Audio(parked), at(40));
                 assert!(next
@@ -3857,6 +3862,7 @@ mod tests {
                 role: String::new(),
                 node: "Brave".into(),
                 mute: false,
+                temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
             }],
@@ -3938,7 +3944,7 @@ mod tests {
                 assert!(start.effects.iter().any(|e| matches!(e, Effect::PausePlayers(_))));
                 let old = recovery_id(&daemon).unwrap();
                 let mut parked = playing.clone();
-                parked.streams[0].mute = true;
+                parked.streams[0].temporarily_muted = true;
                 parked.streams[0].sink = "speakers".into();
                 let restart = daemon.step(Input::Audio(parked.clone()), at(3_020));
                 assert!(restart
@@ -4124,7 +4130,7 @@ mod tests {
         assert_eq!(recovery_id(&daemon), Some(rebuild));
 
         let mut parked = playing.clone();
-        parked.streams[0].mute = true;
+        parked.streams[0].temporarily_muted = true;
         parked.streams[0].sink = "speakers".into();
         let reset = daemon.step(Input::Audio(parked), at(3_310));
         assert!(reset
@@ -4172,6 +4178,7 @@ mod tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
@@ -4193,7 +4200,7 @@ mod tests {
             // Opening reports may name the old owner before granting this play.
             daemon.step(Input::Observation(Observation::Ownership(false)), now);
             daemon.step(Input::Observation(Observation::Ownership(true)), now);
-            graph.streams[0].mute = true;
+            graph.streams[0].temporarily_muted = true;
             daemon.step(Input::Audio(graph.clone()), now);
             graph.sinks.push(pods);
             let arrived = daemon.step(Input::Audio(graph.clone()), now);
@@ -4277,6 +4284,7 @@ mod tests {
                         role: String::new(),
                         node: "Brave".into(),
                         mute: true,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
                     }],
@@ -4302,6 +4310,7 @@ mod tests {
                         role: String::new(),
                         node: "Brave".into(),
                         mute: true,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
                     }],
@@ -4332,6 +4341,7 @@ mod tests {
                         role: String::new(),
                         node: "Brave".into(),
                         mute: true,
+                        temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
                     }],

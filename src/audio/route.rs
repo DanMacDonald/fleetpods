@@ -27,6 +27,8 @@ pub struct LiveStream {
     /// PipeWire node or application name. The speaker-tuning output is not a playback stream.
     pub node: String,
     pub mute: bool,
+    /// FleetPods owns this temporary hold independently of the user mute.
+    pub temporarily_muted: bool,
     pub volume: f64,
     pub corked: bool,
 }
@@ -67,7 +69,6 @@ struct RouteState {
     quiet_at: Option<MonoMs>,
     asked_default: Option<MonoMs>,
     asked_move: Option<MonoMs>,
-    asked_restore: Option<MonoMs>,
     restore_sent: BTreeSet<(u32, u64)>,
     takeover_started: Option<MonoMs>,
     missing_since: BTreeMap<(u32, u64), MonoMs>,
@@ -176,7 +177,6 @@ impl RouteState {
         self.quiet_at = None;
         self.asked_default = None;
         self.asked_move = None;
-        self.asked_restore = None;
         self.restore_sent.clear();
         self.takeover_started = None;
         self.from = None;
@@ -191,7 +191,6 @@ impl RouteState {
             quiet_at: None,
             asked_default: None,
             asked_move: None,
-            asked_restore: None,
             restore_sent: BTreeSet::new(),
             takeover_started: None,
             missing_since: BTreeMap::new(),
@@ -284,7 +283,6 @@ impl RouteState {
         }
         self.quiet_at = None;
         self.asked_move = None;
-        self.asked_restore = None;
         self.restore_sent.clear();
         self.recovery = Recovery::Parking {
             id,
@@ -762,7 +760,7 @@ fn plan(
             .held
             .iter()
             .filter_map(|saved| find_held(graph, saved))
-            .filter(|s| (s.sink == sink || s.sink == via) && !s.mute)
+            .filter(|s| (s.sink == sink || s.sink == via) && !s.mute && !s.temporarily_muted)
             .map(target)
             .collect();
         if !hot.is_empty() {
@@ -812,7 +810,11 @@ fn plan(
     }
     let still_hot: Vec<StreamTarget> = on_from
         .iter()
-        .filter(|stream| !stream.mute && state.quieted.contains(&(stream.id, stream.generation)))
+        .filter(|stream| {
+            !stream.mute
+                && !stream.temporarily_muted
+                && state.quieted.contains(&(stream.id, stream.generation))
+        })
         .map(|stream| target(stream))
         .collect();
     if !still_hot.is_empty() {
@@ -822,7 +824,7 @@ fn plan(
         }
         return waiting(state);
     }
-    let restore = take_arrived(&mut state, graph, &sink.name, now);
+    let restore = take_arrived(&mut state, graph, &sink.name);
     if graph.default_sink != sink.name {
         let set_default = if due(&state.asked_default, now) {
             state.asked_default = Some(now);
@@ -1004,16 +1006,10 @@ fn on_sink<'a>(graph: &'a Graph, sink: Option<&str>) -> Vec<&'a LiveStream> {
         .collect()
 }
 
-fn take_arrived(
-    state: &mut RouteState,
-    graph: &Graph,
-    accessory: &str,
-    now: MonoMs,
-) -> Vec<StreamSnap> {
+fn take_arrived(state: &mut RouteState, graph: &Graph, accessory: &str) -> Vec<StreamSnap> {
     let from = state.from.clone();
     let mut restore = Vec::new();
     let mut keep = Vec::new();
-    let mut ask = false;
     for saved in state.held.drain(..) {
         let Some(live) = find_held(graph, &saved) else {
             // A move can temporarily remove the stream from a graph snapshot.
@@ -1035,21 +1031,18 @@ fn take_arrived(
         // An unmuted snapshot can precede our queued mute, especially when
         // WirePlumber auto-moves a stream onto a newly created output. Always
         // send the matching restore before considering that stream settled.
-        if settled(live, &saved)
+        if !live.temporarily_muted
             && (saved.mute || state.restore_sent.contains(&(saved.id, saved.generation)))
         {
             continue;
         }
-        ask = true;
-        restore.push(saved);
+        // Submit release once. The audio worker owns cleanup retries, including
+        // after cancellation; this gate still waits for the hold to be gone.
+        if state.restore_sent.insert((saved.id, saved.generation)) {
+            restore.push(saved);
+        }
         keep.push(saved);
     }
-    if ask && due(&state.asked_restore, now) {
-        state.asked_restore = Some(now);
-    } else if ask {
-        restore.clear();
-    }
-    state.restore_sent.extend(restore.iter().map(|saved| (saved.id, saved.generation)));
     state.held = keep;
     // Once a stream is restored, a later route must save it afresh before
     // muting it again. Remembering only "already quieted" loses that save.
@@ -1059,9 +1052,6 @@ fn take_arrived(
     state.restore_sent.retain(|&(id, generation)| {
         state.held.iter().any(|saved| saved.id == id && saved.generation == generation)
     });
-    if state.held.is_empty() {
-        state.asked_restore = None;
-    }
     restore
 }
 
@@ -1076,10 +1066,6 @@ fn find_held<'a>(graph: &'a Graph, saved: &StreamSnap) -> Option<&'a LiveStream>
                 .iter()
                 .find(|stream| saved.generation != 0 && stream.generation == saved.generation)
         })
-}
-
-fn settled(live: &LiveStream, saved: &StreamSnap) -> bool {
-    live.mute == saved.mute && (live.volume - saved.volume).abs() < 0.05
 }
 
 fn streams_to_move(state: &RouteState, graph: &Graph, accessory: &str) -> Vec<StreamTarget> {
@@ -1209,7 +1195,7 @@ fn sink_for(graph: &Graph, address: Address) -> Option<&Sink> {
 /// A stream the user is hearing. Event sounds, notifications, muted streams,
 /// and corked streams are not moved.
 pub fn managed(stream: &LiveStream) -> bool {
-    if stream.corked || stream.mute {
+    if stream.corked || stream.mute || stream.temporarily_muted {
         return false;
     }
     let role = stream.role.to_ascii_lowercase();
@@ -1272,6 +1258,7 @@ mod tests {
             role: role.into(),
             node: String::new(),
             mute,
+            temporarily_muted: false,
             volume: 1.0,
             corked: false,
         }
@@ -1321,7 +1308,7 @@ mod tests {
         assert_eq!(quiet.quiet, vec![StreamTarget { id: 1, generation: 8 }]);
         assert!(quiet.move_streams.is_none());
         assert!(quiet.set_default.is_none());
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         let waiting = plan(quiet.state, Some(pods), &picture, MonoMs(200));
         assert!(waiting.restore.is_empty());
         assert!(!waiting.state.held[0].mute);
@@ -1347,7 +1334,7 @@ mod tests {
         );
         let held = plan(claiming(), Some(pods), &picture, MonoMs(0)).state;
         assert_eq!(held.held.len(), 1);
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         for cancel in [false, true] {
             let mut state = held.clone();
             if cancel {
@@ -1375,7 +1362,7 @@ mod tests {
         let mut router = Router::new();
         router.claim();
         router.on_graph(Some(pods), &picture, false, MonoMs(0));
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         // The control link came up 8 s in; the sink lands 60 ms past the first deadline.
         router.extend_takeover(MonoMs(8_000));
         let waiting = router.on_graph(Some(pods), &picture, false, MonoMs(TAKEOVER_HOLD_MS + 60));
@@ -1407,14 +1394,44 @@ mod tests {
         let arrived = plan(quiet.state, Some(pods), &picture, MonoMs(100));
         assert_eq!(arrived.restore.len(), 1);
         assert!(!arrived.restore[0].mute);
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         let retry = plan(arrived.state, Some(pods), &picture, MonoMs(1_200));
-        assert_eq!(retry.restore.len(), 1);
-        assert!(!retry.restore[0].mute);
-        picture.streams[0].mute = false;
+        assert!(retry.restore.is_empty(), "the audio worker owns release retries");
+        assert_eq!(retry.state.held.len(), 1, "routing still waits for release confirmation");
+        picture.streams[0].temporarily_muted = false;
         let done = plan(retry.state, Some(pods), &picture, MonoMs(1_300));
         assert!(done.state.held.is_empty());
         assert!(done.restore.is_empty());
+    }
+
+    #[test]
+    fn releasing_our_hold_preserves_user_mute_and_volume_changes() {
+        let pods = address();
+        let mut picture = graph(
+            "speakers",
+            vec![sink("speakers", None, None), sink("pods", Some(pods), Some("a2dp-sink"))],
+            vec![stream(1, 8, "speakers", "", false)],
+        );
+        let quiet = plan(claiming(), Some(pods), &picture, MonoMs(0));
+        picture.default_sink = "pods".into();
+        picture.streams[0].sink = "pods".into();
+        picture.streams[0].temporarily_muted = true;
+        picture.streams[0].mute = true; // The user mutes and adjusts gain during our hold.
+        picture.streams[0].volume = 0.3;
+        let arrived = plan(quiet.state, Some(pods), &picture, MonoMs(100));
+        assert_eq!(arrived.restore.len(), 1);
+        let waiting = plan(arrived.state, Some(pods), &picture, MonoMs(2_000));
+        assert_eq!(waiting.state.held.len(), 1);
+        assert!(waiting.restore.is_empty());
+        picture.streams[0].temporarily_muted = false;
+        let done = plan(waiting.state, Some(pods), &picture, MonoMs(2_100));
+        assert!(done.state.held.is_empty(), "only our hold needs to clear");
+        assert!(
+            done.restore.is_empty(),
+            "do not chase the user's mute or gain back to the snapshot"
+        );
+        assert!(picture.streams[0].mute);
+        assert_eq!(picture.streams[0].volume, 0.3);
     }
 
     #[test]
@@ -1446,7 +1463,7 @@ mod tests {
         assert!(waiting.set_default.is_none());
 
         let mut muted = picture.clone();
-        muted.streams[0].mute = true;
+        muted.streams[0].temporarily_muted = true;
         let switching = plan(first.state, Some(pods), &muted, MonoMs(300));
         assert_eq!(switching.set_default.as_deref(), Some(pods_sink));
 
@@ -1469,8 +1486,9 @@ mod tests {
         assert!(again.restore.is_empty(), "the unmute is not repeated inside the retry interval");
         assert_eq!(again.state.held.len(), 1);
         let retry = plan(again.state, Some(pods), &landed, MonoMs(1_700));
-        assert!(!retry.restore[0].mute);
-        landed.streams[0].mute = false;
+        assert!(retry.restore.is_empty(), "the audio worker owns release retries");
+        assert_eq!(retry.state.held.len(), 1);
+        landed.streams[0].temporarily_muted = false;
         let done = plan(retry.state, Some(pods), &landed, MonoMs(1_800));
         assert!(done.restore.is_empty());
         assert!(done.state.held.is_empty());
@@ -1571,7 +1589,7 @@ mod tests {
         assert_eq!(muted.quiet, vec![StreamTarget { id: 1, generation: 10 }]);
         assert!(muted.move_streams.is_none());
         assert!(muted.restart_output.is_none());
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         let detached = plan(muted.state, Some(pods), &picture, MonoMs(10));
         assert_eq!(detached.move_streams.as_ref().unwrap().sink, "speakers");
         assert_eq!(detached.move_streams.as_ref().unwrap().streams.len(), 2);
@@ -1604,7 +1622,7 @@ mod tests {
         assert!(restored.start_output.is_none(), "wait for the unmute to be observed");
         let waiting = plan(restored.state, Some(pods), &picture, MonoMs(300));
         assert!(waiting.start_output.is_none());
-        picture.streams[0].mute = false;
+        picture.streams[0].temporarily_muted = false;
         let linked = plan(waiting.state, Some(pods), &picture, MonoMs(310));
         assert!(linked.start_output.is_none());
         let mut cancelled = linked.state.clone();
@@ -1721,7 +1739,7 @@ mod tests {
         let quiet = plan(state, Some(pods), &picture, MonoMs(10));
         assert_eq!(quiet.quiet.len(), 1);
         assert_eq!(quiet.state.held.len(), 1, "every mute needs a saved state");
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         let moved = plan(quiet.state, Some(pods), &picture, MonoMs(20));
         picture.streams[0].sink = "pods".into();
         let restored = plan(moved.state, Some(pods), &picture, MonoMs(30));
@@ -1743,7 +1761,7 @@ mod tests {
         for id in 1..=3 {
             assert!(state.begin_recovery(id, pods, &picture, MonoMs(id * 1_000)));
             let muted = plan(state, Some(pods), &picture, MonoMs(id * 1_000));
-            picture.streams[0].mute = true;
+            picture.streams[0].temporarily_muted = true;
             let detached = plan(muted.state, Some(pods), &picture, MonoMs(id * 1_000 + 10));
             picture.streams[0].sink = "speakers".into();
             let reset = plan(detached.state, Some(pods), &picture, MonoMs(id * 1_000 + 20));
@@ -1757,7 +1775,7 @@ mod tests {
             let arrived = plan(gap.state, Some(pods), &picture, MonoMs(id * 1_000 + 50));
             assert_eq!(arrived.restore.len(), 1, "switch {id} must restore after the graph gap");
             assert!(!arrived.restore[0].mute);
-            picture.streams[0].mute = false;
+            picture.streams[0].temporarily_muted = false;
             state = plan(arrived.state, Some(pods), &picture, MonoMs(id * 1_000 + 60)).state;
             assert!(state.held.is_empty());
             let started = plan(state, Some(pods), &picture, MonoMs(id * 1_000 + 310));
@@ -1842,7 +1860,7 @@ mod tests {
         // State survived inside the Router: the muted stream is held, and a
         // later graph with the pods sink moves to SetDefault, not Quiet again.
         assert_eq!(router.held_streams().len(), 1);
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         picture.sinks.push(sink("pods", Some(pods), Some("a2dp-sink")));
         router.on_graph(Some(pods), &picture, false, MonoMs(400));
         assert_eq!(router.take_work(MonoMs(400), false), vec![Work::SetDefault("pods".into())]);
@@ -1887,7 +1905,7 @@ mod tests {
         router.claim();
         router.on_graph(Some(address()), &picture, false, MonoMs(0));
         router.take_work(MonoMs(0), true);
-        picture.streams[0].mute = true;
+        picture.streams[0].temporarily_muted = true;
         picture.streams[0].sink = "pods".into();
         picture.default_sink = "pods".into();
         // The last graph already reflects our mute; handoff must keep the original.

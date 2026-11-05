@@ -17,6 +17,8 @@ pub struct Requests(u64);
 #[derive(Clone, Copy, Debug)]
 pub enum Limit {
     Attempts(u32),
+    /// Required cleanup remains owned until it succeeds or the resource is gone.
+    UntilCancelled,
     /// Measured from the first failed reply, checked on each subsequent failure.
     FailureWindow(u64),
 }
@@ -199,6 +201,7 @@ impl Task {
     fn failed(&mut self, now: MonoMs) {
         let first = *self.first_failure.get_or_insert(now);
         let exhausted = match self.policy.limit {
+            Limit::UntilCancelled => false,
             Limit::Attempts(limit) => self.attempts >= limit,
             Limit::FailureWindow(ms) => now.saturating_since(first) >= ms,
         };

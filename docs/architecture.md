@@ -64,7 +64,10 @@ graph observations and the clock. Its `finish_session` plans and drains routing
 once per step after ownership and recovery decisions. Mutes execute ahead of
 player pauses and control writes. Recovery can cancel a queued restore before it reaches Linux;
 a new claim inherits a handoff's originals before reading a muted graph. An
-audio-server restart discards saved serials and every queued mute or restore.
+audio-server restart discards the router's saved serials and queued work. The
+Linux audio worker retains cleanup of its own temporary mutes until fresh
+inventory confirms release or disappearance. It does not restore persistent
+user mute or volume settings; those remain separate from its temporary holds.
 `Audio` keeps player observations, not a second copy of routing holds.
 Deferred claims, background/rejoin intent, ownership timing, player resumes and
 recovery bookkeeping are private to `Session`.

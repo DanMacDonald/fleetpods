@@ -39,6 +39,19 @@ hold. The authenticated roster's playback-intent flag is the single early-yield
 trigger, preserving advance release for actual takeovers before a control claim
 can arrive.
 
+The router decides when a temporary stream mute is needed and when to release
+it. The Linux audio worker owns every possibly applied `softMute`, including
+when the fast command succeeded but its confirmation failed. Release is sent
+once by the router; the worker's shared retry task retains cleanup through
+failure or cancellation, with backoff capped at five seconds until success or
+confirmed node disappearance. A new hold cancels pending release for that node.
+Live graphs distinguish this hold from the user's mute. Releasing it only clears
+`softMute`; it never writes a saved Pulse mute or volume over a user's changes.
+Routing still waits for the temporary hold to clear before completing recovery.
+Pulse reconnection releases surviving owned nodes using fresh stream identities;
+incomplete inventories do not prove removal, and replacement serials are not
+unmuted. Normal shutdown stops the fast writer and makes a bounded cleanup attempt.
+
 Permission to open is not permission to take audio: `Facts.intent` is
 `JoinInBackground` until the router holds a playback claim (`TakeAudio`), and
 only `TakeAudio` pursues profiles, routing and streaming. Ownership claims are
@@ -71,6 +84,14 @@ updates and pairing holds preserve a failed attempt's budget. Explicit release
 followed by new intent, removal of a successful registration, or a bluetoothd
 restart starts a new registration lifetime. D-Bus call timeouts report failure to
 the task; tagged late replies cannot complete a newer attempt.
+
+Discovery belongs to that same radio worker. It waits for BlueZ to acknowledge
+the transport and duplicate-report filter before starting discovery. Rejected,
+timed-out or unsent filter requests use discovery's existing one-second retry
+deadline; submitting a request never records the filter as configured. Updating
+a live scan preserves its session. Filter requests use the same pending D-Bus
+serials and timeout as discovery, so replies after timeout or a BlueZ restart
+cannot configure a replacement session. Pairing still yields this client's scan.
 
 Removal is a separate operation under that same radio owner, using the shared
 retry task with the same five-attempt backoff. Failure, timeout or a failed submit

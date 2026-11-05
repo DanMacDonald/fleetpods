@@ -608,6 +608,7 @@ enum SecretJob {
 }
 
 enum CallKind {
+    ScanFilter { transport: Option<&'static str> },
     StartDiscovery,
     StopDiscovery,
     Disconnect { address: Address, generation: Generation },
@@ -1007,6 +1008,7 @@ struct Air {
     removal: Option<Task>,
     requests: Requests,
     clock_origin: Instant,
+    /// The filter BlueZ acknowledged, never just the one we submitted.
     scan_transport: Option<&'static str>,
 }
 
@@ -1198,14 +1200,28 @@ impl Air {
         self.scan_retry_at = (!accepted).then_some(now + Duration::from_secs(1));
     }
 
+    fn scan_filter_result(
+        &mut self,
+        transport: Option<&'static str>,
+        accepted: bool,
+        now: Instant,
+    ) {
+        self.scan_transport = if accepted { transport } else { None };
+        // Reuse discovery's retry deadline, including when changing a live
+        // scan's transport. A filter failure does not release its session.
+        self.scan_retry_at = (!accepted).then_some(now + Duration::from_secs(1));
+    }
+
     fn scan_check_due(&self, now: Instant) -> bool {
         self.want_scan
             && self.scanned
             && self.scan_checked_at.is_none_or(|at| now.duration_since(at) >= SCAN_CHECK)
     }
 
-    fn scan_due(&self, now: Instant) -> bool {
-        !self.scanned && !self.pairing_paused(now) && self.scan_retry_at.is_none_or(|at| now >= at)
+    fn scan_due(&self, transport: &str, now: Instant) -> bool {
+        (!self.scanned || self.scan_transport != Some(transport))
+            && !self.pairing_paused(now)
+            && self.scan_retry_at.is_none_or(|at| now >= at)
     }
 }
 
@@ -1221,7 +1237,11 @@ fn poll_timeout(live: &Live, now: Instant) -> i32 {
     if live.air.want_scan {
         // A running scan is rechecked; see verify_scan. A scan that needs
         // a new session is retried on the one-second poll.
-        let scan = if live.air.scanned { SCAN_CHECK.as_millis() as i32 } else { 1_000 };
+        let scan = if live.air.scanned && live.air.scan_retry_at.is_none() {
+            SCAN_CHECK.as_millis() as i32
+        } else {
+            1_000
+        };
         timeout = Some(timeout.map_or(scan, |current| current.min(scan)));
     }
     if live.adapter_path.is_some()
@@ -1487,6 +1507,10 @@ fn expire_calls(reports: &Sender<Input>, live: &mut Live) {
             continue;
         }
         match call.kind {
+            CallKind::ScanFilter { transport } => {
+                eprintln!("fleetpodsd: Bluetooth discovery filter timed out; retrying");
+                live.air.scan_filter_result(transport, false, Instant::now());
+            }
             CallKind::Advertise { id } => {
                 live.air.advertisement_reply(id, false, Instant::now());
                 // The unanswered call may have reserved a slot. Its replacement
@@ -1681,6 +1705,21 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
         CallResult::Failed { name, message } => Some(format!("{name}: {message}")),
     };
     match call.kind {
+        CallKind::ScanFilter { transport } => {
+            let accepted = matches!(&result, CallResult::Done);
+            live.air.scan_filter_result(transport, accepted, Instant::now());
+            if let CallResult::Failed { name, message } = &result {
+                eprintln!(
+                    "fleetpodsd: Bluetooth discovery filter failed: {name}: {message}; retrying"
+                );
+            }
+            if live.air.scanned
+                && ((!live.air.want_scan && !live.air.wanted)
+                    || live.air.pairing_paused(Instant::now()))
+            {
+                stop_discovery(bus, live);
+            }
+        }
         CallKind::StartDiscovery => {
             // A submitted request is not proof that BlueZ actually started scanning.
             let accepted = matches!(&result, CallResult::Done)
@@ -1915,6 +1954,7 @@ fn drop_restarted_calls(live: &mut Live) {
             call.kind,
             CallKind::StartDiscovery
                 | CallKind::StopDiscovery
+                | CallKind::ScanFilter { .. }
                 | CallKind::Advertise { .. }
                 | CallKind::Unadvertise { .. }
         )
@@ -2319,7 +2359,11 @@ fn unregister_advertisement(bus: &Bus, live: &mut Live, id: RequestId) {
 }
 
 fn stop_discovery(bus: &Bus, live: &mut Live) {
-    if live.calls.iter().any(|call| matches!(call.kind, CallKind::StopDiscovery)) {
+    if live
+        .calls
+        .iter()
+        .any(|call| matches!(call.kind, CallKind::StopDiscovery | CallKind::ScanFilter { .. }))
+    {
         return;
     }
     let Some(path) = live.adapter_path.as_deref() else {
@@ -2340,7 +2384,7 @@ fn stop_discovery(bus: &Bus, live: &mut Live) {
     }
 }
 
-fn set_scan_filter(bus: &Bus, live: &Live, transport: Option<&str>) {
+fn set_scan_filter(bus: &Bus, live: &mut Live, transport: Option<&'static str>) {
     let Some(path) = live.adapter_path.as_deref() else { return };
     let mut filter: HashMap<String, dbus::arg::Variant<Box<dyn dbus::arg::RefArg>>> =
         HashMap::new();
@@ -2355,7 +2399,17 @@ fn set_scan_filter(bus: &Bus, live: &Live, transport: Option<&str>) {
         "org.bluez.Adapter1",
         "SetDiscoveryFilter",
     ) {
-        let _ = bus.submit(message.append1(filter));
+        match bus.submit(message.append1(filter)) {
+            Ok(serial) => live.calls.push(PendingCall {
+                serial,
+                kind: CallKind::ScanFilter { transport },
+                sent: Instant::now(),
+            }),
+            Err(err) => {
+                eprintln!("fleetpodsd: Bluetooth discovery filter submit failed: {err}; retrying");
+                live.air.scan_filter_result(transport, false, Instant::now());
+            }
+        }
     }
 }
 
@@ -2368,10 +2422,12 @@ fn verify_scan(bus: &Bus, live: &mut Live) {
     let now = Instant::now();
     if !live.air.scan_check_due(now)
         || live.air.pairing_paused(now)
-        || live
-            .calls
-            .iter()
-            .any(|call| matches!(call.kind, CallKind::StartDiscovery | CallKind::StopDiscovery))
+        || live.calls.iter().any(|call| {
+            matches!(
+                call.kind,
+                CallKind::StartDiscovery | CallKind::StopDiscovery | CallKind::ScanFilter { .. }
+            )
+        })
     {
         return;
     }
@@ -2397,22 +2453,25 @@ fn ensure_scan(bus: &Bus, live: &mut Live) {
         }
         return;
     }
-    if live
-        .calls
-        .iter()
-        .any(|call| matches!(call.kind, CallKind::StartDiscovery | CallKind::StopDiscovery))
-    {
+    if live.calls.iter().any(|call| {
+        matches!(
+            call.kind,
+            CallKind::StartDiscovery | CallKind::StopDiscovery | CallKind::ScanFilter { .. }
+        )
+    }) {
         return;
     }
     let Some(path) = live.adapter_path.clone() else { return };
     // During setup the panel may adopt existing discovery instead of starting
     // its own session. Include classic Bluetooth so the audio device is found.
     let transport = if live.accessory.is_some() { "le" } else { "auto" };
+    if !live.air.scan_due(transport, now) {
+        return;
+    }
     if live.air.scan_transport != Some(transport) {
         set_scan_filter(bus, live, Some(transport));
-        live.air.scan_transport = Some(transport);
-    }
-    if !live.air.scan_due(now) {
+        // Starting before the acknowledgement could silently scan with the
+        // default settings after an adapter restart rejected the filter.
         return;
     }
     if let Ok(message) =
@@ -3055,20 +3114,91 @@ mod advertisement_tests {
     fn failed_or_lost_discovery_retries_without_becoming_a_connection_request() {
         let now = Instant::now();
         let mut air = Air { want_scan: true, ..Air::default() };
-        assert!(air.scan_due(now));
+        assert!(air.scan_due("le", now));
         // StartDiscovery can fail while bluetoothd is restarting. Do not
         // mistake submitting that request for a running discovery session.
         air.scan_result(false, now);
         assert!(!air.scanned);
-        assert!(!air.scan_due(now + Duration::from_millis(999)));
-        assert!(air.scan_due(now + Duration::from_secs(1)));
+        assert!(!air.scan_due("le", now + Duration::from_millis(999)));
+        assert!(air.scan_due("le", now + Duration::from_secs(1)));
+        air.scan_filter_result(Some("le"), true, now + Duration::from_secs(1));
         air.scan_result(true, now + Duration::from_secs(1));
         assert!(air.scanned);
-        assert!(!air.scan_due(now + Duration::from_secs(10)));
+        assert!(!air.scan_due("le", now + Duration::from_secs(10)));
         // DiscoveryStopped / bluetoothd loss invalidates a successful start.
         air.scan_result(false, now + Duration::from_secs(10));
         assert!(air.want_scan);
-        assert!(air.scan_due(now + Duration::from_secs(11)));
+        assert!(air.scan_due("le", now + Duration::from_secs(11)));
+    }
+
+    #[test]
+    fn rejected_scan_filter_is_retried_before_discovery_can_start() {
+        let now = Instant::now();
+        let mut air = Air { want_scan: true, ..Air::default() };
+        // BlueZ owns its name but has not exported Adapter1 yet. Submitting
+        // SetDiscoveryFilter must not cache the requested transport.
+        air.scan_filter_result(Some("le"), false, now);
+        assert_eq!(air.scan_transport, None);
+        assert!(!air.scanned);
+        assert!(!air.scan_due("le", now + Duration::from_millis(999)));
+        let retry = now + Duration::from_secs(1);
+        assert!(air.scan_due("le", retry));
+        air.scan_filter_result(Some("le"), true, retry);
+        assert_eq!(air.scan_transport, Some("le"));
+        assert!(air.scan_due("le", retry), "the acknowledged filter still needs StartDiscovery");
+        air.scan_result(true, retry);
+        assert!(!air.scan_due("le", retry));
+        assert!(air.scan_due("auto", retry), "setup must replace the acknowledged LE filter");
+    }
+
+    #[test]
+    fn timed_out_filter_update_keeps_the_scan_and_retries_without_radio_traffic() {
+        let (tx, _rx) = mpsc::channel();
+        let mut live = Live::default();
+        live.air.want_scan = true;
+        live.air.scan_transport = Some("auto");
+        live.air.scan_result(true, Instant::now());
+        live.calls.push(PendingCall {
+            serial: 42,
+            kind: CallKind::ScanFilter { transport: Some("le") },
+            sent: Instant::now() - Duration::from_secs(26),
+        });
+        expire_calls(&tx, &mut live);
+        assert!(live.calls.is_empty(), "a late acknowledgement no longer has a pending serial");
+        assert!(live.air.scanned, "configuration failure must not lose our running session");
+        assert_eq!(live.air.scan_transport, None);
+        assert!(poll_timeout(&live, Instant::now()) <= 1_000);
+        let retry = live.air.scan_retry_at.unwrap();
+        assert!(!live.air.scan_due("le", retry - Duration::from_millis(1)));
+        assert!(live.air.scan_due("le", retry));
+        live.air.scan_filter_result(Some("le"), true, retry);
+        assert!(!live.air.scan_due("le", retry), "a live scan needs no second StartDiscovery");
+    }
+
+    #[test]
+    fn bluez_restart_retires_scan_filter_requests_and_confirmed_settings() {
+        for returned in [false, true] {
+            let (tx, _rx) = mpsc::channel();
+            let mut live = Live::default();
+            live.air.want_scan = true;
+            live.air.scan_transport = Some("auto");
+            live.air.scan_result(true, Instant::now());
+            live.calls.push(PendingCall {
+                serial: 42,
+                kind: CallKind::ScanFilter { transport: Some("le") },
+                sent: Instant::now(),
+            });
+            if returned {
+                note_bluez_returned(&tx, &mut live);
+            } else {
+                note_bluez_left(&tx, &mut live);
+            }
+            assert!(live.calls.is_empty(), "the old filter reply cannot configure the new owner");
+            assert_eq!(live.air.scan_transport, None);
+            assert!(!live.air.scanned);
+            assert!(live.air.want_scan);
+            assert!(live.air.scan_due("le", live.air.scan_retry_at.unwrap()));
+        }
     }
 
     #[test]
@@ -3099,19 +3229,19 @@ mod advertisement_tests {
         let mut air = Air { want_scan: true, ..Air::default() };
         air.observe_pairing(false, Some(&pairing_frame()), now);
         assert!(air.pairing_paused(now));
-        assert!(!air.scan_due(now));
+        assert!(!air.scan_due("le", now));
         // A late discovery reply, adapter recovery, or scan retry must not
         // reclaim discovery from the Bluetooth panel during pairing.
         air.scan_result(true, now);
         assert!(air.pairing_paused(now));
         air.scan_result(false, now + Duration::from_secs(1));
-        assert!(!air.scan_due(now + Duration::from_secs(119)));
-        assert!(air.scan_due(now + Duration::from_secs(120)));
+        assert!(!air.scan_due("le", now + Duration::from_secs(119)));
+        assert!(air.scan_due("le", now + Duration::from_secs(120)));
 
         air.observe_pairing(false, Some(&pairing_frame()), now);
         air.pairing_completed(now + Duration::from_secs(10));
-        assert!(!air.scan_due(now + Duration::from_secs(14)));
-        assert!(air.scan_due(now + Duration::from_secs(15)));
+        assert!(!air.scan_due("le", now + Duration::from_secs(14)));
+        assert!(air.scan_due("le", now + Duration::from_secs(15)));
         assert!(air.want_scan);
     }
 
@@ -3120,20 +3250,20 @@ mod advertisement_tests {
         let now = Instant::now();
         let mut air = Air { want_scan: true, ..Air::default() };
         air.observe_pairing(true, Some(&pairing_frame()), now);
-        assert!(air.scan_due(now));
+        assert!(air.scan_due("le", now));
         let mut ordinary = pairing_frame();
         ordinary[2] = 1;
         air.observe_pairing(false, Some(&ordinary), now);
         air.observe_pairing(false, Some(&pairing_frame()[..26]), now);
-        assert!(air.scan_due(now));
+        assert!(air.scan_due("le", now));
         air.observe_pairing(false, Some(&pairing_frame()), now);
         // Interleaved ordinary packets must not end the pairing window.
         air.observe_pairing(false, Some(&ordinary), now + Duration::from_secs(1));
-        assert!(!air.scan_due(now + Duration::from_secs(2)));
+        assert!(!air.scan_due("le", now + Duration::from_secs(2)));
         // Reports from another client's scan keep an ongoing attempt protected.
         air.observe_pairing(false, Some(&pairing_frame()), now + Duration::from_secs(119));
-        assert!(!air.scan_due(now + Duration::from_secs(120)));
-        assert!(air.scan_due(now + Duration::from_secs(239)));
+        assert!(!air.scan_due("le", now + Duration::from_secs(120)));
+        assert!(air.scan_due("le", now + Duration::from_secs(239)));
     }
 
     #[test]
@@ -3146,12 +3276,12 @@ mod advertisement_tests {
         let mut ordinary = pairing_frame();
         ordinary[2] = 0;
         air.observe_pairing(true, Some(&ordinary), now);
-        assert!(air.scan_due(now));
+        assert!(air.scan_due("le", now));
 
         // BlueZ connecting that unbonded device is the pairing window.
         air.observe_foreign_pairing(max, true, false, now);
         assert!(air.pairing_paused(now));
-        assert!(!air.scan_due(now));
+        assert!(!air.scan_due("le", now));
         // Losing the connection ends the attempt after a short tail.
         air.observe_foreign_pairing(max, false, false, now + Duration::from_secs(1));
         assert!(air.pairing_paused(now + Duration::from_secs(10)));
@@ -3608,7 +3738,7 @@ mod advertisement_tests {
                 .iter()
                 .any(|input| matches!(input, Input::Bonded { saved: false, .. })));
             assert!(
-                !live.air.scan_due(started + Duration::from_secs(30)),
+                !live.air.scan_due("le", started + Duration::from_secs(30)),
                 "a temporary pairing must not end the setup scan pause"
             );
             live.devices[0].connected = false;
@@ -3623,7 +3753,7 @@ mod advertisement_tests {
             assert!(!bonded.iter().any(|input| matches!(input, Input::Unpaired { .. })));
             assert!(bonded.iter().any(|input| matches!(input, Input::Bonded { saved: true, .. })));
             assert!(
-                live.air.scan_due(started + Duration::from_secs(30)),
+                live.air.scan_due("le", started + Duration::from_secs(30)),
                 "a saved bond ends setup after the service discovery grace"
             );
             assert_eq!(live.accessory, Some(address));
@@ -3781,6 +3911,7 @@ mod advertisement_tests {
                     role: String::new(),
                     node: "Brave".into(),
                     mute: false,
+                    temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
                 }],
