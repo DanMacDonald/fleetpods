@@ -11,10 +11,10 @@ Window {
   height: 780
   title: "FleetPods · AirPods Max artwork study"
   property bool lightTheme: Qt.application.arguments.indexOf('--light') >= 0
-  // Rear three-quarter view selected from the artwork review.
-  readonly property real selectedYaw: -2.6
+  // Resting view on the same side as the frontal worn pose.
+  readonly property real selectedYaw: Math.PI - 2.6
   property real yaw: selectedYaw
-  property real roll: -0.133
+  property real roll: 0.133
   property real resting: 1
   readonly property color background: lightTheme ? '#efeee8' : '#1b1c28'
   readonly property color foreground: lightTheme ? '#343b4c' : '#afb4d8'
@@ -43,7 +43,7 @@ Window {
         Caption { text: 'Rotate' }
         Slider { Layout.fillWidth: true; from: -Math.PI; to: Math.PI; value: window.yaw; onMoved: window.yaw = value }
         Button { text: 'Front'; onClicked: { window.yaw = 0; window.roll = 0 } }
-        Button { text: 'Selected angle'; onClicked: { window.yaw = window.selectedYaw; window.roll = -0.133 } }
+        Button { text: 'Selected angle'; onClicked: { window.yaw = window.selectedYaw; window.roll = 0.133 } }
       }
       RowLayout {
         Layout.fillWidth: true

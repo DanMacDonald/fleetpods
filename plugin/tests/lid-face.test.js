@@ -111,3 +111,27 @@ for (const size of [64, 96, 132]) for (let step = 0; step <= 20; step++) {
 }
 check(checked > 1000, 'the flat face must retain meaningful coverage at all preview scales')
 console.log(`Flat lid lighting and backing occlusion passed across 63 animated views (${checked} samples)`)
+
+// Secondary cases retain a complete bright lid contour at small dot grids,
+// including grids whose first samples land in the dark sockets instead of the lip.
+for (const size of [40, 43, 44, 45, 46, 48, 50]) for (const state of ['open', 'open-left', 'open-right', 'open-empty', 'closed', '']) {
+  const lid = state === 'closed' ? 0 : 1
+  const view = { state, lid, columns: size, rows: size, scale: size / 3.6 * 0.98, yaw: 0, pitch: 0.24 }
+  const scene = Mesh.parts(geometry, state, lid, 0)
+  const raw = Raster.rasterize(scene, view, { vertexTone: Dark.artworkTone })
+  const normal = Dark.render(scene, view).values
+  const bright = Dark.render(scene, { ...view, brightLidEdge: true }).values
+  const edge = new Set()
+  if (state.startsWith('open')) {
+    for (let x = 0; x < size; x++) {
+      let y = 0
+      while (y < size && !raw.surfaces[y * size + x]) y++
+      if (y < size && raw.surfaces[y * size + x] === 2) edge.add(y * size + x)
+    }
+    check(edge.size > size / 2, 'exercise the full visible lid width')
+    for (const i of edge) check(bright[i] === 1, `unbroken bright lid at ${size}/${state}/${i}`)
+  }
+  for (let i = 0; i < bright.length; i++)
+    if (!edge.has(i)) check(bright[i] === normal[i], 'only the visible top lid contour may brighten')
+}
+console.log('secondary lid edge: all checks passed')

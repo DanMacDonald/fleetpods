@@ -15,6 +15,22 @@ TestCase {
   SignalSpy { id: release; signalName: "appleClicked" }
   SignalSpy { id: enroll; signalName: "enrollClicked" }
 
+  function test_nearbyAccessoryFadesWithoutChangingMainArtwork() {
+    var item = createTemporaryObject(view, this, { podsVariant: "max", headsetWorn: true })
+    var secondary = findChild(item, "nearbyAccessoryArtwork")
+    verify(!secondary.visible)
+    item.nearbyAccessory = { address: "10:B5:88:96:4D:AE", label: "AirPods Pro 2", caseState: "open" }
+    tryCompare(secondary, "opacity", 0.65)
+    compare(secondary.displayedAccessory.caseState, "open")
+    var main = findChild(item, "seatPodsArtwork")
+    verify(secondary.x + secondary.width < main.x)
+    compare(main.variant, "max")
+    item.nearbyAccessory = null
+    compare(secondary.displayedAccessory.caseState, "open", "retain pose during fade")
+    tryCompare(secondary, "visible", false)
+    compare(main.variant, "max")
+  }
+
   function test_maxWearIsIndependentOfConnectionOwner() {
     var item = createTemporaryObject(view, this, {
       podsVariant: "max", headsetWorn: false, connectedToOmarchy: true,
@@ -27,17 +43,190 @@ TestCase {
     item.connectedToOmarchy = false
     compare(mesh.rest, 1, "ownership alone cannot open the cups")
     item.headsetWorn = true
-    compare(mesh.rest, 0)
+    tryCompare(mesh, "rest", 0)
     item.headsetWorn = null
-    compare(mesh.rest, 0)
+    tryCompare(mesh, "rest", 1, 500, "unknown wear must not look confirmed on-head")
     verify(item.connectorEndY > item.linkY, "connector reaches the mesh headband")
+  }
+
+  function test_secondarySlidesAlongsidePrimaryDescentWithoutReplaying() {
+    var item = createTemporaryObject(view, this, { podsVariant: "pro", caseState: "closed" })
+    var main = findChild(item, "seatPodsArtwork")
+    var secondary = findChild(item, "nearbyAccessoryArtwork")
+    item.caseState = ""
+    item.nearbyAccessory = { address: "70:F9:4A:BA:19:81", label: "AirPods Max 2", isHeadset: true, headsetWorn: false, caseState: "" }
+    tryVerify(function() { return secondary.entrance < 1 })
+    verify(secondary.x < secondary.restingX)
+    verify(main.budsIn < 1, "secondary begins while the primary is descending")
+    wait(100)
+    verify(secondary.entrance > 0 && secondary.entrance < 1)
+    var progress = secondary.entrance
+    item.nearbyAccessory = { address: "70:F9:4A:BA:19:81", label: "AirPods Max 2", isHeadset: true, headsetWorn: true, caseState: "" }
+    verify(secondary.entrance >= progress, "fresh reports must not restart the pan")
+    tryCompare(secondary, "entrance", 1)
+    fuzzyCompare(secondary.x, secondary.restingX, 0.01)
+    item.nearbyAccessory = { address: "10:B5:88:96:4D:AE", label: "AirPods Pro 2", caseState: "closed" }
+    tryVerify(function() { return secondary.entrance < 1 }, 500, "a different accessory gets its own entrance")
+    item.visible = false
+    compare(secondary.entrance, 1, "closing the panel settles the entrance")
+  }
+
+  function test_secondaryLabelFollowsPaintedCaseBottom() {
+    var item = createTemporaryObject(view, this, { podsVariant: "max", animatePlacement: false })
+    var secondary = findChild(item, "nearbyAccessoryArtwork")
+    var mesh = findChild(item, "nearbyCaseMesh")
+    var label = findChild(item, "nearbyAccessoryLabel")
+    for (var pose of ["closed", "open"]) {
+      item.nearbyAccessory = { address: "10:B5:88:96:4D:AE", label: "AirPods Pro 2", caseState: pose }
+      tryCompare(secondary, "displayedAccessory", item.nearbyAccessory)
+      compare(secondary.entrance, 1, "disabled placement animation stays settled")
+      fuzzyCompare(label.y - (mesh.y + mesh.caseBottom), 4, 0.01)
+      verify(label.y < secondary.height, "label no longer sits below the empty frame padding")
+    }
+  }
+
+  function test_secondaryPromotionSlidesAndBrightens_data() {
+    return [{ tag: "primary binding first", secondaryFirst: false },
+            { tag: "secondary binding first", secondaryFirst: true }]
+  }
+
+  function test_secondaryPromotionSlidesAndBrightens(data) {
+    var oldPrimary = { address: "70:F9:4A:BA:19:81", label: "Max", isHeadset: true, headsetWorn: false, caseState: "" }
+    var incoming = { address: "CC:22:FE:54:DF:C7", label: "Pro 3", isHeadset: false, caseState: "closed" }
+    var item = createTemporaryObject(view, this, {
+      podsVariant: "max", primaryAccessoryAddress: oldPrimary.address, nearbyAccessory: incoming
+    })
+    var main = findChild(item, "seatPodsArtwork")
+    var secondary = findChild(item, "nearbyAccessoryArtwork")
+    tryCompare(secondary, "opacity", 0.65)
+    var variants = []
+    main.variantChanged.connect(function() { variants.push(main.variant) })
+    item.podsVariant = "pro"
+    item.caseState = "closed"
+    if (data.secondaryFirst) item.nearbyAccessory = oldPrimary
+    item.primaryAccessoryAddress = incoming.address
+    if (!data.secondaryFirst) item.nearbyAccessory = oldPrimary
+    tryCompare(item, "accessoryPhase", "receding")
+    compare(main.variant, "max", "retain the outgoing primary during retreat")
+    compare(variants.length, 0, "never load the incoming renderer before retreat finishes")
+    verify(main.layer.enabled && main.layer.smooth && main.layer.mipmap, "filter dots during shrinking")
+    compare(secondary.displayedAccessory.address, incoming.address, "secondary waits for the center to clear")
+    compare(secondary.entrance, 1)
+    var center = main.mapToItem(item, main.width / 2, main.height / 2)
+    tryVerify(function() { return item.accessoryPhase === "receding" && main.scale < 1 && main.opacity < 1 },
+      500, "outgoing primary shrinks and fades")
+    var receded = main.mapToItem(item, main.width / 2, main.height / 2)
+    fuzzyCompare(receded.x, center.x, 0.01, "retreat has no sideways motion")
+    fuzzyCompare(receded.y, center.y, 0.01, "retreat has no vertical motion")
+    var retreatProgress = item.accessoryProgress
+    item.nearbyAccessory = Object.assign({}, oldPrimary)
+    wait(20)
+    compare(item.accessoryPhase, "receding")
+    verify(item.accessoryProgress >= retreatProgress, "telemetry does not restart retreat")
+    tryVerify(function() { return item.promotionProgress < 1 })
+    compare(variants.join(","), "pro", "swap the renderer once, after retreat")
+    verify(main.mapToItem(item, main.width / 2, main.height / 2).x < main.x + main.width / 2)
+    verify(main.scale < 1 && main.opacity >= 0.65 && main.opacity < 1)
+    compare(main.animatePlacement, false, "promotion replaces downward entrance")
+    compare(main.budsIn, 1)
+    compare(secondary.displayedAccessory.address, oldPrimary.address, "no duplicate of promoted artwork")
+    wait(50)
+    var progress = item.promotionProgress
+    item.nearbyAccessory = Object.assign({}, oldPrimary)
+    wait(20)
+    verify(item.promotionProgress >= progress, "status refresh must not replay promotion")
+    tryCompare(item, "promotionProgress", 1)
+    compare(main.layer.enabled, false, "stationary artwork keeps its native dot grid")
+    compare(main.scale, 1)
+    compare(main.opacity, 1)
+    fuzzyCompare(main.mapToItem(item, main.width / 2, main.height / 2).x, main.x + main.width / 2, 0.01)
+
+    // A quick reversal uses the current secondary position; closing the
+    // panel settles both motions so reopening cannot replay half a move.
+    item.primaryAccessoryAddress = oldPrimary.address
+    item.podsVariant = "max"
+    item.caseState = ""
+    item.nearbyAccessory = incoming
+    tryVerify(function() { return item.promotionProgress < 1 })
+    item.visible = false
+    compare(item.promotionProgress, 1)
+    compare(secondary.entrance, 1)
+  }
+
+  function test_reversingSelectionDuringRetreatCancelsTheQueuedSwap() {
+    var first = { address: "70:F9:4A:BA:19:81", label: "Max", isHeadset: true, caseState: "" }
+    var second = { address: "CC:22:FE:54:DF:C7", label: "Pro 3", isHeadset: false, caseState: "closed" }
+    var item = createTemporaryObject(view, this, {
+      podsVariant: "max", primaryAccessoryAddress: first.address, nearbyAccessory: second
+    })
+    var main = findChild(item, "seatPodsArtwork")
+    var secondary = findChild(item, "nearbyAccessoryArtwork")
+    tryCompare(secondary, "opacity", 0.65)
+    item.podsVariant = "pro"
+    item.caseState = "closed"
+    item.primaryAccessoryAddress = second.address
+    item.nearbyAccessory = first
+    tryCompare(item, "accessoryPhase", "receding")
+    item.podsVariant = "max"
+    item.caseState = ""
+    item.primaryAccessoryAddress = first.address
+    item.nearbyAccessory = second
+    tryCompare(item, "accessoryPhase", "idle")
+    wait(300)
+    compare(item.accessoryPhase, "idle", "cancelled completion must not begin the obsolete pan")
+    compare(main.variant, "max")
+    compare(main.opacity, 1)
+    compare(main.scale, 1)
+    compare(secondary.displayedAccessory.address, second.address)
+  }
+
+  function test_backgroundMaxUsesHeadsetArtworkAndFades() {
+    var item = createTemporaryObject(view, this, { podsVariant: "pro", caseState: "" })
+    item.nearbyAccessory = { label: "AirPods Max 2", isHeadset: true, headsetWorn: false, caseState: "" }
+    var secondary = findChild(item, "nearbyAccessoryArtwork")
+    var max = findChild(item, "nearbyMaxArtwork")
+    tryCompare(secondary, "opacity", 0.65)
+    verify(max.visible)
+    tryCompare(max, "rest", 1)
+    compare(findChild(item, "seatPodsArtwork").variant, "pro")
+    item.nearbyAccessory = { label: "AirPods Max 2", isHeadset: true, headsetWorn: true, caseState: "" }
+    tryCompare(max, "rest", 0)
+    item.nearbyAccessory = { label: "AirPods Max 2", isHeadset: true, headsetWorn: null, caseState: "" }
+    tryCompare(max, "rest", 1, 500, "secondary unknown wear also uses the resting pose")
+    item.nearbyAccessory = null
+    tryCompare(secondary, "visible", false)
+    item.nearbyAccessory = { label: "AirPods Pro 2", isHeadset: false, caseState: "closed" }
+    tryCompare(secondary, "opacity", 0.65)
+    verify(!max.visible)
+  }
+
+  function test_hidingPanelDuringRetreatSettlesLatestSelection() {
+    var incoming = { address: "CC:22:FE:54:DF:C7", label: "Pro 3", isHeadset: false, caseState: "closed" }
+    var item = createTemporaryObject(view, this, {
+      podsVariant: "max", primaryAccessoryAddress: "70:F9:4A:BA:19:81", nearbyAccessory: incoming
+    })
+    var main = findChild(item, "seatPodsArtwork")
+    item.podsVariant = "pro"
+    item.caseState = "closed"
+    item.primaryAccessoryAddress = incoming.address
+    item.nearbyAccessory = null
+    tryCompare(item, "accessoryPhase", "receding")
+    item.visible = false
+    compare(item.accessoryPhase, "idle")
+    compare(item.presentedPrimaryAddress, incoming.address)
+    compare(main.variant, "pro")
+    item.visible = true
+    wait(300)
+    compare(item.accessoryPhase, "idle")
+    compare(main.scale, 1)
+    compare(main.opacity, 1)
   }
 
   function test_caseExitRevealsRestingPodsConnectors() {
     var item = createTemporaryObject(view, this, { podsVariant: "pro", caseState: "open-empty" })
     var art = findChild(item, "seatPodsArtwork")
     item.caseState = ""
-    verify(art.caseExiting)
+    tryVerify(function() { return art.caseExiting })
     var target = item.connectorEndY
     verify(target > item.revealedConnectorEndY, "case initially covers the lower wire")
     verify(item.revealedConnectorEndY > item.linkY + 8, "both wire ends point down")

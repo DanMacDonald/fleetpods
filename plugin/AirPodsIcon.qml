@@ -25,7 +25,8 @@ Item {
   property bool pairingMode: false
   property bool pixelArt: false
   property bool highlighted: true
-  // Positive off-head evidence closes the Max; unknown stays neutral/upright.
+  // Only confirmed wear opens the Max into its on-head pose. Unknown wear
+  // remains unknown telemetry and uses the resting artwork.
   property var headsetWorn: null
 
   width: iconSize
@@ -535,7 +536,7 @@ Item {
     MaxArtwork {
       objectName: "maxMeshArtwork"
       highlighted: root.highlighted
-      rest: root.headsetWorn === false ? 1 : 0
+      rest: root.headsetWorn === true ? 0 : 1
       animatePose: root._animatePlacement
       poseDuration: Commons.Style.duration(240)
       foregroundColor: artworkPalette.item.foreground

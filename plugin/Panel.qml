@@ -339,6 +339,7 @@ Panel {
         appleSeatUnknown: root.seatPresentation.appleSeatUnknown === true,
         waitingOmarchy: seats.availableOmarchy.map(function (device) { return device.label }),
         caseState: root.barCaseState, reportedLid: pods.view.lidState,
+        nearbyAccessory: seats.nearbyAccessory,
         pairingMode: pods.view.pairingMode, batteriesVisible: seats.showBattery,
         panelAvailable: true, panelOpen: root.opened, seatsVisible: root.showSeats,
         pluginVersion: root.pluginVersion,
@@ -629,6 +630,11 @@ Panel {
             fontFamily: root.fontFamily
             podsVariant: root.podsVariant
             headsetWorn: pods.view.headset.worn
+            nearbyAccessory: pods.view.daemonReachable ? Model.nearbyAccessory(pods.view.accessories, root.batteryNow) : null
+            primaryAccessoryAddress: {
+              var selected = pods.view.accessories.filter(function (entry) { return entry.selected })
+              return selected.length ? selected[0].address : ""
+            }
             connectionSpinVisible: root.connectionSpinVisible
             connectionComplete: Model.localSeatConnected(pods.view)
             caseState: root.barCaseState

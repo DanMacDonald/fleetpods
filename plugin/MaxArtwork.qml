@@ -10,16 +10,19 @@ DotPods {
   property bool animatePose: true
   // Returning on-head uses the full duration; closing off-head is twice as fast.
   property int poseDuration: 240
-  // Level the cup bottoms in the approved rear three-quarter view.
-  property real roll: -0.133
+  // Face the viewer squarely while worn; retain the angled resting pose.
+  // Follow the same animated wear progress so camera and cups move together.
+  property real roll: 0.133 * rest
   artworkTop: height * 0.10
   animating: false
   smoothSampling: true
-  yaw: -2.6
+  // View the opposite side of the resting pose so wear changes turn only
+  // about 31 degrees instead of carrying a cup across the camera.
+  yaw: (Math.PI - 2.6) * rest
   pitch: 0.24
-  // Centre the strap under the fixed connector pair. Whole dot columns keep
-  // the artwork aligned to physical pixels at every display scale.
-  transform: Translate { x: 2 * root.effectiveDotPitch }
+  // The frontal pose is already centered. Only the angled resting view needs
+  // the two-column correction beneath the fixed connectors.
+  transform: Translate { x: -2 * root.effectiveDotPitch * root.rest }
   shadowColor: Qt.tint(backgroundColor, Qt.rgba(foregroundColor.r,
     foregroundColor.g, foregroundColor.b, 0.08))
   onRestChanged: requestPaint()

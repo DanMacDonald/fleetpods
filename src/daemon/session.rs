@@ -41,6 +41,9 @@ pub(super) struct Session {
     /// claims wait for pods or a link without holding speaker playback;
     /// an active claim has been applied to the router and the seat.
     claim: PlaybackClaim,
+    /// A manual output choice overrides automatic playback claims until the
+    /// user selects the pods again or explicitly requests a connection/takeover.
+    manual_output: bool,
     /// When this laptop last sent a claim on the control link.
     claim_sent_at: Option<MonoMs>,
     /// A remote report arrived just after a claim or during setup settle;
@@ -778,6 +781,9 @@ impl Daemon {
     /// Player snapshots and new streams may use directly confirmed local
     /// ownership. Neither can turn an explicit release into a takeover.
     fn route_owned_playback(&mut self, new_stream: bool, now: Clock) {
+        if !self.automatic_playback_allowed() {
+            return;
+        }
         if new_stream && self.accessory.playback_blocked() {
             self.return_to_speakers(now);
             return;
@@ -903,6 +909,7 @@ impl Daemon {
             if self.routing.phase() == Phase::WaitingCompletion
                 && self.routing.queue_claim_until_route_lands()
             {
+                self.session.manual_output = false;
                 return Response::line("accepted");
             }
             return Response::line("error: fleet routing in progress");
@@ -911,6 +918,7 @@ impl Daemon {
             return Response::line("error: no paired AirPods address");
         }
         self.displaced = false;
+        self.session.manual_output = false;
         self.routing.claim_audio();
         self.open_connection(now.mono);
         Response::line("accepted")
@@ -960,6 +968,9 @@ impl Daemon {
 
     /// Take the seat. Routing intent, the audio route, and the yield flag move together.
     pub(super) fn claim_seat(&mut self, now: Clock) {
+        if !self.automatic_playback_allowed() {
+            return;
+        }
         self.seat.claim(now);
         self.apply_claim();
         self.output.extend_takeover(now.mono);
@@ -967,6 +978,7 @@ impl Daemon {
 
     /// Take the seat for an explicit user switch.
     pub(super) fn claim_seat_user(&mut self, now: Clock) {
+        self.session.manual_output = false;
         self.seat.claim_user(now);
         self.apply_claim();
         self.output.extend_takeover(now.mono);
@@ -1137,6 +1149,9 @@ impl Daemon {
     }
 
     pub(crate) fn claim_playback(&mut self, now: Clock) {
+        if !self.automatic_playback_allowed() {
+            return;
+        }
         self.activity_at = None;
         self.session.stem_loss_at = None;
         self.session.stem_peer = None;
@@ -1609,6 +1624,48 @@ impl Daemon {
         }
     }
     pub(crate) fn observe_audio_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
+        // A different default while both outputs still exist is an output
+        // choice, not a lost Bluetooth sink. Our recovery deliberately parks
+        // playback elsewhere, so it must never be mistaken for a manual switch.
+        let selected = graph.sinks.iter().find(|sink| sink.name == graph.default_sink);
+        let selected_pods = selected.is_some_and(|sink| {
+            self.config.accessory.is_some() && sink.address == self.config.accessory
+        });
+        let changed_between_present_outputs = selected.is_some()
+            && self.last_graph.as_ref().is_some_and(|previous| {
+                previous.default_sink != graph.default_sink
+                    && graph.sinks.iter().any(|sink| sink.name == previous.default_sink)
+            });
+        if changed_between_present_outputs {
+            if self.session.manual_output && selected_pods {
+                eprintln!("fleetpodsd: AirPods selected as output; resuming playback claims");
+                self.claim_seat_user(now);
+            } else if self.output.wants_output()
+                && self.audio.routed()
+                && !self.output.recovering()
+                && !selected_pods
+                && self.last_graph.as_ref().is_some_and(|previous| {
+                    previous.sinks.iter().any(|sink| {
+                        sink.name == previous.default_sink
+                            && self.config.accessory.is_some()
+                            && sink.address == self.config.accessory
+                    })
+                })
+            {
+                eprintln!(
+                    "fleetpodsd: manual output switch to {}; releasing AirPods playback",
+                    graph.default_sink
+                );
+                self.session.manual_output = true;
+                self.session.claim = PlaybackClaim::Idle;
+                self.session.rejoin = None;
+                self.activity_at = None;
+                self.idle_claimed = None;
+                // The output picker owns the new route. Release our claim and
+                // pending work without pausing or restoring the previous default.
+                self.release_preference(now);
+            }
+        }
         let started = self.config.accessory.is_some_and(|accessory| {
             crate::audio::route::playback_started(
                 self.last_graph.as_ref(),
@@ -1619,6 +1676,10 @@ impl Daemon {
         });
         self.route_owned_playback(started, now);
         self.last_graph = Some(graph.clone());
+    }
+
+    pub(crate) fn automatic_playback_allowed(&self) -> bool {
+        !self.session.manual_output
     }
 
     fn follow_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
@@ -2143,6 +2204,130 @@ mod tests {
     use crate::daemon::tests::*;
     use crate::fleet::members::{GroupKey, Member};
     use crate::types::Battery;
+
+    fn manual_output_fixture() -> (Daemon, crate::audio::route::Graph) {
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.note_ownership(true, now.mono);
+        daemon.claim_seat_user(now);
+        daemon.audio.update_player("brave", Some(true));
+        let graph = Graph {
+            default_sink: "pods".into(),
+            sinks: vec![
+                Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                },
+                Sink { name: "speakers".into(), address: None, profile: None },
+                Sink { name: "usb".into(), address: None, profile: None },
+            ],
+            streams: vec![LiveStream {
+                id: 1,
+                generation: 10,
+                sink: "pods".into(),
+                role: String::new(),
+                node: "Brave".into(),
+                mute: false,
+                temporarily_muted: false,
+                volume: 1.0,
+                corked: false,
+            }],
+            cards: vec![],
+        };
+        daemon.last_graph = Some(graph.clone());
+        daemon.audio.set_routed(true);
+        (daemon, graph)
+    }
+
+    #[test]
+    fn manual_output_choice_survives_playback_activity_and_server_reconnect() {
+        use crate::step::{Effect, Input};
+        for target in ["speakers", "usb"] {
+            let (mut daemon, mut graph) = manual_output_fixture();
+            let now = clock();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            graph.default_sink = target.into();
+            // The default notification can precede the picker's stream moves.
+            let switched = daemon.step(Input::Audio(graph.clone()), at(100));
+            assert!(daemon.session.manual_output);
+            assert!(!daemon.output.wants_output());
+            assert!(
+                !switched.effects.iter().any(|effect| matches!(
+                    effect,
+                    Effect::PausePlayers(_)
+                        | Effect::SetDefaultSink { .. }
+                        | Effect::MoveStreams(_)
+                )),
+                "the picker owns the route: {:?}",
+                switched.effects
+            );
+            graph.streams[0].sink = target.into();
+            let mut inputs = vec![
+                Input::Audio(graph.clone()),
+                Input::Tick,
+                Input::Player { service: "brave".into(), playing: Some(false) },
+                Input::Command(crate::panel::ipc::Command::Activity),
+                Input::Player { service: "brave".into(), playing: Some(true) },
+                Input::AudioLost,
+                Input::Audio(graph.clone()),
+            ];
+            graph.streams[0].generation = 11;
+            inputs.push(Input::Audio(graph.clone()));
+            for (i, input) in inputs.into_iter().enumerate() {
+                let result = daemon.step(input, at(200 + i as u64 * 1000));
+                assert!(daemon.session.manual_output);
+                assert!(!daemon.output.wants_output());
+                assert!(
+                    !result.effects.iter().any(|effect| matches!(
+                        effect,
+                        Effect::SetDefaultSink { .. }
+                            | Effect::MoveStreams(_)
+                            | Effect::PausePlayers(_)
+                    )),
+                    "{target} step {i}: {:?}",
+                    result.effects
+                );
+            }
+            graph.default_sink = "pods".into();
+            graph.streams[0].sink = "pods".into();
+            daemon.step(Input::Audio(graph), at(9000));
+            assert!(!daemon.session.manual_output);
+            assert!(daemon.output.wants_output());
+        }
+    }
+
+    #[test]
+    fn manual_output_choice_allows_an_explicit_fleetpods_takeover() {
+        let (mut daemon, mut graph) = manual_output_fixture();
+        graph.default_sink = "speakers".into();
+        daemon.observe_audio_graph(&graph, clock());
+        assert!(daemon.session.manual_output);
+        daemon.claim_seat_user(clock());
+        assert!(!daemon.session.manual_output);
+        assert!(daemon.output.wants_output());
+    }
+
+    #[test]
+    fn output_loss_initial_routing_and_recovery_are_not_manual_output_choices() {
+        for scenario in ["missing", "acquiring", "recovering", "unknown default"] {
+            let (mut daemon, mut graph) = manual_output_fixture();
+            match scenario {
+                "missing" => graph.sinks.retain(|sink| sink.name != "pods"),
+                "acquiring" => daemon.audio.set_routed(false),
+                "recovering" => {
+                    assert!(daemon.output.begin_recovery(1, addr(3), &graph, clock().mono))
+                }
+                _ => graph.sinks.retain(|sink| sink.name != "speakers"),
+            }
+            graph.default_sink = "speakers".into();
+            daemon.observe_audio_graph(&graph, clock());
+            assert!(!daemon.session.manual_output, "{scenario}");
+            assert!(daemon.output.wants_output(), "{scenario}");
+        }
+    }
 
     fn recovery_id(daemon: &Daemon) -> Option<u64> {
         match daemon.session.output_recovery.task.state() {

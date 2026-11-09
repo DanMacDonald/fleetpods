@@ -52,6 +52,16 @@ Pulse reconnection releases surviving owned nodes using fresh stream identities;
 incomplete inventories do not prove removal, and replacement serials are not
 unmuted. Normal shutdown stops the fast writer and makes a bounded cleanup attempt.
 
+An established AirPods route yields to an external default-output change while
+both outputs remain present. Session records this manual output preference and
+uses the existing non-pausing release to retire routing, recovery and queued
+player work; the output picker owns its stream moves. Player starts, new streams,
+wear and desktop activity cannot automatically reclaim playback. Selecting the
+AirPods output again, or an explicit FleetPods connection/takeover, clears the
+preference. It survives audio-server reconnection within the daemon session.
+Initial acquisition, disappearing outputs and the router's own recovery parking
+are not interpreted as manual choices.
+
 Permission to open is not permission to take audio: `Facts.intent` is
 `JoinInBackground` until the router holds a playback claim (`TakeAudio`), and
 only `TakeAudio` pursues profiles, routing and streaming. Ownership claims are
@@ -152,6 +162,10 @@ BlueZ inventory reconciliation owns connection evidence for non-selected paired
 accessories. Removal, loss of pairing or replacement of the BlueZ instance retires
 that evidence; saved identity and keys remain in the daemon. Selecting an accessory
 hands observations to its selected connection and retires the inventory dedup entry.
+The daemon owns accessory selection through wear promotion and explicit commands.
+The radio's paired report can establish the initial selection or update the current
+accessory's identity; a delayed report for another accessory cannot undo a newer
+selection and enqueue a switch back. Non-selected accessories remain in inventory.
 
 Microphone support is selected by SKU in `audio::mic::format_for_sku`; Max 2
 uses the existing format, source and capture lifetime. `pace_microphone` offers

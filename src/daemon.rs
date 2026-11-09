@@ -570,6 +570,7 @@ impl Daemon {
                 &self.accessory,
                 true,
                 self.membership.accessory_keys_ready(address),
+                now,
             ));
         }
         for (address, report) in &self.tracked {
@@ -578,6 +579,7 @@ impl Daemon {
                 report,
                 false,
                 self.membership.accessory_keys_ready(*address),
+                now,
             ));
         }
         // Accessories we hold keys for but have not heard from yet are
@@ -586,7 +588,13 @@ impl Daemon {
             let known =
                 self.config.accessory == Some(*address) || self.tracked.contains_key(address);
             if !known {
-                accessories.push(status::accessory_entry(*address, &Accessory::new(), false, true));
+                accessories.push(status::accessory_entry(
+                    *address,
+                    &Accessory::new(),
+                    false,
+                    true,
+                    now,
+                ));
             }
         }
         value["accessories"] = serde_json::json!(accessories);
@@ -3244,6 +3252,9 @@ impl Daemon {
     /// Keep fresh input through the peer's pause debounce, never through a later session.
     pub(crate) fn claim_idle_on_activity(&mut self, now: Clock) -> bool {
         const ACTIVITY_GRACE_MS: u64 = 5_000;
+        if !self.automatic_playback_allowed() {
+            return false;
+        }
         let Some(at) = self.activity_at else {
             return false;
         };
@@ -4061,6 +4072,7 @@ mod tests {
         assert!(daemon.tracked.contains_key(&second));
 
         // Selecting the second pair keeps the first pair's report tracked.
+        daemon.step(Input::Command(Command::Select(second)), now);
         daemon.step(Input::Paired { address: second, name: "AirPods Pro".into() }, now);
         assert_eq!(daemon.config.accessory, Some(second));
         assert!(daemon.tracked.contains_key(&first));
@@ -4291,6 +4303,33 @@ mod tests {
     }
 
     #[test]
+    fn accessory_status_keeps_last_seen_times_separate() {
+        let (mut daemon, first, second, _) = two_pair_daemon();
+        let now = Clock::new(10_000, 100_000);
+        daemon.accessory.note_advertisement(MonoMs(9_000), 0);
+        let mut max = Accessory::new();
+        max.set_identity("AirPods Max", "A3454");
+        max.note_advertisement(MonoMs(8_000), 0);
+        daemon.tracked.insert(second, max);
+        let status = daemon.status_value(now);
+        let entries = status["accessories"].as_array().unwrap();
+        let selected = entries.iter().find(|a| a["address"] == first.display()).unwrap();
+        let tracked = entries.iter().find(|a| a["address"] == second.display()).unwrap();
+        assert_eq!(selected["last_advertisement_ms"], 99_000);
+        assert_eq!(tracked["last_advertisement_ms"], 98_000);
+        assert_eq!(tracked["is_headset"], true);
+        daemon.tracked.remove(&second);
+        let status = daemon.status_value(now);
+        let unheard = status["accessories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["address"] == second.display())
+            .unwrap();
+        assert_eq!(unheard["last_advertisement_ms"], 0);
+    }
+
+    #[test]
     fn wearing_a_tracked_pair_promotes_it_and_keeps_both_pairs() {
         use crate::step::{Effect, Input};
         let (mut daemon, first, second, second_irk) = two_pair_daemon();
@@ -4321,6 +4360,46 @@ mod tests {
         assert_eq!(back.reply.as_deref(), Some("ok\n"));
         assert_eq!(daemon.config.accessory, Some(first));
         assert_eq!(daemon.config.noise, Some(NoiseMode::Anc));
+        assert!(daemon.tracked.contains_key(&second));
+    }
+
+    #[test]
+    fn delayed_pairing_reports_cannot_undo_wear_or_manual_selection() {
+        use crate::step::{Effect, Input};
+        let (mut daemon, first, second, second_irk) = two_pair_daemon();
+        let now = clock();
+        daemon.set_identity("AirPods Max", "A3454");
+        daemon.accessory.note_head_worn(false, now.mono);
+        daemon.step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
+        assert_eq!(daemon.config.accessory, Some(second));
+        assert_eq!(daemon.accessory.wearing(), Some(true));
+
+        // The radio's acknowledgement of its old selection arrives after wear
+        // has selected the buds. It must not enqueue another selection of Max.
+        for address in [first, second, first, second] {
+            let report = daemon.step(Input::Paired { address, name: "Radio name".into() }, now);
+            assert_eq!(daemon.config.accessory, Some(second));
+            assert_eq!(daemon.accessory.wearing(), Some(true));
+            assert_eq!(daemon.status_value(now)["is_headset"], false);
+            assert!(!report.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::SelectAccessory { .. } | Effect::Disconnect { .. }
+            )));
+        }
+
+        // An explicit selection still wins, even over worn buds; their queued
+        // acknowledgement must likewise not undo that decision.
+        let picked = daemon.step(Input::Command(Command::Select(first)), now);
+        assert_eq!(picked.reply.as_deref(), Some("ok\n"));
+        for address in [second, first] {
+            let report = daemon.step(Input::Paired { address, name: "Radio name".into() }, now);
+            assert_eq!(daemon.config.accessory, Some(first));
+            assert_eq!(daemon.status_value(now)["is_headset"], true);
+            assert!(!report.effects.iter().any(|effect| matches!(
+                effect,
+                Effect::SelectAccessory { .. } | Effect::Disconnect { .. }
+            )));
+        }
         assert!(daemon.tracked.contains_key(&second));
     }
 

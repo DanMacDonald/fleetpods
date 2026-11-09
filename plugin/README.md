@@ -8,6 +8,33 @@ The panel reads `$XDG_STATE_HOME/fleetpods/status.json` and sends commands throu
 
 Plugin tests stay under `plugin/tests`. `cargo test` does not run them.
 
+The panel shows one smaller dot-rendered accessory to the left of the selected
+pair. Cases need a fresh lid report; Max headsets need an advertisement from the
+last two minutes. Open cases take priority, then nearby headsets, then closed
+cases, with stable address order breaking ties. The artwork fades out when its
+evidence expires or the daemon becomes unreachable; cached charge and last-known
+placement alone do not keep it visible. This display never selects or connects
+the secondary accessory.
+Both primary and secondary Max artwork use the on-head pose only for an explicit
+worn report. Unknown wear uses the resting pose without inventing an off-head
+report or changing audio behavior.
+New secondary accessories slide in from the left while the primary artwork's
+own animation continues. Reports for the same accessory update its pose without
+restarting that entrance. The case label follows the painted bottom edge.
+When selection changes, the outgoing primary first shrinks and fades straight
+back from its fixed center over 200 ms, with the secondary held in place. Then
+the incoming secondary slides to the center, growing and brightening, while the
+former primary can enter the secondary slot from the left. One animation owner
+sequences these phases and reconciles selection, pose and inventory together
+before drawing. Promotion suppresses the primary's downward entrance. Returning
+to the old selection during retreat cancels the swap; a new selection during the
+incoming pan settles immediately. Closing the panel settles the latest selection.
+The primary renderer reads only the committed presentation pose, so incoming
+status cannot replace it before retreat completes. Scale transitions use a
+filtered texture with mipmaps; resting artwork returns to its native dot grid.
+In dark themes, the secondary case reserves a bright dot along each column of
+the open lid's visible top contour, preserving the thin rim at this smaller size.
+
 The standalone [dot-mesh artwork study](previews/README.md) is kept alongside
 the plugin for visual iteration. Launch it with
 `./tools/artwork/preview --light --open` from the repository root; it needs no

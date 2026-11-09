@@ -68,7 +68,8 @@ pub enum Input {
         name: String,
         connected: bool,
     },
-    /// The paired accessory BlueZ reported.
+    /// The radio's selected paired accessory. May establish the initial
+    /// selection, but cannot supersede a newer daemon selection.
     Paired {
         address: Address,
         name: String,
@@ -341,6 +342,13 @@ impl Daemon {
             }
             Input::KnownAccessory { address, name, connected } => {
                 self.note_known_accessory(address, &name, connected, now);
+                None
+            }
+            Input::Paired { address, .. }
+                if self.config.accessory.is_some_and(|selected| selected != address) =>
+            {
+                // Selection belongs to the daemon. A queued report from before
+                // a wear/manual switch must not select the old accessory again.
                 None
             }
             Input::Paired { address, name } => {

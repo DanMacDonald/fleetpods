@@ -11,6 +11,7 @@ Item {
   property color shadowColor: "#465675"
   readonly property bool lightBackground: backgroundColor.hslLightness > 0.5
   property bool highlighted: true
+  property bool brightLidEdge: false
   // Keep the theme hue; give the lit dots the same lift as the selected device.
   readonly property color litForeground: lightBackground ? foregroundColor : Qt.lighter(foregroundColor, 1.16)
   property string caseState: ""
@@ -51,7 +52,7 @@ Item {
     return Mesh.renderFrame(root.geometry, root.caseState, root.lid, root.time,
       root.yaw + Math.sin(root.time * 0.45) * 0.22, root.pitch, columns, rows, root.lightBackground,
       root.rightLift, root.zoom, root.leftLift, root.budsArrival, root.smoothSampling,
-      { left: root.leftTurn, right: root.rightTurn })
+      { left: root.leftTurn, right: root.rightTurn }, root.brightLidEdge)
   }
 
   function requestPaint() { canvas.requestPaint() }
@@ -85,6 +86,7 @@ Item {
   onRightLiftChanged: canvas.requestPaint()
   onLeftLiftChanged: canvas.requestPaint()
   onCaseStateChanged: canvas.requestPaint()
+  onBrightLidEdgeChanged: canvas.requestPaint()
   onYawChanged: canvas.requestPaint()
   onPitchChanged: canvas.requestPaint()
   onDotPitchChanged: canvas.requestPaint()

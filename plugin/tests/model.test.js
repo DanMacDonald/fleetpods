@@ -3,7 +3,7 @@
 
 const source = Deno.readTextFileSync(new URL("../Model.js", import.meta.url))
 const Model = new Function(
-  source + "; return { pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, rememberPodPlacement, casePlacementKnown, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
+  source + "; return { nearbyAccessory, pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, rememberPodPlacement, casePlacementKnown, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
 )()
 
 const PEERS = {
@@ -2592,6 +2592,49 @@ check('restored membership clears the keyring wait',
   const moved = log.rows.find(r => r.event && r.event.kind === 'audioTaken')
   check('phone takeover log names the selected model', moved && moved.message,
     'AirPods Max 2 audio moved to iPhone.')
+}
+
+// Only live, non-selected accessories may appear beside the active one.
+{
+  const rawCase = { address: "10:B5:88:96:4D:AE", model_name: "AirPods Pro 2",
+    lid_state: Model.LID_OPEN, left: { available: true, in_case: true },
+    right: { available: true, in_case: true } }
+  const cases = raw => Model.parseStatus(JSON.stringify({ schema_version: 1, accessories: raw })).accessories
+  const open = Model.nearbyAccessory(cases([rawCase]))
+  check('nearby open case identified', open, {
+    address: rawCase.address, label: 'AirPods Pro 2', isHeadset: false, headsetWorn: null, caseState: 'open'
+  })
+  check('selected case excluded', Model.nearbyAccessory(cases([{ ...rawCase, selected: true }])), null)
+  check('expired lid cannot use cached charge or lid', Model.nearbyAccessory(cases([{
+    ...rawCase, lid_state: Model.LID_UNKNOWN, last_known_lid_state: Model.LID_CLOSED,
+    case: { available: true, level: 90 }
+  }])), null)
+  check('closed nearby case', Model.nearbyAccessory(cases([{ ...rawCase, lid_state: Model.LID_CLOSED }])).caseState, 'closed')
+  check('pod out uses matching artwork', Model.nearbyAccessory(cases([{
+    ...rawCase, left: { available: true, in_case: false }
+  }])).caseState, 'open-right')
+  const closed = { ...rawCase, address: '00:11:22:33:44:55', lid_state: Model.LID_CLOSED }
+  check('open case preferred over closed', Model.nearbyAccessory(cases([closed, rawCase])), open)
+  check('inventory ordering does not change case', Model.nearbyAccessory(cases([rawCase, closed])), open)
+  check('older daemon has no secondary case', Model.nearbyAccessory(Model.defaultStatus().accessories), null)
+
+  const now = 1000000
+  const max = { address: '70:F9:4A:BA:19:81', model_name: 'AirPods Max 2', model_int: 12,
+    last_advertisement_ms: now - 1000, headset: { available: true, level: 87, worn: false } }
+  const background = Model.nearbyAccessory(cases([max]), now)
+  check('fresh off-head Max appears without a lid', background, {
+    address: max.address, label: 'AirPods Max 2', isHeadset: true, headsetWorn: false, caseState: ''
+  })
+  for (const model of [7, 8, 12])
+    check('Max family supported: ' + model, Model.nearbyAccessory(cases([{ ...max, model_int: model }]), now).isHeadset, true)
+  check('selected Max excluded', Model.nearbyAccessory(cases([{ ...max, selected: true }]), now), null)
+  check('Max report newer than the panel timer stays visible',
+    Model.nearbyAccessory(cases([{ ...max, last_advertisement_ms: now + 1000 }]), now), background)
+  check('Max disappears at expiry despite cached battery', Model.nearbyAccessory(cases([max]), now + 119000), null)
+  check('Max without last-seen evidence stays hidden', Model.nearbyAccessory(cases([{ ...max, last_advertisement_ms: 0 }]), now), null)
+  check('Max before closed cases', Model.nearbyAccessory(cases([closed, max]), now), background)
+  check('open case still takes priority', Model.nearbyAccessory(cases([max, rawCase]), now), open)
+  check('absent Max wear stays unknown', Model.nearbyAccessory(cases([{ ...max, headset: { available: true, level: 87 } }]), now).headsetWorn, null)
 }
 
 if (failures > 0) {

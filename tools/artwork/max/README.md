@@ -12,18 +12,20 @@ coverage sampling. There is no separate approximation of dot styling.
 around their attachment points to sit vertically along the sides of a head.
 Off head, they tilt inward and slide together until their lower cushion tips
 meet, without swivelling flat. The band narrows to follow their attachment
-points; camera and framing stay fixed.
-The panel uses the approved rear three-quarter view (yaw -2.6 radians), with
-a -0.133 radian camera roll (about 7.6° clockwise) to level the cup bottoms.
+points. Worn artwork faces the camera with zero yaw and roll so both cups sit
+symmetrically. Resting artwork uses the opposite side of the original angled
+view (yaw π − 2.6, about 31°), so the cups take the short path instead of crossing
+the camera. A +0.133 radian camera roll levels the cup bottoms in this view.
 The roll rotates geometry and lighting normals before rasterization, keeping
-the screen's dot grid upright. It stays fixed through wear transitions.
-The artwork shifts right by two dot columns to centre the strap beneath the
-fixed connectors; the battery gauge and connection layout stay in place.
+the screen's dot grid upright. Yaw, roll and the resting view's two-dot-column
+centering correction follow the same animated wear progress as the cups.
+The frontal pose needs no centering correction; the battery gauge and
+connection layout stay in place.
 The closing travel is 0.15949 renderer units per cup, measured from this
 simplified mesh. Band flex is an artwork approximation, not a hardware simulation.
 
 The panel passes `headset.worn` through `SeatsView` to `AirPodsIcon`. Only
-explicit `false` selects the closed pose; `true` and unknown use upright cups.
+explicit `true` selects the on-head pose; false and unknown use the resting pose.
 Connection ownership does not determine wear. The Max component animates
 off-head over 120 ms and back on-head over 240 ms, respecting the shell's animation setting;
 the study slider sets them directly.

@@ -67,10 +67,11 @@ function frame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, right
 
 // The painter selects background-to-ink versus shadow-to-light dot colors.
 // Smoothed dark frames also carry coverage, applied after palette selection.
-function renderFrame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, rightLift, zoom, leftLift, budsArrival, smoothSampling, podTurns) {
+function renderFrame(geometry, state, lid, time, yaw, pitch, columns, rows, ink, rightLift, zoom, leftLift, budsArrival, smoothSampling, podTurns, brightLidEdge) {
   var scene = parts(geometry, state, lid, time, rightLift, leftLift, budsArrival, podTurns)
   var view = {
     state: state, lid: lid, yaw: yaw, pitch: pitch, columns: columns, rows: rows,
+    brightLidEdge: brightLidEdge === true,
     scale: Math.min(columns, rows) / (state === "" ? 2.95 : 3.6) * (zoom === undefined ? 1 : zoom)
   }
   return renderScene(scene, view, ink, smoothSampling)

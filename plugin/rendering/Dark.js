@@ -11,7 +11,26 @@ function render(scene, view) {
     surfaceData: cover > 0
   })
   CoveredDeck.blend(samples.light, samples, view)
+  if (view.brightLidEdge) brightenLidEdge(samples, view)
   return { values: samples.light, tonal: false }
+}
+
+// At secondary-artwork density the thin white lip can fall between samples,
+// leaving socket shading on the silhouette. Reserve one bright dot per column
+// along the visible lid's top contour. The final depth-tested surface must be
+// the lid: a pod in front, the case body and interior shading keep their tones.
+function brightenLidEdge(samples, view) {
+  if (!view.state || view.lid <= 0.85) return
+  var amount = Math.min(1, (view.lid - 0.85) / 0.15)
+  for (var x = 0; x < view.columns; x++) {
+    for (var y = 0; y < view.rows; y++) {
+      var i = y * view.columns + x
+      if (!samples.surfaces[i]) continue
+      if (samples.surfaces[i] === 2)
+        samples.light[i] += (1 - samples.light[i]) * amount
+      break
+    }
+  }
 }
 
 // Approved baseline-study settings, shared by the pods and every case state.

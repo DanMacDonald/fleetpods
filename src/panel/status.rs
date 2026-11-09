@@ -210,6 +210,7 @@ pub fn accessory_entry(
     accessory: &Accessory,
     selected: bool,
     keys_ready: bool,
+    now: Clock,
 ) -> Value {
     let mut object = Map::new();
     object.insert("address".into(), json!(address.display()));
@@ -219,6 +220,8 @@ pub fn accessory_entry(
     object.insert("model_number".into(), json!(accessory.sku));
     object.insert("selected".into(), json!(selected));
     object.insert("keys_ready".into(), json!(keys_ready));
+    object.insert("is_headset".into(), json!(accessory.model.is_headset()));
+    object.insert("last_advertisement_ms".into(), json!(unix_at(now, accessory.advertised_at)));
     object.insert("ble_connection_state".into(), json!(accessory.ble_connection.unwrap_or(255)));
     let live = match &accessory.lid.latest {
         Evidence::Fresh { value, .. } => value.wire(),

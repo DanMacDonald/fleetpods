@@ -9,6 +9,7 @@ Item {
   required property color foregroundColor
   required property color backgroundColor
   property bool highlighted: true
+  property bool brightLidEdge: false
   property string caseState: ""
   property real leftLift: caseState === "open-right" || caseState === "open-empty" ? 1 : 0
   property real rightLift: caseState === "open-left" || caseState === "open-empty" ? 1 : 0
@@ -19,6 +20,7 @@ Item {
   property real dotPitch: Grid.pitch
   property real artworkScale: 1
   readonly property bool showsCase: caseState !== ""
+  readonly property real caseBottom: mesh.y + mesh.height * 0.71
   readonly property real artworkTop: showsCase
     ? mesh.y + mesh.height * (0.23 - 0.07 * mesh.lid)
     : (height - width) / 2 + restingPodsTop(width)
@@ -56,6 +58,7 @@ Item {
     animatePodLifts: false
     foregroundColor: root.foregroundColor
     highlighted: root.highlighted
+    brightLidEdge: root.brightLidEdge
     backgroundColor: root.backgroundColor
     shadowColor: Qt.tint(root.backgroundColor, Qt.rgba(root.foregroundColor.r,
       root.foregroundColor.g, root.foregroundColor.b, 0.08))

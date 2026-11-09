@@ -37,7 +37,8 @@ TestCase {
     tryCompare(mesh, "rest", 0, 700)
     compare(item.artworkTop, top, "wear animation keeps the connector anchored")
     item.headsetWorn = null
-    compare(mesh.rest, 0, "unknown wear does not claim the headset is off-head")
+    tryCompare(mesh, "rest", 1, 700, "unknown wear must not retain the on-head pose")
+    compare(item.headsetWorn, null, "resting artwork does not invent a wear report")
     item.variant = "pro"
     verify(!item.usesMeshMax)
     verify(findChild(item, "budsMeshArtwork") !== null)
@@ -52,6 +53,15 @@ TestCase {
     var item = createTemporaryObject(icon, this, { variant: "max", headsetWorn: false })
     verify(!item.usesPixelArt)
     verify(findChild(item, "maxMeshArtwork") === null)
+  }
+
+  function test_maxUnknownWearStartsResting() {
+    var item = createTemporaryObject(popup, this, { variant: "max" })
+    compare(item.headsetWorn, null)
+    var mesh = findChild(item, "maxMeshArtwork")
+    compare(mesh.rest, 1)
+    item.headsetWorn = true
+    tryCompare(mesh, "rest", 0, 700)
   }
 
   function test_standaloneDescentUsesConstantScreenVelocity_data() {

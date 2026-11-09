@@ -263,6 +263,10 @@ function accessoriesList(raw) {
       address: address,
       deviceName: String(entry.device_name || ""),
       modelName: String(entry.model_name || ""),
+      isHeadset: entry.is_headset === true || [7, 8, 12].indexOf(entry.model_int) >= 0,
+      lastAdvertisementMs: Number(entry.last_advertisement_ms || 0),
+      headsetWorn: entry.headset && entry.headset.available === true
+        && typeof entry.headset.worn === "boolean" ? entry.headset.worn : null,
       selected: entry.selected === true,
       keysReady: entry.keys_ready === true,
       lidState: intOr(entry.lid_state, LID_UNKNOWN),
@@ -272,6 +276,36 @@ function accessoriesList(raw) {
     })
   }
   return out
+}
+
+// Cases supply fresh lid evidence; headsets supply a recent advertisement.
+// Cached battery/last-known placement alone cannot establish nearby presence.
+function nearbyAccessory(accessories, nowMs) {
+  function priority(entry) { return entry.isHeadset ? 1 : entry.lidState === LID_OPEN ? 0 : 2 }
+  var candidates = (accessories || []).filter(function (entry) {
+    if (entry.selected) return false
+    if (entry.isHeadset) {
+      // Status updates can arrive between panel clock ticks. A report newer
+      // than that cached clock is fresh, not temporarily absent.
+      var age = Math.max(0, Number(nowMs) - entry.lastAdvertisementMs)
+      return entry.lastAdvertisementMs > 0 && age < TELEMETRY_EXPIRY_MS
+    }
+    return entry.lidState === LID_OPEN || entry.lidState === LID_CLOSED
+  }).sort(function (a, b) {
+    return priority(a) - priority(b) || a.address.localeCompare(b.address)
+  })
+  if (!candidates.length) return null
+  var entry = candidates[0]
+  var leftOut = entry.left.inEar || entry.left.outOfCase
+  var rightOut = entry.right.inEar || entry.right.outOfCase
+  return {
+    address: entry.address,
+    label: entry.modelName || entry.deviceName || "AirPods",
+    isHeadset: entry.isHeadset,
+    headsetWorn: entry.headsetWorn,
+    caseState: entry.isHeadset ? "" : entry.lidState === LID_CLOSED ? "closed"
+      : leftOut && rightOut ? "open-empty" : leftOut ? "open-right" : rightOut ? "open-left" : "open"
+  }
 }
 
 function podFrom(raw) {

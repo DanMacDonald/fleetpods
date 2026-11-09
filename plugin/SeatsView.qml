@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Shapes
 import QtQuick.Controls
+import qs.Commons
 import "Model.js" as Model
 
 Item {
@@ -51,6 +52,104 @@ Item {
   property string fontFamily: ""
   property string podsVariant: "buds"
   property var headsetWorn: null
+  property var nearbyAccessory: null
+  property string primaryAccessoryAddress: ""
+  property string presentedPrimaryAddress: ""
+  property var presentedPrimaryPose: null
+  // One owner sequences the outgoing retreat and incoming promotion.
+  property string accessoryPhase: "idle"
+  property real accessoryProgress: 1
+  readonly property real promotionProgress: accessoryPhase === "promoting" ? accessoryProgress : 1
+  property real promotionSourceX: 0
+  property real promotionSourceY: 0
+  property real promotionSourceSize: 0
+
+  function primaryPose() {
+    return { variant: podsVariant, worn: headsetWorn, caseState: caseState, pairing: pairingMode }
+  }
+  function canAnimateAccessories() {
+    return root.visible && root.animatePlacement && Style.duration(1) > 0
+  }
+  function startAccessoryPhase(phase) {
+    accessoryMotion.stop()
+    accessoryPhase = phase
+    accessoryProgress = 0
+    accessoryMotion.start()
+  }
+  function settleAccessoryArtwork() {
+    accessoryMotion.stop()
+    accessoryPhase = "idle"
+    accessoryProgress = 1
+    presentedPrimaryAddress = primaryAccessoryAddress
+    presentedPrimaryPose = primaryPose()
+    secondaryAccessory.present(root.nearbyAccessory, false)
+    secondaryAccessory.settle()
+  }
+
+  // Coalesce the selection, pose and inventory bindings before drawing.
+  // While retreating, retain both pictures; completion reads the latest target.
+  onPrimaryAccessoryAddressChanged: artworkUpdate.restart()
+  onPodsVariantChanged: artworkUpdate.restart()
+  onHeadsetWornChanged: artworkUpdate.restart()
+  onCaseStateChanged: artworkUpdate.restart()
+  onPairingModeChanged: artworkUpdate.restart()
+  function reconcileAccessoryArtwork() {
+    if (accessoryPhase === "receding") {
+      if (!canAnimateAccessories() || primaryAccessoryAddress === presentedPrimaryAddress)
+        settleAccessoryArtwork()
+      return
+    }
+    if (primaryAccessoryAddress !== presentedPrimaryAddress) {
+      // A second switch during the incoming pan supersedes that motion.
+      if (accessoryPhase === "promoting") { settleAccessoryArtwork(); return }
+      if (presentedPrimaryAddress && presentedPrimaryPose && canAnimateAccessories()) {
+        slideIn.stop()
+        startAccessoryPhase("receding")
+        return
+      }
+      applyAccessorySelection(canAnimateAccessories())
+      return
+    }
+    presentedPrimaryPose = primaryPose()
+    secondaryAccessory.present(root.nearbyAccessory,
+      secondaryAccessory.initialized && canAnimateAccessories())
+  }
+  function applyAccessorySelection(animate) {
+    var previous = secondaryAccessory.displayedAccessory
+    var promoted = animate && primaryAccessoryAddress !== "" && previous
+      && previous.address === primaryAccessoryAddress && secondaryAccessory.visible
+    if (promoted) {
+      promotionSourceX = secondaryAccessory.x + secondaryAccessory.width / 2
+      promotionSourceY = secondaryAccessory.y + secondaryAccessory.height / 2
+      promotionSourceSize = secondaryAccessory.width * 0.9
+      secondaryAccessory.displayedAccessory = null
+    }
+    presentedPrimaryAddress = primaryAccessoryAddress
+    presentedPrimaryPose = primaryPose()
+    if (promoted) startAccessoryPhase("promoting")
+    else {
+      accessoryPhase = "idle"
+      accessoryProgress = 1
+    }
+    secondaryAccessory.present(root.nearbyAccessory, animate)
+  }
+  Timer {
+    id: artworkUpdate
+    interval: 0
+    onTriggered: root.reconcileAccessoryArtwork()
+  }
+  NumberAnimation {
+    id: accessoryMotion
+    target: root
+    property: "accessoryProgress"
+    from: 0; to: 1
+    duration: Style.duration(root.accessoryPhase === "receding" ? 200 : 280)
+    easing.type: Easing.OutCubic
+    onFinished: {
+      if (root.accessoryPhase === "receding") root.applyAccessorySelection(root.canAnimateAccessories())
+      else { root.accessoryPhase = "idle"; root.accessoryProgress = 1 }
+    }
+  }
   property string caseState: ""
   property bool animatePlacement: true
   property bool pairingMode: false
@@ -251,20 +350,127 @@ Item {
     iconSize: usesMeshCase ? 137 : root.budsSize
     pixelArt: true
     color: root.foreground
-    variant: root.podsVariant
-    headsetWorn: root.headsetWorn
-    caseState: root.caseState
-    animatePlacement: root.animatePlacement
-    pairingMode: root.pairingMode
+    // Only the presentation owner commits a pose. Binding directly to live
+    // status here would load the incoming renderer before the queued retreat,
+    // then destroy it to restore the outgoing one, flashing empty canvases.
+    variant: root.presentedPrimaryPose ? root.presentedPrimaryPose.variant : root.podsVariant
+    headsetWorn: root.presentedPrimaryPose ? root.presentedPrimaryPose.worn : root.headsetWorn
+    caseState: root.presentedPrimaryPose ? root.presentedPrimaryPose.caseState : root.caseState
+    animatePlacement: root.animatePlacement && root.accessoryPhase === "idle"
+    pairingMode: root.presentedPrimaryPose ? root.presentedPrimaryPose.pairing : root.pairingMode
     // The stems end at y=113 and the case at y=117.5. Keep their painted
     // bottoms on the same baseline beside the case battery circle.
     y: root.artworkY + (usesMeshCase ? -4.5 : 0)
     anchors.horizontalCenter: parent.horizontalCenter
+    // The resting dot grid uses nearest sampling for crispness. During a
+    // scale transition, filter the complete artwork instead of letting its
+    // subpixel dots repeatedly disappear between texture samples.
+    layer.enabled: root.accessoryPhase !== "idle"
+    layer.smooth: true
+    layer.mipmap: true
+    opacity: root.accessoryPhase === "receding" ? 1 - root.accessoryProgress
+      : 0.65 + 0.35 * root.promotionProgress
+    scale: root.accessoryPhase === "receding" ? 1 - 0.85 * root.accessoryProgress
+      : root.promotionProgress + (1 - root.promotionProgress) * root.promotionSourceSize / width
+    transform: Translate {
+      x: (root.promotionSourceX - buds.x - buds.width / 2) * (1 - root.promotionProgress)
+      y: (root.promotionSourceY - buds.y - buds.height / 2) * (1 - root.promotionProgress)
+    }
+  }
+
+  Item {
+    id: secondaryAccessory
+    objectName: "nearbyAccessoryArtwork"
+    // Retain the last pose only for the fade; visibility follows live evidence.
+    property var displayedAccessory: null
+    property bool initialized: false
+    property real entrance: 1
+    readonly property real restingX: (buds.x - width) / 2
+    function present(accessory, animate) {
+      if (!accessory) return
+      var entering = !displayedAccessory || displayedAccessory.address !== accessory.address || opacity === 0
+      displayedAccessory = accessory
+      if (!entering) return
+      slideIn.stop()
+      if (animate) slideIn.start()
+      else entrance = 1
+    }
+    function settle() { slideIn.stop(); entrance = 1 }
+    Connections {
+      target: root
+      function onNearbyAccessoryChanged() {
+        artworkUpdate.restart()
+      }
+      function onVisibleChanged() { if (!root.visible) root.settleAccessoryArtwork() }
+      function onAnimatePlacementChanged() { if (!root.animatePlacement) root.settleAccessoryArtwork() }
+    }
+    Component.onCompleted: {
+      present(root.nearbyAccessory, false)
+      initialized = true
+    }
+    width: Math.min(96, Math.max(0, buds.x - 24))
+    height: width
+    // This entrance runs independently of the main icon's descent. Repeated
+    // telemetry for the same accessory updates its pose without replaying it.
+    x: -width + entrance * (restingX + width)
+    y: root.artworkY + (root.budsSize - height) / 2
+    opacity: (root.accessoryPhase === "receding" ? displayedAccessory !== null : !!root.nearbyAccessory) ? 0.65 : 0
+    visible: displayedAccessory !== null && opacity > 0 && width > 0
+    Behavior on opacity {
+      NumberAnimation { duration: Style.duration(180); easing.type: Easing.OutCubic }
+    }
+    NumberAnimation {
+      id: slideIn
+      target: secondaryAccessory
+      property: "entrance"
+      from: 0; to: 1
+      duration: Style.duration(260)
+      easing.type: Easing.OutCubic
+    }
+    MeshArtwork {
+      id: secondaryCaseMesh
+      objectName: "nearbyCaseMesh"
+      visible: !secondaryAccessory.displayedAccessory || !secondaryAccessory.displayedAccessory.isHeadset
+      brightLidEdge: true
+      anchors.centerIn: parent
+      width: parent.width * 0.9
+      height: parent.height * 0.9
+      foregroundColor: root.foreground
+      backgroundColor: root.screenFill
+      caseState: secondaryAccessory.displayedAccessory ? secondaryAccessory.displayedAccessory.caseState : "closed"
+    }
+    MaxArtwork {
+      id: secondaryMaxMesh
+      objectName: "nearbyMaxArtwork"
+      visible: !!secondaryAccessory.displayedAccessory && secondaryAccessory.displayedAccessory.isHeadset === true
+      anchors.centerIn: parent
+      width: parent.width * 0.9
+      height: parent.height * 0.9
+      foregroundColor: root.foreground
+      backgroundColor: root.screenFill
+      rest: secondaryAccessory.displayedAccessory && secondaryAccessory.displayedAccessory.headsetWorn === true ? 0 : 1
+      poseDuration: Style.duration(240)
+    }
+    Text {
+      objectName: "nearbyAccessoryLabel"
+      y: (secondaryAccessory.displayedAccessory && secondaryAccessory.displayedAccessory.isHeadset
+        ? secondaryMaxMesh.y + secondaryMaxMesh.height
+        : secondaryCaseMesh.y + secondaryCaseMesh.caseBottom) + 4
+      width: parent.width
+      text: secondaryAccessory.displayedAccessory ? secondaryAccessory.displayedAccessory.label : ""
+      textFormat: Text.PlainText
+      horizontalAlignment: Text.AlignHCenter
+      elide: Text.ElideRight
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      color: root.foreground
+    }
   }
 
   Row {
     id: batteryRow
     objectName: "podBatteryIndicators"
+    opacity: root.accessoryPhase === "receding" ? 0 : root.promotionProgress
     visible: root.showBattery
     anchors.horizontalCenter: buds.horizontalCenter
     // Keep the gauges fixed while the pods drop into place.
@@ -306,6 +512,7 @@ Item {
   Column {
     id: caseBattery
     objectName: "caseBatteryIndicator"
+    opacity: root.accessoryPhase === "receding" ? 0 : root.promotionProgress
     visible: root.showBattery && root.podsVariant !== "max"
     // Follow the case's 3 px wider painted right edge, preserving the gutter.
     x: buds.x + buds.width / 2 + Math.max(128, root.budsSize) / 2 + 27
@@ -430,7 +637,11 @@ Item {
   onConnectionSpinVisibleChanged: Qt.callLater(reconcileAttempt)
   onConnectionCompleteChanged: Qt.callLater(reconcileAttempt)
   onAttemptKindChanged: Qt.callLater(reconcileAttempt)
-  Component.onCompleted: reconcileAttempt()
+  Component.onCompleted: {
+    presentedPrimaryAddress = primaryAccessoryAddress
+    presentedPrimaryPose = primaryPose()
+    reconcileAttempt()
+  }
 
   NumberAnimation {
     id: drawing
