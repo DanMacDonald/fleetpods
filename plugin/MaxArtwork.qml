@@ -20,9 +20,13 @@ DotPods {
   // about 31 degrees instead of carrying a cup across the camera.
   yaw: (Math.PI - 2.6) * rest
   pitch: 0.24
-  // The frontal pose is already centered. Only the angled resting view needs
-  // the two-column correction beneath the fixed connectors.
-  transform: Translate { x: -2 * root.effectiveDotPitch * root.rest }
+  // Ease right with the resting rotation so the headband stays centered
+  // beneath the fixed connectors. The frontal pose needs no correction.
+  transform: Translate {
+    x: root.effectiveDotPitch * root.rest
+    // Keep the enlarged headband below the fixed connection endpoints.
+    y: 2 * root.effectiveDotPitch
+  }
   shadowColor: Qt.tint(backgroundColor, Qt.rgba(foregroundColor.r,
     foregroundColor.g, foregroundColor.b, 0.08))
   onRestChanged: requestPaint()

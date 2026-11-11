@@ -34,5 +34,5 @@ function frame(geometry, rest, yaw, pitch, columns, rows, ink, roll) {
   add('left', -1, 2)
   add('right', 1, 3)
   return Mesh.renderScene(scene, {state: '', lid: 1, yaw: yaw, pitch: pitch, roll: roll,
-    columns: columns, rows: rows, scale: Math.min(columns, rows) / 3.0}, ink, true)
+    columns: columns, rows: rows, scale: Math.min(columns, rows) / 3.0 * 1.1}, ink, true)
 }

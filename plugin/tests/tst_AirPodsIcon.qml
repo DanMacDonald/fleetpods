@@ -30,9 +30,12 @@ TestCase {
     var top = item.artworkTop
     item.headsetWorn = true
     tryCompare(mesh, "rest", 0, 700)
+    // Allow an intermediate frame even when software rasterization takes
+    // longer than the normal 120 ms closing animation.
+    mesh.poseDuration = 1000
     item.headsetWorn = false
-    wait(40)
-    verify(mesh.rest > 0 && mesh.rest < 1, "wear changes animate")
+    tryVerify(function() { return mesh.rest > 0 && mesh.rest < 1 }, 700, "wear changes animate")
+    mesh.poseDuration = 240
     item.headsetWorn = true
     tryCompare(mesh, "rest", 0, 700)
     compare(item.artworkTop, top, "wear animation keeps the connector anchored")
