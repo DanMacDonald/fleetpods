@@ -909,7 +909,24 @@ fn release(
     state.want = false;
     let on_accessory = accessory_sink.is_some_and(|sink| sink.name == graph.default_sink);
     let speakers = if state.returning {
-        state.from.clone().or_else(|| speaker_sink(graph, accessory_sink))
+        // Preserve an output the user already selected, including USB/HDMI.
+        // A saved route may have disappeared during a long background session.
+        graph
+            .sinks
+            .iter()
+            .find(|sink| !on_accessory && sink.name == graph.default_sink)
+            .map(|sink| sink.name.clone())
+            .or_else(|| {
+                state
+                    .from
+                    .as_ref()
+                    .filter(|name| {
+                        graph.sinks.iter().any(|sink| &sink.name == *name)
+                            && !accessory_sink.is_some_and(|sink| &sink.name == *name)
+                    })
+                    .cloned()
+            })
+            .or_else(|| speaker_sink(graph, accessory_sink))
     } else {
         state.from.clone()
     };
@@ -1126,11 +1143,10 @@ pub fn playing_on_speakers(graph: &Graph, from: Option<&str>) -> bool {
     })
 }
 
-/// Anything on the pods but event sounds, playing or not: a play is
-/// often reported before its stream uncorks.
+/// Park all application streams, including corked and notification streams:
+/// leaving one pinned to the pods can interrupt their remote owner on uncork.
 fn returnable(stream: &LiveStream) -> bool {
-    let role = stream.role.to_ascii_lowercase();
-    role != "event" && role != "notification" && !is_speaker_chain(stream)
+    !is_speaker_chain(stream)
 }
 
 /// The laptop speakers when no claim recorded where playback came from.
@@ -1432,6 +1448,25 @@ mod tests {
         );
         assert!(picture.streams[0].mute);
         assert_eq!(picture.streams[0].volume, 0.3);
+    }
+
+    #[test]
+    fn returning_uses_a_live_output_when_the_saved_output_disappeared() {
+        let mut router = Router::new();
+        router.state.from = Some("missing_usb".into());
+        router.return_to_speakers();
+        let mut picture = graph(
+            "pods",
+            vec![sink("pods", Some(address()), None), sink("omarchy_speaker_tuning", None, None)],
+            vec![stream(1, 8, "pods", "notification", false)],
+        );
+        picture.streams[0].corked = true;
+        router.on_graph(Some(address()), &picture, false, MonoMs(0));
+        let work = router.take_work(MonoMs(0), false);
+        assert!(work.contains(&Work::SetDefault("omarchy_speaker_tuning".into())));
+        assert!(work.iter().any(|work| matches!(work, Work::Move(moves)
+            if moves.sink == "omarchy_speaker_tuning" && moves.streams[0].id == 1)));
+        assert!(!router.wants_output());
     }
 
     #[test]

@@ -1684,6 +1684,13 @@ impl Daemon {
 
     fn follow_graph(&mut self, graph: &crate::audio::route::Graph, now: Clock) {
         self.last_graph = Some(graph.clone());
+        // A background Bluetooth connection is not a playback claim. Leaving
+        // it as the default lets even an unlabelled notification start A2DP
+        // and interrupt the remote owner without any ownership command.
+        if !self.output.wants_output() && matches!(self.resolved(now).holder, Holder::Remote { .. })
+        {
+            self.output.return_to_speakers();
+        }
         // The takeover hold applies while admission is still opening the
         // link, not only once it is ready: routing onto a present sink
         // before the grant lets the pods drop the stream back to the
@@ -2240,6 +2247,68 @@ mod tests {
         daemon.last_graph = Some(graph.clone());
         daemon.audio.set_routed(true);
         (daemon, graph)
+    }
+
+    #[test]
+    fn remote_playback_parks_default_and_notification_streams_without_claiming() {
+        use crate::audio::route::LiveStream;
+        use crate::step::{Effect, Input};
+        for initial in ["pods", "usb"] {
+            let (mut daemon, mut graph) = manual_output_fixture();
+            let now = clock();
+            let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.audio.update_player("brave", Some(false));
+            daemon.release_preference(now);
+            daemon.note_ownership(false, now.mono);
+            daemon.note_source(false, 2, now.mono);
+            daemon.note_remote(addr(4), now.mono);
+            daemon.note_remote_player(addr(4), now.mono);
+            graph.default_sink = initial.into();
+            graph.streams.clear();
+            let parked = daemon.step(Input::Audio(graph.clone()), at(100));
+            let target = if initial == "pods" { "speakers" } else { "usb" };
+            assert_eq!(
+                parked.effects.iter().any(|effect| matches!(effect,
+                    Effect::SetDefaultSink { name } if name == target
+                )),
+                initial == "pods",
+                "{:?}",
+                parked.effects
+            );
+            assert!(!daemon.output.wants_output());
+            graph.default_sink = target.into();
+            daemon.step(Input::Audio(graph.clone()), at(200));
+            // Slack reported no media.role. Both it and explicitly tagged
+            // notifications must stay local, including cached corked streams.
+            for (i, (role, corked)) in
+                [("", false), ("notification", true), ("event", false)].into_iter().enumerate()
+            {
+                graph.streams = vec![LiveStream {
+                    id: 20,
+                    generation: 20,
+                    sink: "pods".into(),
+                    role: role.into(),
+                    node: "Slack".into(),
+                    mute: false,
+                    temporarily_muted: false,
+                    volume: 1.0,
+                    corked,
+                }];
+                let result = daemon.step(Input::Audio(graph.clone()), at(1000 + i as u64 * 2000));
+                assert!(result.effects.iter().any(|effect| matches!(effect,
+                    Effect::MoveStreams(moves) if moves.sink == target && moves.streams[0].id == 20
+                )), "{initial} role={role}: {:?}", result.effects);
+                assert!(!daemon.output.wants_output());
+                assert!(!result.effects.iter().any(|effect| matches!(effect,
+                    Effect::WriteControl { bytes, .. } if *bytes == setup::ownership(true)
+                )));
+                graph.streams[0].sink = target.into();
+                daemon.step(Input::Audio(graph.clone()), at(1100 + i as u64 * 2000));
+            }
+            // Real media intent retains the existing fast takeover path.
+            daemon.step(Input::Player { service: "brave".into(), playing: Some(true) }, at(7000));
+            assert!(daemon.output.wants_output());
+        }
     }
 
     #[test]

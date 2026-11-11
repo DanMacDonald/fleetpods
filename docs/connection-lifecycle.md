@@ -62,6 +62,15 @@ preference. It survives audio-server reconnection within the daemon session.
 Initial acquisition, disappearing outputs and the router's own recovery parking
 are not interpreted as manual choices.
 
+While a remote device owns the AirPods and this laptop has no playback claim,
+session advancement uses the router's existing speaker-return path to keep the
+local default and lingering application streams off the AirPods. Starting A2DP
+can interrupt the remote owner even without an ownership command, so this applies
+to unlabelled sounds as well as notification/event roles and corked streams. The
+router preserves an already-selected local output, otherwise restores a live
+saved output or falls back to the laptop speakers. Speaker-processing streams
+stay in place. A deliberate playback claim supersedes this background routing.
+
 Permission to open is not permission to take audio: `Facts.intent` is
 `JoinInBackground` until the router holds a playback claim (`TakeAudio`), and
 only `TakeAudio` pursues profiles, routing and streaming. Ownership claims are
