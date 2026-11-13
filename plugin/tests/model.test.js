@@ -3,7 +3,7 @@
 
 const source = Deno.readTextFileSync(new URL("../Model.js", import.meta.url))
 const Model = new Function(
-  source + "; return { nearbyAccessory, pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, handoffPhaseLabel, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, rememberPodPlacement, casePlacementKnown, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
+  source + "; return { nearbyAccessory, pairingWarning, deviceNameMarkup, logDeviceNames, appleTrayAvailable, fleetOutcome, fleetRouteFailed, statusLog, statusLogState, statusLogRecord, connectionAttempt, caseQuietConnection, connectingLine, seatPresentation, seatAudioSubtitle, localAudio, heldSubtitle, backgroundJoin, seatAudioOwner, fleetViewSubtitle, appleFleetSubtitle, fleetLabel, playingLabel, appleFleetMember, localSeatConnected, localConnectionLabel, fleetSeatView, remoteOmarchyAudio, omarchyRosterOwner, appleRosterOwner, appleOwnsAudio, confirmedLocalPlayback, idleAudioReady, controlConnectionLabel, audioRouteState, localAudioLabel, defaultStatus, connectionPresentation, connectionElsewhere, confirmedInCase, showDisconnectedMark, telemetryUnavailable, displayedBatteryLevel, ownershipText, parseStatus, podFrom, defaultPod, noiseModeVerb, earDetectionVerb, levelFraction, levelText, podMeta, elideError, availableModes, seatOccupants, availableDevices, linuxHeld, domainEvent, statusText, podsNearby, appleOccupantAddress, applePadDevices, devicesMap, rememberPodPlacement, casePlacementKnown, caseIconState, inCase, budsOut, emptyGuidance, statusLogSuppressed, iconVariant, openingControlLink, statusCaptionChanged, isPhone, appleSeat, omarchySeat, seatPairHold, seatedDevices, trayDevices, seatDeviceLit, NOISE_OFF, NOISE_ANC, NOISE_TRANSPARENCY, NOISE_ADAPTIVE, LEVEL_UNKNOWN, NOISE_UNKNOWN, EAR_PAUSE_ONE_OUT, LID_OPEN, LID_CLOSED, LID_UNKNOWN, MAX_ERROR_CHARS }"
 )()
 
 const PEERS = {
@@ -289,9 +289,6 @@ check("nearby disconnected caption",
 check("holding seat caption",
   domainCaption(false, [{ label: "iPhone" }], [{ label: "Linux laptop" }], true),
   "Reclaiming Omarchy seat. Apple keeps audio.")
-check("handoff phase names the audio profile step", Model.handoffPhaseLabel("profile_connect"), "Connecting the audio profile")
-check("handoff phase names speaker recovery", Model.handoffPhaseLabel("recovery_speakers"), "Moving audio to the speakers")
-check("unknown handoff phase has no label", Model.handoffPhaseLabel("idle"), "")
 check("click omarchy connecting caption",
   domainCaption(false, [{ label: "MacBook Pro" }, { label: "iPhone" }], [{ label: "Linux laptop" }], true, true, true),
   "Linux laptop claims ownership.")
@@ -1312,10 +1309,9 @@ check('a connecting laptop says so', Model.localConnectionLabel({ ...localLinkSt
 {
   // The connection ring reads these from the view; the service's own copy merged a legacy file nothing writes.
   const native = (handoff, t) => ({ t, ev: 'status', status: { ...Model.defaultStatus(), ok: true, nativeHandoff: { updated_ms: t, ...handoff } } })
-  let ring = Model.statusLog(null, native({ connecting: true, attempting: true, phase: 'control' }, 1000))
-  check('the view carries a native connection in progress', [ring.view.connecting, ring.view.connectionAttempting,
-    ring.view.handoffPhase, ring.view.connectionCompleted], [true, true, 'control', false])
-  ring = Model.statusLog(ring, native({ connecting: false, completed: true, phase: 'idle' }, 2000))
+  let ring = Model.statusLog(null, native({ connecting: true }, 1000))
+  check('the view carries a native connection in progress', [ring.view.connecting, ring.view.connectionCompleted], [true, false])
+  ring = Model.statusLog(ring, native({ connecting: false, completed: true }, 2000))
   check('the view carries a completed native connection', [ring.view.connecting, ring.view.connectionCompleted], [false, true])
   const asking = Model.statusLog(null, { t: 1000, ev: 'status', status: { ...Model.defaultStatus(), ok: true,
     connected: false, fleet: { routing: { phase: 'waiting_admission', busy: true, peer: 'D0:C6:37:2F:D0:9F' } } } })

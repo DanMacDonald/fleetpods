@@ -21,7 +21,8 @@
     "defaults": {
       "hideWhenDisconnected": true,
       "ctlPath": "",
-      "connectionSpinMs": 13000
+      "connectionSpinMs": 13000,
+      "connectionNotifications": true
     },
     "schema": [
       {
@@ -46,6 +47,13 @@
         "max": 20000,
         "step": 500,
         "defaultValue": 13000
+      },
+      {
+        "key": "connectionNotifications",
+        "type": "boolean",
+        "label": "Show connection notifications",
+        "description": "Native notification with FleetPods progress artwork while connecting audio.",
+        "defaultValue": true
       }
     ]
   }

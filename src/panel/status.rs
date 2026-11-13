@@ -35,7 +35,6 @@ pub struct Snapshot<'a> {
     pub microphone: &'a Microphone,
     pub mic_path: &'a MicPath,
     pub handoff_yielded: bool,
-    pub handoff_phase: &'static str,
     pub handoff_failure: &'static str,
     pub handoff_updated: Option<crate::types::UnixMs>,
     pub audio_seen: bool,
@@ -72,9 +71,12 @@ pub fn project(snapshot: &Snapshot<'_>) -> Value {
 }
 
 fn insert_handoff(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>) {
+    // Connection owns the Apple reconnect, including its cancellation by
+    // Bluetooth service loss; the seat keeps no second flag for it.
+    let reconnecting = snapshot.connection.apple_reconnect();
     let active = snapshot.audio_seen
         || snapshot.handoff_yielded
-        || snapshot.handoff_phase != "idle"
+        || reconnecting
         || !snapshot.handoff_failure.is_empty();
     if !active {
         return;
@@ -82,10 +84,8 @@ fn insert_handoff(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>) {
     let mut handoff = Map::new();
     handoff.insert("enabled".into(), json!(true));
     handoff.insert("yielded".into(), json!(snapshot.handoff_yielded));
-    handoff.insert("phase".into(), json!(snapshot.handoff_phase));
     handoff.insert("playing".into(), json!(snapshot.playing && !snapshot.handoff_yielded));
-    handoff.insert("connecting".into(), json!(snapshot.handoff_phase == "reconnecting"));
-    handoff.insert("attempting".into(), json!(snapshot.handoff_phase == "reconnecting"));
+    handoff.insert("connecting".into(), json!(reconnecting));
     handoff.insert("failure".into(), json!(snapshot.handoff_failure));
     handoff
         .insert("updated_ms".into(), json!(snapshot.handoff_updated.map(|at| at.0).unwrap_or(0)));

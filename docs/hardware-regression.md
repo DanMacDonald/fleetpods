@@ -219,3 +219,31 @@ docked. Losing the remaining control link paused Brave again. A link that
 has already released audio now closes without handing off speaker playback.
 The regression test verifies no extra pause/mute and preserves the deferred
 claim for the next insertion. Ear-removal pause behavior is unchanged.
+
+## 2026-11-12: XPS/Gram background connection churn
+
+Both laptops repeatedly lost their ready control link beside the iPhone, waited
+five seconds and reopened in the background. Each still remembered itself as
+preferred. The existing `displaced` state was recorded but passive reconnects
+did not consult it. Repeated Max wear advertisements could therefore authorize
+another opening as soon as the settling delay elapsed.
+
+Passive reopening now honors that displacement state; fresh activity and an
+explicit Connect still work, and switching accessories clears the old hold.
+The regression reproduced an OpenLink at 5,000 ms before the fix. Afterward it
+held through repeated wear reports up to 60 seconds and passive ACL attachment,
+then accepted fresh activity/Connect. All 486 unit and 33 acceptance tests and
+Clippy passed.
+
+Installed the matching daemon on XPS and Gram, with running executable SHA-256
+`989ff832ba2662b790cad73d7c372a5d043b644cc52812d0d3a3e00e46cb1e52`.
+Gram was temporarily stopped during diagnosis and restored after installation.
+Live checks showed XPS retaining playback and Gram staying connected in the
+background; the user confirmed the switching stopped. The FleetPods toast and
+battery ring also rendered on Gram's older native notification implementation.
+No native Omarchy plugins were edited.
+
+A separate clock check found Gram approximately 16 seconds ahead of XPS,
+exceeding the fleet's five-second future-clock allowance. Refreshing Gram's
+systemd-timesyncd service over SSH required a sudo password and was not applied.
+This remains a potential cause of rejected fleet advertisements.

@@ -34,6 +34,9 @@ Admission/preference/pairing rules supply permission to open. The lifecycle
 issues the request in Linking; there is no separate daemon launch flag. BlueZ
 service discovery runs with the physical connection and reports its result.
 Fleet admission reserves a connection slot; it does not imply playback intent.
+The handoff's reconnect indicator reads Connection's Apple reconnect operation
+directly. The audio seat only records the yield, so cancellation by Bluetooth
+service loss, suspend or adapter shutdown cannot leave a stale reconnect spinner.
 A background join must not pause the current owner or create a speculative resume
 hold. The authenticated roster's playback-intent flag is the single early-yield
 trigger, preserving advance release for actual takeovers before a control claim
@@ -93,6 +96,20 @@ worn headset, the existing owned-playback routing path can restore playback only
 when the pods directly confirm local ownership and playback has not been yielded.
 The same owner handles newly observed streams. Explicit Play and insertion retain
 their existing claim paths; snapshots cannot reclaim a released or remote seat.
+
+Losing an idle control connection while sharing the pods with an Apple device
+retains the existing displacement wait. The five-second settling delay does not
+authorize passive reconnection: repeated worn advertisements and ACL attachment
+cannot reopen that slot. This prevents two laptops with isolated preference
+records from repeatedly evicting one another. Fresh desktop activity after the
+settling delay, an explicit connection/playback request, a real case cycle, or
+selecting another accessory can progress through the existing admission paths.
+
+`ReopenHold` (`src/daemon/reopen.rs`) is the one record of why this laptop is
+not reopening on its own: displacement, the timed slot hold and the owner-first
+order. Passive openings ask `passive_blocked`; activity honors only the two
+timed holds, since fresh input is what displacement waits for. A ready link or
+an accessory switch clears the record; explicit Connect and Play never read it.
 
 Fleet advertisement intent belongs to the Linux radio worker. Pairing temporarily
 blocks registration without clearing that intent, including a first request

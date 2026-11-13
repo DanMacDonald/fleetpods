@@ -1,4 +1,5 @@
 import QtQuick
+import "Motion.js" as Motion
 import QtQuick.Shapes
 import Qt5Compat.GraphicalEffects
 import qs.Commons as Commons
@@ -538,7 +539,7 @@ Item {
       highlighted: root.highlighted
       rest: root.headsetWorn === true ? 0 : 1
       animatePose: root._animatePlacement
-      poseDuration: Commons.Style.duration(240)
+      poseDuration: Motion.duration(Commons.Style, 240)
       foregroundColor: artworkPalette.item.foreground
       backgroundColor: artworkPalette.item.backgroundColor
     }

@@ -5,5 +5,9 @@ import QtQuick
 QtObject {
   function space(value) { return value }
   function duration(value) { return value }
-  property QtObject font: QtObject { property int caption: 12 }
+  property QtObject font: QtObject {
+    property int caption: 12
+    property int title: 14
+    property int body: 12
+  }
 }

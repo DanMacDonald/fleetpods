@@ -263,13 +263,12 @@ enum ConnectionHold {
     Superseded,
 }
 
-/// Release behavior is explicit: only handoff/reconnect pause players.
+/// Release behavior is explicit: only a handoff pauses players.
 enum Release {
     Handoff,
     Speakers,
     Preference,
     AwaitAvailability,
-    AppleReconnect,
 }
 
 struct Rejoin {
@@ -370,14 +369,7 @@ impl Daemon {
                 && !self.routing.phase().busy()
                 && !self.connection.apple_reconnect()
             {
-                let until = now.saturating_add(DISPLACEMENT_HOLD_MS);
-                self.slot_hold_until = Some(self.slot_hold_until.map_or(until, |held| {
-                    if held.0 > until.0 {
-                        held
-                    } else {
-                        until
-                    }
-                }));
+                self.hold.hold_slot(now.saturating_add(DISPLACEMENT_HOLD_MS));
             }
             self.consider_apple_displacement();
             self.consider_reopen_order();
@@ -391,10 +383,7 @@ impl Daemon {
     pub fn mark_control_ready(&mut self, generation: Generation) -> bool {
         let ready = self.connection.mark_ready(generation);
         if ready {
-            self.displaced = false;
-            self.slot_hold_until = None;
-            self.reopen_wait = false;
-            self.reopen_hold_until = None;
+            self.hold.clear();
             self.session.background_requested = false;
             self.microphone.set_control_ready(true);
         }
@@ -485,8 +474,7 @@ impl Daemon {
             self.claim_rejoin(now);
         } else if !self.connection.stage().is_opening() {
             eprintln!("fleetpodsd: rejoining the AirPods alongside the device that took this link");
-            self.displaced = false;
-            self.slot_hold_until = None;
+            self.hold.clear_slot_loss();
             self.routing.claim_audio();
             self.open_connection(now.mono);
         }
@@ -519,7 +507,7 @@ impl Daemon {
             || self.routing.phase().busy()
             || self.connection.apple_reconnect()
             || self.outside_device_playing(now)
-            || self.background_reopen_blocked(now.mono)
+            || self.hold.passive_blocked(now.mono)
         {
             return;
         }
@@ -594,20 +582,20 @@ impl Daemon {
         }
         // Input on an established link can claim idle audio immediately. Input
         // after a slot loss must not evict the device still taking that slot.
-        if self.slot_hold_until.is_some_and(|until| now.mono.0 < until.0) {
+        // Activity honors the timed holds but not displacement: fresh input is
+        // exactly what a displaced laptop waits for.
+        if self.hold.slot_held(now.mono) {
             eprintln!("fleetpodsd: activity ignored while a yielded slot is held");
             return Response::line("ignored");
         }
-        self.slot_hold_until = None;
         // Use a connected helper when present; otherwise open only the control link.
         let target = self.activity_target(now);
         // The reopen hold lets the pair's audio owner land first. A connected
         // fleet helper means it already has, so input asks that helper for a
         // seat instead of waiting out the hold.
         if matches!(target, ActivityTarget::One(_)) {
-            self.reopen_wait = false;
-            self.reopen_hold_until = None;
-        } else if self.reopen_blocked(now.mono) {
+            self.hold.owner_landed();
+        } else if self.hold.owner_blocked(now.mono) {
             eprintln!("fleetpodsd: activity ignored while the audio owner reconnects first");
             return Response::line("ignored");
         }
@@ -649,7 +637,7 @@ impl Daemon {
 
     fn begin_background_open(&mut self, now: Clock) {
         self.routing.clear_failure();
-        self.displaced = false;
+        self.hold.displaced = false;
         self.open_connection(now.mono);
         eprintln!("fleetpodsd: activity opening the background control connection");
     }
@@ -825,7 +813,7 @@ impl Daemon {
             }
             return;
         }
-        if self.background_reopen_blocked(now) {
+        if self.hold.passive_blocked(now) {
             return;
         }
         if generation != self.connection.generation()
@@ -864,7 +852,7 @@ impl Daemon {
         }
         self.step_back(now);
         self.effects.drop_link = true;
-        self.slot_hold_until = Some(now.mono.saturating_add(SLOT_HOLD_MS));
+        self.hold.hold_slot(now.mono.saturating_add(SLOT_HOLD_MS));
     }
 
     pub(super) fn claim_handoff(&mut self, now: Clock) -> Response {
@@ -917,7 +905,7 @@ impl Daemon {
         if self.config.accessory.is_none() {
             return Response::line("error: no paired AirPods address");
         }
-        self.displaced = false;
+        self.hold.displaced = false;
         self.session.manual_output = false;
         self.routing.claim_audio();
         self.open_connection(now.mono);
@@ -1070,9 +1058,9 @@ impl Daemon {
         self.session.retire_player_work();
         self.session.resume_output_on_grant = false;
         self.routing.release_audio();
-        let pause = matches!(how, Release::Handoff | Release::AppleReconnect);
+        let pause = matches!(how, Release::Handoff);
         match how {
-            Release::Handoff | Release::AppleReconnect => {
+            Release::Handoff => {
                 // The router queues quieting ahead of Pause and control writes.
                 self.output.handoff(self.config.accessory, self.last_graph.as_ref(), now.mono);
             }
@@ -1081,7 +1069,6 @@ impl Daemon {
         }
         match how {
             Release::AwaitAvailability => return, // Keep local intent for the deferred claim.
-            Release::AppleReconnect => self.seat.begin_reconnect(now),
             _ => self.seat.step_back(now),
         };
         let players = self.audio.yield_playback();
@@ -1129,7 +1116,10 @@ impl Daemon {
         match self.connection.begin_apple_reconnect(now.mono) {
             Ok(()) => {
                 self.session.background_requested = false;
-                self.release_playback(Release::AppleReconnect, now);
+                // A release, like step_back: an active claim would keep airing
+                // fleet intent once the Apple device owns the audio.
+                self.session.claim = PlaybackClaim::Idle;
+                self.release_playback(Release::Handoff, now);
                 Response::line("accepted")
             }
             Err(message) => Response::line(message.trim_end()),
@@ -2753,7 +2743,7 @@ mod tests {
                 last_use: UnixMs(0),
             });
             // This laptop's link dropped while the XPS owned the pair's audio.
-            daemon.reopen_wait = true;
+            daemon.hold.owner_first = true;
             daemon.accessory.left = crate::types::Evidence::fresh(
                 Pod {
                     battery: crate::types::Battery::new(60, false).unwrap(),
@@ -2766,11 +2756,11 @@ mod tests {
             if owner_connected {
                 // The owner already landed: ask it for a seat alongside it.
                 assert_eq!(daemon.routing.phase(), Phase::WaitingAdmission);
-                assert!(!daemon.reopen_wait);
+                assert!(!daemon.hold.owner_first);
             } else {
                 // The owner is not back yet, so it still gets to land first.
                 assert!(!daemon.routing.phase().busy());
-                assert!(daemon.reopen_wait);
+                assert!(daemon.hold.owner_first);
                 assert!(!daemon.session.background_requested);
             }
         }
@@ -3010,7 +3000,7 @@ mod tests {
             daemon.free_slot(addr(2), now);
             let generation = daemon.connection.generation();
             daemon.step(Input::ControlSocket { up: false, generation }, now);
-            assert_eq!(daemon.slot_hold_until, Some(now.mono.saturating_add(SLOT_HOLD_MS)));
+            assert_eq!(daemon.hold.slot_until, Some(now.mono.saturating_add(SLOT_HOLD_MS)));
             let activity = daemon.step(Input::Command(Command::Activity), now);
             assert!(!activity.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
             assert!(!daemon.session.background_requested);
@@ -3037,7 +3027,7 @@ mod tests {
 
         daemon.free_slot(peer, now);
         assert!(daemon.effects.drop_link);
-        assert!(daemon.slot_hold_until.is_some());
+        assert!(daemon.hold.slot_until.is_some());
 
         let generation = daemon.connection().generation();
         daemon.attach_available(generation, now.mono.saturating_add(1_000));
@@ -3141,7 +3131,7 @@ mod tests {
             let mut daemon = Daemon::new("xps");
             let now = clock();
             ready_link(&mut daemon, now);
-            daemon.release_playback(Release::AppleReconnect, now);
+            daemon.release_playback(Release::Handoff, now);
             daemon.note_lid(true, now.mono);
             let generation = daemon.connection().generation();
             daemon.note_socket(false, generation, now.mono);
@@ -3219,7 +3209,7 @@ mod tests {
                 let now = clock();
                 let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
                 ready_link(&mut daemon, now);
-                daemon.release_playback(Release::AppleReconnect, now);
+                daemon.release_playback(Release::Handoff, now);
                 daemon.note_lid(true, now.mono);
                 daemon.note_socket(false, daemon.connection.generation(), now.mono);
                 daemon.fail_reconnect("link did not return", now);
@@ -3284,6 +3274,50 @@ mod tests {
     }
 
     #[test]
+    fn an_apple_reconnect_ends_the_playback_claim_and_airs_no_fleet_intent() {
+        use crate::step::Input;
+
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.note_bluez(true);
+        daemon.claim_playback(now);
+        assert!(matches!(daemon.session.claim, PlaybackClaim::Active));
+
+        let started = daemon.step(Input::Command(Command::ReconnectPeer), now);
+        assert_eq!(started.reply.as_deref(), Some("accepted\n"));
+        // Giving the pods to an Apple device is a release. A claim left active
+        // would ask the next fleet owner to step back for a play that never comes
+        // (xps/gram, 2026-11-12).
+        assert!(matches!(daemon.session.claim, PlaybackClaim::Idle));
+        daemon.accessory.note_ownership(false, now.mono);
+        assert!(!daemon.roster_intent(now), "a released laptop airs no playback intent");
+    }
+
+    #[test]
+    fn interrupted_apple_reconnect_clears_the_reported_attempt() {
+        use crate::step::Input;
+
+        for interruption in [Input::BluezLost, Input::Suspend, Input::AdapterPower(false)] {
+            let mut daemon = Daemon::new("gram");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.note_bluez(true);
+            let started = daemon.step(Input::Command(Command::ReconnectPeer), now);
+            assert_eq!(started.reply.as_deref(), Some("accepted\n"));
+            assert_eq!(daemon.status_value(now)["native_handoff"]["connecting"], true);
+
+            daemon.step(interruption, now);
+            assert!(!daemon.connection.apple_reconnect());
+            let status = daemon.status_value(now);
+            assert_eq!(status["native_handoff"]["connecting"], false);
+            assert_eq!(status["control_connection"]["peer_reconnect"], false);
+            assert_eq!(status["native_handoff"]["yielded"], true);
+            assert!(!daemon.output.wants_output());
+        }
+    }
+
+    #[test]
     fn release_pauses_the_player_and_a_reconnect_writes_the_request() {
         use crate::audio::play::PlayerSeen;
         use crate::fleet::members::{GroupKey, Member, Proposal};
@@ -3338,7 +3372,7 @@ mod tests {
         assert_eq!(started.reply.as_deref(), Some("accepted\n"));
         assert_eq!(daemon.routing().intent(), intent);
         assert!(started.effects.iter().all(|effect| !matches!(effect, Effect::Disconnect { .. })));
-        assert_eq!(daemon.status_value(now)["native_handoff"]["phase"], "reconnecting");
+        assert_eq!(daemon.status_value(now)["control_connection"]["peer_reconnect"], true);
         let waiting = daemon.step(Input::Tick, Clock::new(now.mono.0 + 2_999, now.unix.0));
         assert!(waiting.effects.iter().all(|effect| !matches!(effect, Effect::Disconnect { .. })));
         daemon.step(
@@ -3380,7 +3414,10 @@ mod tests {
             .iter()
             .all(|effect| !matches!(effect, Effect::RemoveDevice { .. })));
         assert_eq!(daemon.status_value(disconnected_at)["bluetooth_paired"], true);
-        assert_eq!(daemon.status_value(disconnected_at)["native_handoff"]["phase"], "reconnecting");
+        assert_eq!(
+            daemon.status_value(disconnected_at)["control_connection"]["peer_reconnect"],
+            true
+        );
         // The pods sit free for the rejoin delay first (giving a nearby
         // Apple device its chance to connect), then this laptop rejoins.
         let soon = daemon.step(Input::Tick, Clock::new(now.mono.0 + 9_200, now.unix.0));

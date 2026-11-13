@@ -1,4 +1,5 @@
 import QtQuick
+import "Motion.js" as Motion
 import QtQuick.Shapes
 import QtQuick.Controls
 import qs.Commons
@@ -68,7 +69,7 @@ Item {
     return { variant: podsVariant, worn: headsetWorn, caseState: caseState, pairing: pairingMode }
   }
   function canAnimateAccessories() {
-    return root.visible && root.animatePlacement && Style.duration(1) > 0
+    return root.visible && root.animatePlacement && Motion.duration(Style, 1) > 0
   }
   function startAccessoryPhase(phase) {
     accessoryMotion.stop()
@@ -143,7 +144,7 @@ Item {
     target: root
     property: "accessoryProgress"
     from: 0; to: 1
-    duration: Style.duration(root.accessoryPhase === "receding" ? 200 : 280)
+    duration: Motion.duration(Style, root.accessoryPhase === "receding" ? 200 : 280)
     easing.type: Easing.OutCubic
     onFinished: {
       if (root.accessoryPhase === "receding") root.applyAccessorySelection(root.canAnimateAccessories())
@@ -417,14 +418,14 @@ Item {
     opacity: (root.accessoryPhase === "receding" ? displayedAccessory !== null : !!root.nearbyAccessory) ? 0.65 : 0
     visible: displayedAccessory !== null && opacity > 0 && width > 0
     Behavior on opacity {
-      NumberAnimation { duration: Style.duration(180); easing.type: Easing.OutCubic }
+      NumberAnimation { duration: Motion.duration(Style, 180); easing.type: Easing.OutCubic }
     }
     NumberAnimation {
       id: slideIn
       target: secondaryAccessory
       property: "entrance"
       from: 0; to: 1
-      duration: Style.duration(260)
+      duration: Motion.duration(Style, 260)
       easing.type: Easing.OutCubic
     }
     MeshArtwork {
@@ -449,7 +450,7 @@ Item {
       foregroundColor: root.foreground
       backgroundColor: root.screenFill
       rest: secondaryAccessory.displayedAccessory && secondaryAccessory.displayedAccessory.headsetWorn === true ? 0 : 1
-      poseDuration: Style.duration(240)
+      poseDuration: Motion.duration(Style, 240)
     }
     Text {
       objectName: "nearbyAccessoryLabel"

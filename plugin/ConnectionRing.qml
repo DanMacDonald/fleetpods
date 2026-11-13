@@ -9,6 +9,7 @@ Item {
   property real sweep: 0.15
   property real doneSweep: 0.15
   property real doneOpacity: 0
+  onRingColorChanged: { spinRing.requestPaint(); doneRing.requestPaint() }
 
   function paintRing(ctx, item, arc, bright) {
     ctx.reset()

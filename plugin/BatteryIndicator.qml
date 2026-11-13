@@ -14,6 +14,7 @@ Item {
   property string fontFamily: ""
   property string unknownCaption: ""
   property real ringSize: 28
+  property bool captionInside: false
   readonly property int lowBatteryPercent: 10
   readonly property bool known: level >= 0
   readonly property color fillColor: known && level < lowBatteryPercent ? lowColor : healthyColor
@@ -26,7 +27,7 @@ Item {
   readonly property string caption: !known && unknownCaption ? unknownCaption
     : (label ? label + " " : "") + (known ? level + "%" : "--")
   implicitWidth: Math.max(ringSize, captionText.implicitWidth)
-  implicitHeight: ringSize + 6 + captionText.implicitHeight
+  implicitHeight: captionInside ? ringSize : ringSize + 6 + captionText.implicitHeight
   Accessible.role: Accessible.Indicator
   Accessible.name: label + " battery"
   Accessible.description: known ? level + "% remaining" : unknownCaption || "Battery level unavailable"
@@ -75,12 +76,12 @@ Item {
   Text {
     id: captionText
     anchors.top: parent.top
-    anchors.topMargin: root.ringSize + 6
+    anchors.topMargin: root.captionInside ? (root.ringSize - implicitHeight) / 2 : root.ringSize + 6
     anchors.horizontalCenter: parent.horizontalCenter
     text: root.caption
     textFormat: Text.PlainText
     color: root.foreground
     font.family: root.fontFamily
-    font.pixelSize: 10
+    font.pixelSize: root.captionInside ? 11 : 10
   }
 }

@@ -68,7 +68,6 @@ pub const USER_WINDOW_MS: u64 = 30_000;
 pub struct Seat {
     held: bool,
     yielded: bool,
-    phase: &'static str,
     failure: &'static str,
     updated: Option<UnixMs>,
     ownership_at_claim: Option<MonoMs>,
@@ -80,7 +79,6 @@ impl Seat {
         Self {
             held: false,
             yielded: false,
-            phase: "idle",
             failure: "",
             updated: None,
             ownership_at_claim: None,
@@ -96,10 +94,6 @@ impl Seat {
         self.yielded
     }
 
-    pub fn phase(&self) -> &'static str {
-        self.phase
-    }
-
     pub fn failure(&self) -> &'static str {
         self.failure
     }
@@ -111,7 +105,6 @@ impl Seat {
     pub fn claim(&mut self, now: Clock) -> Intent {
         self.held = true;
         self.yielded = false;
-        self.phase = "idle";
         self.failure = "";
         self.updated = Some(now.unix);
         Intent::Claim
@@ -137,7 +130,6 @@ impl Seat {
     pub fn step_back(&mut self, now: Clock) -> Intent {
         self.held = false;
         self.yielded = true;
-        self.phase = "idle";
         self.failure = "";
         self.updated = Some(now.unix);
         self.user_claimed_at = None;
@@ -145,7 +137,6 @@ impl Seat {
     }
 
     pub fn note_failure(&mut self, reason: &'static str, now: Clock) {
-        self.phase = "failed";
         self.failure = reason;
         self.updated = Some(now.unix);
     }
@@ -157,20 +148,7 @@ impl Seat {
         }
     }
 
-    /// The seat is left so an Apple device can take the slot. The
-    /// reconnect state machine itself stays with the caller.
-    pub fn begin_reconnect(&mut self, now: Clock) -> Intent {
-        self.held = false;
-        self.yielded = true;
-        self.phase = "reconnecting";
-        self.failure = "";
-        self.updated = Some(now.unix);
-        self.user_claimed_at = None;
-        Intent::Release
-    }
-
     pub fn note_reconnected(&mut self, now: Clock) {
-        self.phase = "idle";
         self.updated = Some(now.unix);
     }
 

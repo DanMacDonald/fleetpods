@@ -35,6 +35,8 @@ var GLYPH_CHECK = "\uDB80\uDD2C"
 var CONTROL_OPENING_STAGES = ["connecting", "handshake", "features", "notifications", "retrying"]
 // fleet.routing.phase while this laptop's own request is in flight; the other busy phases admit another laptop's.
 var ROUTE_REQUESTING_PHASES = ["waiting_admission", "connecting", "waiting_completion"]
+// connection_lifecycle.state between asking for the pods and hearing audio.
+var LIFECYCLE_ACQUIRING_STATES = ["linking", "preparing_paths", "completing_profiles", "routing", "retrying"]
 // fleet.routing.phase once the helper has admitted this laptop's request.
 var ROUTE_ADMITTED_PHASES = ["connecting", "waiting_completion", "success"]
 // fleet_outcome.result values that end a route without a seat change.
@@ -59,6 +61,7 @@ function defaultStatus() {
     earReported: false,
     nativeHandoff: null,
     controlConnection: null,
+    connectionLifecycle: null,
     reportedOwnership: -1,
     audioSourceLocal: -1,
     audioSourceType: -1,
@@ -232,6 +235,17 @@ function backgroundJoin(status) {
   return controlOpening(control)
 }
 
+// This laptop is working toward audible playback: the complement of a
+// background join. A fleet request counts once it carries a playback claim,
+// including one queued until admission completes.
+function acquiringPlayback(status) {
+  var claiming = status.ownershipIntent === "claim"
+  if (routeRequesting(status.fleet && status.fleet.routing) && (claiming || status.wantOmarchySeat === true)) return true
+  if (!claiming) return false
+  return LIFECYCLE_ACQUIRING_STATES.indexOf((status.connectionLifecycle || {}).state) >= 0
+    || (status.nativeHandoff || {}).connecting === true
+}
+
 // A blank between two copies of a caption is not a new log line.
 function statusCaptionChanged(lastLogged, next) {
   var message = String(next || "").trim()
@@ -371,6 +385,7 @@ function parseStatus(raw) {
   // Older daemons omit the validity flag, so their pod values remain usable.
   status.earReported = parsed.ear_reported !== false
   status.controlConnection = parsed.control_connection || null
+  status.connectionLifecycle = parsed.connection_lifecycle || null
   status.reportedOwnership = [0, 1].indexOf(parsed.reported_ownership) >= 0 ? parsed.reported_ownership : -1
   status.audioSourceLocal = [0, 1].indexOf(parsed.audio_source_local) >= 0 ? parsed.audio_source_local : -1
   status.audioSourceType = [0, 1, 2].indexOf(parsed.audio_source_type) >= 0 ? parsed.audio_source_type : -1
@@ -882,31 +897,6 @@ function connectionLog(connection, refreshing, caption, phase, accessory) {
     connection: statusText(connectionEvent), connectionEvent: connectionEvent,
     status: statusText(statusEvent), statusEvent: statusEvent,
     phase: progress ? "" : phase
-  }
-}
-
-function handoffPhaseLabel(phase) {
-  switch (phase) {
-    case "scan": return "Connecting Bluetooth"
-    case "rapport": return "Asking Apple to hand off"
-    case "profile_connect": return "Connecting the audio profile"
-    case "control": return "Opening the control link"
-    case "control_audio": return "Waiting for the AirPods output"
-    case "priority_prepare": return "Setting connection priority"
-    case "priority_verify": return "Confirming connection priority"
-    case "ownership": return "Claiming the Omarchy seat"
-    case "seat_audio": return "Arming the AirPods output"
-    case "await_audio": return "Waiting for playback"
-    case "routing":
-    case "audio": return "Routing audio to the buds"
-    case "recovery_speakers": return "Moving audio to the speakers"
-    case "recovery_suspend": return "Pausing the AirPods output"
-    case "recovery_resume": return "Resuming the AirPods output"
-    case "recovery_route": return "Routing audio again"
-    case "rebuild_route": return "Rebuilding the audio route"
-    case "recovered_audio": return "Checking playback"
-    case "reconnect_audio": return "Reconnecting audio"
-    default: return ""
   }
 }
 
@@ -1628,7 +1618,7 @@ function statusLogDaemonState() {
   return {
     status: defaultStatus(), fleet: { phase: "idle" }, presentation: { refreshing: false, snapshot: null }, presentationUntil: 0,
     audioRoute: {}, joined: null, joinSuccess: null, joinedUntil: 0, pendingIntent: null, pendingUntil: 0, ownershipIntent: "none",
-    wantOmarchySeat: false, nativeHandoff: false, connecting: false, attempting: false, handoffPhase: "",
+    wantOmarchySeat: false, nativeHandoff: false, connecting: false,
     connectionUpdatedMs: 0, connected: false, seatHold: false, seatHoldUntil: 0, lastInEarMs: -1,
     iconLidState: LID_UNKNOWN, localSeatHeld: false, connectionFailed: false, caseRecoveryQuiet: false, audioRecoveryPending: false,
     busyPeer: "", waitingForPeer: null, routeEnded: null, seatHandoff: false,
@@ -1656,7 +1646,7 @@ function statusLog(previous, event) {
   }
   if (s.presentation.audio && now >= s.presentation.audio.seenMs + AUDIO_CARRY_MS)
     s.presentation = Object.assign({}, s.presentation, { audio: null })
-  if ((s.connecting || s.attempting) && now - s.connectionUpdatedMs >= 60000) s.connecting = s.attempting = false
+  if (s.connecting && now - s.connectionUpdatedMs >= 60000) s.connecting = false
 
   if (event.ev === "status") statusLogApply(s, event.status, now)
   else if (event.ev === "gone") {
@@ -1754,7 +1744,7 @@ function statusLogApply(s, status, now) {
   var advertisementMs = Number(status.lastAdvertisementMs || 0)
   if (status.left.inEar || status.right.inEar) s.lastInEarMs = advertisementMs
   s.iconLidState = status.lidUpdatedMs <= s.lastInEarMs ? LID_UNKNOWN : status.caseLidState
-  if (s.nativeHandoff && !status.nativeHandoff) { s.connecting = s.attempting = false; s.handoffPhase = ""; s.connectionUpdatedMs = 0 }
+  if (s.nativeHandoff && !status.nativeHandoff) { s.connecting = false; s.connectionUpdatedMs = 0 }
   s.nativeHandoff = !!status.nativeHandoff
   if (s.nativeHandoff) s.connectionUpdatedMs = Number(status.nativeHandoff.updated_ms || 0)
   if (status.connected !== s.connected) {
@@ -1763,11 +1753,7 @@ function statusLogApply(s, status, now) {
   }
   s.connected = status.connected
   s.wantOmarchySeat = status.wantOmarchySeat === true
-  if (s.nativeHandoff) {
-    s.attempting = status.nativeHandoff.attempting === true
-    s.connecting = status.nativeHandoff.connecting === true
-    s.handoffPhase = status.nativeHandoff.phase || ""
-  }
+  if (s.nativeHandoff) s.connecting = status.nativeHandoff.connecting === true
   if (s.pendingIntent === null) s.ownershipIntent = status.ownershipIntent
   else if (status.ownershipIntent === s.pendingIntent) { s.ownershipIntent = status.ownershipIntent; s.pendingIntent = null; s.pendingUntil = 0 }
   else s.ownershipIntent = s.pendingIntent
@@ -1790,7 +1776,6 @@ function statusLogPods(s) {
     // The ring and the drawing line follow a fleet ask and a socket that is opening, not only a handoff.
     connecting: !transportPlaybackConfirmed(st) && (s.connecting
       || openingControlLink(s.connected === true, st.controlConnection, s.fleet && s.fleet.routing)),
-    connectionAttempting: s.attempting, handoffPhase: s.handoffPhase,
     // Completed and connected before connecting goes false, so the ring can fill and fade instead of hiding.
     connectionCompleted: !!native && native.completed === true,
     connected: s.connected, ownershipIntent: s.ownershipIntent, wantOmarchySeat: s.wantOmarchySeat,
@@ -2098,7 +2083,7 @@ function statusLogInputs(s, now) {
       && (caption.kind === "appleHasAudio" || caption.kind === "audioTaken" || caption.kind === "audioOn")) ? caption : null,
     audio: pods.daemonReachable ? pods.audioRoute.message || "" : "",
     audioEvent: pods.daemonReachable ? pods.audioRoute.event || null : null,
-    phase: pods.nativeHandoff || controlDescription !== "" ? "" : handoffPhaseLabel(pods.handoffPhase),
+    phase: "",
     error: s.action !== "" ? s.action
       : (pods.daemonReachable && control ? control.peer_reconnect_error || "" : "") || pods.localAudioFailure
         || (pods.daemonReachable ? pods.lastError : "")

@@ -85,6 +85,7 @@ pub(crate) struct PendingEffects {
     pub announce_dirty: bool,
 }
 
+mod reopen;
 mod session;
 
 pub struct Daemon {
@@ -123,15 +124,11 @@ pub struct Daemon {
     priority_generation: u64,
     /// The only seat record. Claim and step-back are its writers. Status reads it.
     pub(crate) seat: Seat,
-    /// Hold passive reconnects after yielding or losing a slot so the
-    /// incoming device can finish connecting without being displaced.
-    slot_hold_until: Option<MonoMs>,
+    /// Every reason this laptop is not reopening its link on its own.
+    hold: reopen::ReopenHold,
     /// Who owned the audio while this laptop shared the pods with a fleet
-    /// laptop, and whether this laptop is holding its automatic reconnect
-    /// so that owner can come back first.
+    /// laptop; that owner reconnects first after the pair drops.
     pair_audio_owner: Option<Address>,
-    reopen_wait: bool,
-    reopen_hold_until: Option<MonoMs>,
     pub(crate) lifecycle: crate::pods::lifecycle::Lifecycle,
     pub(crate) staged_controls: Vec<Vec<u8>>,
     pub(crate) peers_seated: Vec<Address>,
@@ -182,9 +179,6 @@ pub struct Daemon {
     /// to trust the peer over a working local connection.
     roster_probe: Option<(Generation, MonoMs)>,
     roster_probe_after: Option<MonoMs>,
-    /// An Apple device took the slot this laptop had been sitting in.
-    /// A failed route, a closed case, and an idle link do not set this.
-    displaced: bool,
     case_opened_at: Option<MonoMs>,
     apple_labels: std::collections::HashMap<Address, String>,
     apple_labels_dirty: bool,
@@ -339,10 +333,8 @@ impl Daemon {
             priority_until: None,
             priority_generation: 0,
             seat: Seat::new(),
-            slot_hold_until: None,
+            hold: reopen::ReopenHold::default(),
             pair_audio_owner: None,
-            reopen_wait: false,
-            reopen_hold_until: None,
             lifecycle: crate::pods::lifecycle::Lifecycle::default(),
             staged_controls: Vec::new(),
             peers_seated: Vec::new(),
@@ -379,7 +371,6 @@ impl Daemon {
             acl_up_at: None,
             roster_probe: None,
             roster_probe_after: None,
-            displaced: false,
             case_opened_at: None,
             apple_labels: std::collections::HashMap::new(),
             apple_labels_dirty: false,
@@ -457,9 +448,7 @@ impl Daemon {
         // The switch gesture supersedes holds earned against the previous
         // pair and slot: the newly selected pair may pre-connect right
         // away instead of waiting out the old pair's holds.
-        self.slot_hold_until = None;
-        self.reopen_wait = false;
-        self.reopen_hold_until = None;
+        self.hold.clear();
         self.select_accessory(Some(address));
     }
 
@@ -756,14 +745,14 @@ impl Daemon {
     /// The pods ended the link while this laptop and one Apple device were the pair.
     /// A fleet laptop in that pair is a handoff, not a playback wait.
     fn consider_apple_displacement(&mut self) {
-        if self.displaced || self.seat.held() || self.routing.phase().busy() {
+        if self.hold.displaced || self.seat.held() || self.routing.phase().busy() {
             return;
         }
         let Some(other) = self.pod_pair_other() else {
             return;
         };
         if !self.membership.contains(other) {
-            self.displaced = true;
+            self.hold.displaced = true;
         }
     }
 
@@ -776,37 +765,8 @@ impl Daemon {
             return;
         };
         if self.membership.contains(other) && self.pair_audio_owner == Some(other) {
-            self.reopen_wait = true;
-            self.reopen_hold_until = None;
+            self.hold.wait_for_owner();
         }
-    }
-
-    /// Whether the automatic reconnect is currently held for the pair's
-    /// audio owner. The grace window starts at the first held attempt;
-    /// after it, this laptop may attach anyway (the owner may be gone).
-    fn reopen_blocked(&mut self, now: MonoMs) -> bool {
-        if !self.reopen_wait {
-            return false;
-        }
-        let until =
-            *self.reopen_hold_until.get_or_insert_with(|| now.saturating_add(REOPEN_HOLD_MS));
-        if now.0 < until.0 {
-            true
-        } else {
-            self.reopen_wait = false;
-            self.reopen_hold_until = None;
-            false
-        }
-    }
-
-    /// Passive ACL attachment and desktop activity share the same slot hold.
-    /// An explicit Connect or a new Play request can still reconnect immediately.
-    fn background_reopen_blocked(&mut self, now: MonoMs) -> bool {
-        if self.slot_hold_until.is_some_and(|until| now.0 < until.0) {
-            return true;
-        }
-        self.slot_hold_until = None;
-        self.reopen_blocked(now)
     }
 
     /// Start the wake grace when the controller can be used again.
@@ -2510,12 +2470,12 @@ impl Daemon {
         }
         self.accessory.note_lid(state, now);
         self.enforce_connection_admission(now);
-        if !open && self.displaced {
+        if !open && self.hold.displaced {
             let worn = |pod: &crate::types::Evidence<crate::pods::reports::Pod>| {
                 pod.known().is_some_and(|pod| pod.in_ear == Some(true))
             };
             if !worn(&self.accessory.left) && !worn(&self.accessory.right) {
-                self.displaced = false;
+                self.hold.displaced = false;
             }
         }
         // Availability is evaluated in reconnect_preferred after all evidence
@@ -3614,7 +3574,7 @@ impl Daemon {
         self.effects.follow_link = false;
         self.effects.drop_link = false;
         self.effects.control_out.clear();
-        self.displaced = false;
+        self.hold.displaced = false;
         self.held_peers.clear();
         self.held_reporter = None;
         self.accessory = self.nearby_pods.selected_report(now.mono).unwrap_or_default();
@@ -3803,7 +3763,6 @@ impl Daemon {
             microphone: &self.microphone,
             mic_path: &self.mic_path,
             handoff_yielded: self.seat.yielded(),
-            handoff_phase: self.seat.phase(),
             handoff_failure: self.seat.failure(),
             handoff_updated: self.seat.updated(),
             audio_seen: self.last_graph.is_some(),
@@ -3816,7 +3775,7 @@ impl Daemon {
             pod_peers: &self.pod_peers,
             pod_peers_known: self.pod_peers_known,
             pod_peers_at: self.pod_peers_at,
-            displaced: self.displaced,
+            displaced: self.hold.displaced,
             apple_labels: &self.apple_labels,
         }
     }
@@ -4411,16 +4370,18 @@ mod tests {
         daemon.step(Input::Proximity { address: rpa(), payload: captured_case(0x39) }, now);
         assert_eq!(daemon.config.accessory, Some(first));
         // A yielded slot and a pending owner-reconnect hold are in force.
-        daemon.slot_hold_until = Some(now.mono.saturating_add(60_000));
-        daemon.reopen_wait = true;
-        daemon.reopen_hold_until = Some(now.mono.saturating_add(60_000));
+        daemon.hold.slot_until = Some(now.mono.saturating_add(60_000));
+        daemon.hold.owner_first = true;
+        daemon.hold.owner_until = Some(now.mono.saturating_add(60_000));
+        daemon.hold.displaced = true;
         // Putting the tracked pair in is the switch gesture: the holds were
         // earned against the previous pair and must not delay this one.
         daemon.step(Input::Proximity { address: rpa_for(&second_irk), payload: worn_frame() }, now);
         assert_eq!(daemon.config.accessory, Some(second));
-        assert_eq!(daemon.slot_hold_until, None, "the switch supersedes the slot hold");
-        assert!(!daemon.reopen_wait, "the switch supersedes the reopen hold");
-        assert_eq!(daemon.reopen_hold_until, None);
+        assert_eq!(daemon.hold.slot_until, None, "the switch supersedes the slot hold");
+        assert!(!daemon.hold.owner_first, "the switch supersedes the reopen hold");
+        assert_eq!(daemon.hold.owner_until, None);
+        assert!(!daemon.hold.displaced, "the displacement belongs to the old accessory");
     }
 
     #[test]
@@ -5883,7 +5844,7 @@ mod tests {
         daemon.step(Input::ControlSocket { up: false, generation }, now);
         let generation = daemon.connection.generation();
         let until = now.mono.saturating_add(DISPLACEMENT_HOLD_MS);
-        assert_eq!(daemon.slot_hold_until, Some(until));
+        assert_eq!(daemon.hold.slot_until, Some(until));
         for delta in [0, 1_000, DISPLACEMENT_HOLD_MS - 1] {
             let at = Clock::new(now.mono.0 + delta, now.unix.0 + delta);
             // Duplicate close notifications must not keep pushing the hold out.
@@ -5897,7 +5858,7 @@ mod tests {
                 let outcome = daemon.step(input, at);
                 assert!(!outcome.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
             }
-            assert_eq!(daemon.slot_hold_until, Some(until));
+            assert_eq!(daemon.hold.slot_until, Some(until));
             assert_eq!(daemon.connection.generation(), generation);
             // (The rebuild-on-silence count is asserted inside the grant arm above.)
         }
@@ -5918,7 +5879,7 @@ mod tests {
             now,
         );
         assert_eq!(daemon.connection.stage(), Stage::Ready);
-        assert_eq!(daemon.slot_hold_until, None);
+        assert_eq!(daemon.hold.slot_until, None);
     }
 
     #[test]
@@ -6816,7 +6777,7 @@ mod tests {
                 });
             }
             daemon.step_back(now);
-            daemon.displaced = true;
+            daemon.hold.displaced = true;
             daemon.note_pod(
                 false,
                 Pod {
@@ -7815,6 +7776,56 @@ mod tests {
                 daemon.step(Input::Tick, at(3_100));
                 assert!(!daemon.output.wants_output(), "{owner}: reclaimed after a release");
             }
+        }
+    }
+
+    #[test]
+    fn a_displaced_max_does_not_reopen_on_repeated_wear_advertisements() {
+        use crate::step::{Effect, Input};
+        for resume in [Command::Activity, Command::Connect] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let local = addr(1);
+            let peer = addr(2);
+            let phone = addr(4);
+            daemon.set_local_address(Some(local));
+            daemon.restore_fleet(crate::fleet::members::Fleet {
+                id: FleetId::new([3; 16]),
+                key: GroupKey::new([0x11; 32]),
+                members: vec![
+                    Member { address: local, label: "xps".into() },
+                    Member { address: peer, label: "gram".into() },
+                ],
+            });
+            daemon.accessory.note_model(Model::AirPodsMax2);
+            ready_link(&mut daemon, now);
+            daemon.step(Input::Command(Command::HandoffRelease), now);
+            daemon.note_pod_peers(vec![local, phone], now.unix);
+            daemon.accessory.note_head_worn(true, now.mono);
+            daemon.activity_preference.note_local([3; 16], addr(3), local, now.unix);
+            // Radio election can be unavailable. Both laptops can remember
+            // themselves as preferred, but losing a ready slot is still real.
+            let generation = daemon.connection.generation();
+            daemon.step(Input::ControlSocket { up: false, generation }, now);
+            daemon.step(Input::Bluez(false), now);
+            assert!(daemon.hold.displaced);
+            for delta in [1_000, 5_000, 7_000, 15_000, 30_000, 60_000] {
+                let at = Clock::new(now.mono.0 + delta, now.unix.0 + delta);
+                daemon.accessory.note_head_worn(true, at.mono);
+                let tick = daemon.step(Input::Tick, at);
+                assert!(
+                    !tick.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })),
+                    "a repeated worn advertisement must not reclaim the slot at {delta} ms"
+                );
+            }
+            let at = Clock::new(now.mono.0 + 61_000, now.unix.0 + 61_000);
+            daemon.step(Input::Bluez(true), at);
+            let passive = daemon
+                .step(Input::AttachAvailable { generation: daemon.connection.generation() }, at);
+            assert!(!passive.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            let requested = daemon.step(Input::Command(resume), at);
+            assert!(requested.effects.iter().any(|e| matches!(e, Effect::OpenLink { .. })));
+            assert!(!daemon.hold.displaced, "fresh input or Connect can request a new slot");
         }
     }
 

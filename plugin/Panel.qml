@@ -310,6 +310,17 @@ Panel {
     onViewChanged: root.syncFleet()
   }
   readonly property bool podsConnecting: pods.view.connecting === true
+  // Prototype adapter: the host creation context exposes the real scene;
+  // the regular bar facade intentionally has no notification-card API.
+  // If that context changes, ConnectionNotification keeps a plain toast.
+  readonly property var notificationHost: typeof shell !== "undefined" ? shell : null
+  ConnectionNotification {
+    id: connectionNotification
+    shell: root.notificationHost || (root.bar ? root.bar.shell : null)
+    status: pods.statusLogState.status
+    reachable: pods.daemonReachable
+    enabled: !root.settings || root.settings.connectionNotifications !== false
+  }
   onPodsConnectingChanged: syncConnectionRing()
 
   Timer {
@@ -328,6 +339,8 @@ Panel {
     function noise(): string { pods.cycleNoiseMode(); return "ok" }
     function status(): string { return Model.noiseModeName(pods.noiseMode) }
     function connecting(): bool { return root.showConnecting }
+    function connectionToastPreview(): string { return connectionNotification.preview() }
+    function connectionToastState(): string { return connectionNotification.probe() }
     function iconState(): string {
       return JSON.stringify({ connected: pods.view.hasAirPods, audioHere: pods.view.audioHere,
         remoteOmarchyAudio: pods.view.remoteOmarchyAudio, omarchyOwnsAudio: seats.omarchyOwnsAudio,
