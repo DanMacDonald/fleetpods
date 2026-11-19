@@ -11002,6 +11002,34 @@ mod tests {
     }
 
     #[test]
+    fn an_admitted_request_ends_when_its_connection_fails_for_good() {
+        use crate::fleet::route::{Admit, Phase, Start};
+        use crate::step::{Effect, Input};
+        let now = clock();
+        let mut daemon = Daemon::new("requester");
+        daemon.select_accessory(Some(addr(9)));
+        daemon.step_back(now);
+        let Start::Sent { tx } = daemon.start_route(addr(2)) else { panic!("route") };
+        assert_eq!(daemon.routing.admit(tx, true, Some(addr(3))), Admit::Beside);
+        daemon.open_connection(now.mono);
+        // Every attempt finds the pods unreachable.
+        let mut at = now;
+        let mut opened = 0;
+        for _ in 0..200 {
+            if matches!(daemon.connection.stage(), Stage::Connecting) {
+                let generation = daemon.connection.generation();
+                daemon.note_setup_failed(generation, FailReason::Transport, at.mono);
+            }
+            at = Clock::new(at.mono.0 + 1_000, at.unix.0 + 1_000);
+            let step = daemon.step(Input::Tick, at);
+            opened += step.effects.iter().filter(|e| matches!(e, Effect::OpenLink { .. })).count();
+        }
+        assert_eq!(daemon.connection.stage(), Stage::Failed);
+        assert_eq!(daemon.routing.phase(), Phase::Failed);
+        assert!(opened <= 5, "the retry budget is spent once, not every round: {opened}");
+    }
+
+    #[test]
     fn a_play_during_fleet_admission_waits_muted_and_claims_once_the_link_is_ready() {
         use crate::audio::play::PlayerSeen;
         use crate::audio::route::{Graph, LiveStream, Sink};

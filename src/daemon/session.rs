@@ -298,6 +298,14 @@ impl Daemon {
         // request. This applies equally to a callback failure and a timeout.
         if self.connection.stage() == Stage::Failed {
             self.session.background_requested = false;
+            // An admitted route cannot time out, and while it is connecting
+            // it is itself the intent that reopens a failed link. It ends
+            // with the link it was admitted for; unreachable pods must not
+            // be dialled forever.
+            if matches!(self.routing.phase(), Phase::Connecting | Phase::WaitingCompletion) {
+                eprintln!("fleetpodsd: admitted AirPods request ended: the connection failed");
+                self.routing.restart();
+            }
         }
         self.advance_rejoin(now);
         self.reconnect_preferred(now);
