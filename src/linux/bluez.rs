@@ -261,6 +261,11 @@ pub enum Notice {
         device: Option<Address>,
         active: bool,
     },
+    /// A device's A2DP transport changed its absolute volume (0..=127).
+    Volume {
+        device: Option<Address>,
+        level: u8,
+    },
     Upsert {
         device: Device,
         fleet: Option<Vec<u8>>,
@@ -396,6 +401,12 @@ fn properties(message: &Message) -> Option<Notice> {
     let (interface, changed, _invalid): (String, Props, Vec<String>) = message.read3().ok()?;
     if interface == "org.bluez.MediaTransport1" {
         trace_transport(&path, &changed, "event");
+        if let Some(level) = changed.get("Volume").and_then(|value| value.0.as_u64()) {
+            return Some(Notice::Volume {
+                device: transport_device(&path),
+                level: level.min(127) as u8,
+            });
+        }
         return transport_notice(&path, &changed);
     }
     if interface == "org.bluez.Adapter1" {
@@ -566,11 +577,13 @@ type Objects = HashMap<dbus::Path<'static>, Interfaces>;
 
 fn transport_notice(path: &str, props: &Props) -> Option<Notice> {
     let state = prop_string(props, "State")?;
-    let device = path
-        .split('/')
+    Some(Notice::Transport { device: transport_device(path), active: state == "active" })
+}
+
+fn transport_device(path: &str) -> Option<Address> {
+    path.split('/')
         .find(|part| part.starts_with("dev_"))
-        .and_then(|part| Address::parse(&part["dev_".len()..].replace('_', ":")));
-    Some(Notice::Transport { device, active: state == "active" })
+        .and_then(|part| Address::parse(&part["dev_".len()..].replace('_', ":")))
 }
 
 fn transports_from(objects: &Objects) -> HashMap<Address, bool> {

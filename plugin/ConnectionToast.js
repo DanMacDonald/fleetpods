@@ -11,11 +11,14 @@ var machine = initial()
 // request; demo is the run it started. Both end together, in endPreview.
 var previewAt = 0
 var demo = 0
+var volume = volumeInitial()
+var volumeDemo = 0
 function acquire(token) { if (!owner) owner = token; return owner === token }
 function release(token) { if (owner === token) { machine.visible = false; previewAt = demo = 0; owner = "" } }
 function token() { return "fleetpods-toast-" + (++serial) }
 function preview(now) { previewAt = now }
-function reset() { machine = initial() }
+function previewVolume(now) { volumeDemo = now }
+function reset() { machine = initial(); volume = volumeInitial(); volumeDemo = 0 }
 function endPreview() { previewAt = demo = 0; machine = initial() }
 function previewInput(age) {
   return { key: "preview", target: "preview", busy: age < 5000,
@@ -30,7 +33,33 @@ function advance(input, now, observed, duration, enabled) {
   // Return to live status as soon as the preview's card closes, so real
   // takeovers immediately become eligible again.
   if (demo && (!machine.visible || now - demo >= PREVIEW_MS)) endPreview()
-  return result
+  if (volumeDemo && now - volumeDemo >= 3000) volumeDemo = 0
+  if (volumeDemo) input = Object.assign({}, input, { volumeAt: now,
+    volume: Math.round(50 + 35 * Math.sin((now - volumeDemo) / 450)) })
+  volume = volumeStep(volume, input, now, observed, enabled)
+  // A connection in progress keeps the card; volume shows once it has left.
+  return result.visible || !volume.visible ? result : volumePresentation(volume, volumeDemo !== 0)
+}
+
+// A volume change made on the pods themselves shows the card for a moment.
+// The daemon timestamps those changes; dismissing quiets that one adjustment.
+var VOLUME_MS = 2000
+function volumeInitial() { return { started: 0, at: 0, dismissed: 0, visible: false, input: {} } }
+function volumeStep(previous, input, now, observed, enabled) {
+  observed = observed || {}
+  var s = Object.assign({}, previous, { input: input })
+  if (s.visible && observed.episode === -s.started && (observed.dismissed || observed.failed)) s.dismissed = s.at
+  s.at = input.volumeAt || 0
+  s.visible = enabled !== false && input.volume >= 0 && s.at > 0 && s.at !== s.dismissed
+    && Math.abs(now - s.at) < VOLUME_MS
+  if (s.visible && !previous.visible) s.started = now
+  return s
+}
+function volumePresentation(s, preview) {
+  var name = s.input.name || "AirPods", battery = s.input.battery
+  return { episode: -s.started, visible: true, phase: "volume", name: name, variant: s.input.variant || "max",
+    battery: battery, volume: s.input.volume, artworkProgress: 1, animating: preview, preview: preview,
+    text: { summary: name + " volume", body: s.input.volume + "%", detail: "" } }
 }
 
 var LEAD = 500, HOLD = 1000
@@ -70,7 +99,9 @@ function project(status, reachable, now) {
   // Playback intent survives a fast routing phase and remains set while paused.
   // null means no reliable baseline yet, so shell startup stays quiet.
   var target = reachable && state ? (busy || (s.ownershipIntent === "claim" && success) ? key : "") : null
+  var volume = s.volume || {}
   return { key: key, target: target, busy: busy, phase: phase, name: label(s.modelName || s.deviceName),
+    volume: typeof volume.percent === "number" ? volume.percent : -1, volumeAt: volume.adjustedMs || 0,
     variant: s.isHeadset ? "max" : "pro", battery: fresh && levels.length ? Math.min.apply(Math, levels) : -1 }
 }
 // Native attachment/dismissal are observations, not another presentation clock.

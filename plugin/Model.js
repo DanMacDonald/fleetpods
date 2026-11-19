@@ -68,6 +68,7 @@ function defaultStatus() {
     audioOwner: { holder: "", playing: false },
     remotePlaying: false,
     audioTransportActive: false,
+    volume: { percent: -1, adjustedMs: 0 },
     ownershipIntent: "none",
     remotePeerCount: -1,
     handoffResult: "none",
@@ -392,6 +393,8 @@ function parseStatus(raw) {
   var owner = parsed.audio_owner || {}
   status.audioOwner = { holder: ["local", "remote"].indexOf(owner.holder) >= 0 ? owner.holder : "", playing: owner.playing === true }
   status.audioTransportActive = parsed.audio_transport_active === true
+  var volume = parsed.pods_volume || {}
+  status.volume = { percent: intOr(volume.percent, -1), adjustedMs: Number(volume.adjusted_ms) || 0 }
   status.remotePlaying = parsed.remote_playing === true
   status.nativeHandoff = parsed.native_handoff && parsed.native_handoff.enabled === true ? parsed.native_handoff : null
   status.ownershipIntent = String(parsed.ownership_intent || "none")

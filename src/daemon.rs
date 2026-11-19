@@ -88,6 +88,14 @@ pub(crate) struct PendingEffects {
 mod reopen;
 mod session;
 
+/// The accessory's absolute volume (0..=127) and when it was last changed on
+/// the accessory itself rather than through this laptop's output.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PodsVolume {
+    pub(crate) level: u8,
+    pub(crate) adjusted: Option<crate::types::UnixMs>,
+}
+
 pub struct Daemon {
     session: session::Session,
     pub(crate) local_name: String,
@@ -137,6 +145,7 @@ pub struct Daemon {
     pub(crate) output_health: crate::audio::health::Health,
     /// Whether the accessory's A2DP transport is streaming.
     pub(crate) transport_active: bool,
+    pub(crate) pods_volume: Option<PodsVolume>,
     /// When each pod (left, right) last advertised while sending the frame.
     pub(crate) advertised_self_at: [Option<MonoMs>; 2],
     pub(crate) radio_inbox: crate::fleet::radio::Inbox,
@@ -342,6 +351,7 @@ impl Daemon {
             last_graph: None,
             output_health: crate::audio::health::Health::default(),
             transport_active: false,
+            pods_volume: None,
             advertised_self_at: [None, None],
             radio_inbox: crate::fleet::radio::Inbox::new(),
             outbound: crate::fleet::radio::Schedule::new(),
@@ -542,6 +552,15 @@ impl Daemon {
             .unwrap_or(Value::Null);
         value["connection_lifecycle"] = status::lifecycle(&self.lifecycle.progress());
         value["audio_transport_active"] = serde_json::json!(self.transport_active);
+        value["pods_volume"] = self
+            .pods_volume
+            .map(|volume| {
+                serde_json::json!({
+                    "percent": (u32::from(volume.level) * 100 + 63) / 127,
+                    "adjusted_ms": volume.adjusted.map_or(0, |at| at.0),
+                })
+            })
+            .unwrap_or(Value::Null);
         value["nearby_airpods"] = self.nearby_pods.status(now.mono);
         value["audio_output_health"] = self.output_health_status();
         value["pairing_candidates"] = serde_json::json!(if self.config.accessory.is_none() {
@@ -5686,6 +5705,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
+                        pinned: false,
                     }],
                 }),
                 now,
@@ -6650,6 +6670,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 0.4,
                     corked: false,
+                    pinned: false,
                 }],
                 cards: vec![],
             }),
@@ -7148,6 +7169,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
         };
         daemon.step(Input::Audio(graph.clone()), now);
@@ -7255,6 +7277,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             });
             effects.extend(daemon.step(Input::Audio(graph), now).effects);
             assert!(!daemon.output.wants_output());
@@ -7313,6 +7336,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 0.5,
                     corked: false,
+                    pinned: false,
                 }],
             };
             daemon.step(Input::Audio(graph.clone()), now);
@@ -7441,6 +7465,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
+                        pinned: false,
                     }],
                 }),
                 now,
@@ -7555,6 +7580,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked,
+                pinned: false,
             }],
         };
         for (headset, lifted) in
@@ -7738,6 +7764,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: owner == "silent speakers",
+                        pinned: false,
                     }],
                 }),
                 now,
@@ -8174,7 +8201,7 @@ mod tests {
             profile: Some("a2dp-sink".into()),
             state,
             muted: false,
-            audible_volume: true,
+            volume_percent: 100.0,
         };
         let released = |effects: &[Effect]| {
             effects.iter().any(|e| matches!(e, Effect::SuspendOutput { name } if name == "pods"))
@@ -8227,6 +8254,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 0.8,
                 corked: false,
+                pinned: false,
             }],
         };
         for reclaim in [false, true] {
@@ -8430,6 +8458,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
         };
         daemon.step(Input::Audio(graph.clone()), at(60));
@@ -8502,6 +8531,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 })
                 .collect(),
         };
@@ -8616,6 +8646,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             };
             if card_known {
@@ -8689,6 +8720,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
         };
         daemon.step(Input::Audio(graph.clone()), now);
@@ -8830,6 +8862,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
+                        pinned: false,
                     }],
                 };
                 // Two snapshots: the first lets the rebuilt output observe
@@ -9509,6 +9542,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 },
                 LiveStream {
                     id: 2,
@@ -9520,6 +9554,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 0.4,
                     corked: false,
+                    pinned: false,
                 },
             ],
         };
@@ -9623,6 +9658,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
                 cards: Vec::new(),
             }),
@@ -10997,6 +11033,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             }),
             now,
@@ -11080,6 +11117,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
         };
         daemon.step(Input::Audio(graph.clone()), now);
@@ -11208,6 +11246,7 @@ mod tests {
                             temporarily_muted: false,
                             volume: 1.0,
                             corked: false,
+                            pinned: false,
                         }],
                     }),
                 );
@@ -11948,6 +11987,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 0.6,
                 corked: false,
+                pinned: false,
             });
             let started = daemon.step(Input::Audio(graph), now);
             assert_eq!(daemon.output.wants_output(), expected);
@@ -12173,6 +12213,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 0.7,
                     corked: false,
+                    pinned: false,
                 }],
             };
             let held = a.step(Input::Audio(graph.clone()), now);
@@ -12571,6 +12612,38 @@ mod tests {
         assert_eq!(daemon.status_value(now)["audio_transport_active"], true);
         daemon.step(Input::Transport { active: false }, now);
         assert_eq!(daemon.status_value(now)["audio_transport_active"], false);
+    }
+    #[test]
+    fn only_a_volume_change_made_on_the_accessory_is_reported_as_adjusted() {
+        use crate::audio::health::Output;
+        use crate::step::Input;
+        let now = clock();
+        let mut daemon = Daemon::new("xps");
+        let volume = |daemon: &Daemon| daemon.status_value(now)["pods_volume"].clone();
+        let output = |percent: f64| {
+            Input::Outputs(vec![Output {
+                name: "bluez_output.pods".into(),
+                index: 1,
+                address: Some(addr(3)),
+                profile: Some("a2dp-sink".into()),
+                state: 0,
+                muted: false,
+                volume_percent: percent,
+            }])
+        };
+        assert!(volume(&daemon).is_null());
+        // The transport's opening report precedes its output.
+        daemon.step(Input::Volume { accessory: addr(3), level: 94 }, now);
+        assert_eq!(volume(&daemon), serde_json::json!({"percent": 74, "adjusted_ms": 0}));
+        // The laptop's slider moves the output first; the transport follows.
+        daemon.step(output(72.0), now);
+        daemon.step(Input::Volume { accessory: addr(3), level: 91 }, now);
+        assert_eq!(volume(&daemon), serde_json::json!({"percent": 72, "adjusted_ms": 0}));
+        // The crown moves the transport first.
+        daemon.step(Input::Volume { accessory: addr(3), level: 64 }, now);
+        assert_eq!(volume(&daemon), serde_json::json!({"percent": 50, "adjusted_ms": now.unix.0}));
+        daemon.step(Input::Bluez(false), now);
+        assert!(volume(&daemon).is_null());
     }
     #[test]
     fn a_busy_audio_profile_is_asked_again_until_the_window_closes() {

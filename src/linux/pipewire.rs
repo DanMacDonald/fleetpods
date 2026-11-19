@@ -261,6 +261,7 @@ struct RawStream {
     mute: bool,
     volume: f64,
     corked: bool,
+    pinned: bool,
 }
 
 struct RawSink {
@@ -453,6 +454,7 @@ impl Query {
                     temporarily_muted: false,
                     volume: stream.volume,
                     corked: stream.corked,
+                    pinned: stream.pinned,
                 })
             })
             .collect();
@@ -487,7 +489,7 @@ impl Query {
                     profile: sink.profile.clone(),
                     state: sink.state,
                     muted: sink.level.mute,
-                    audible_volume: sink.level.volume_percent.iter().any(|v| *v > 0.0),
+                    volume_percent: sink.level.volume_percent.iter().copied().fold(0.0, f64::max),
                 })
                 .collect(),
             cache,
@@ -1136,6 +1138,9 @@ fn raw_stream(info: &SinkInputInfo) -> RawStream {
         mute: info.mute,
         volume: VolumeLinear::from(info.volume.avg()).0,
         corked: info.corked,
+        pinned: ["node.dont-reconnect", "node.dont-move"]
+            .iter()
+            .any(|key| info.proplist.get_str(key).is_some_and(|value| value == "true")),
     }
 }
 

@@ -3,7 +3,7 @@ const source = Deno.readTextFileSync(new URL('../ConnectionToast.js', import.met
   .replace(/^\.(?:pragma|import)[^\n]*\n/gm, '')
 const modelSource = Deno.readTextFileSync(new URL('../Model.js', import.meta.url))
 const Model = new Function(modelSource + '; return {parseStatus,routeRequesting,acquiringPlayback}')()
-const T = new Function('Model', source + '; return {initial,step,project,presentation,text,label,acquire,release,advance,preview,LIMIT_MS}')(Model)
+const T = new Function('Model', source + '; return {initial,step,project,presentation,text,label,acquire,release,advance,preview,reset,LIMIT_MS}')(Model)
 function eq(actual, expected, message) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw Error(message + ': ' + JSON.stringify(actual))
 }
@@ -286,3 +286,26 @@ s = T.step(s, p(linking), 4000, {}, 1000, true)
 eq(s.visible, true, 'Enabling during an attempt in flight shows it again')
 eq(T.LIMIT_MS, 30000, 'The native expiry and the model share one limit')
 console.log('Preview and disabled-setting checks passed')
+
+// Volume adjusted on the pods: the daemon's timestamp opens the card briefly.
+T.reset()
+const quiet = {...playing, ownershipIntent: 'release', volume: {percent: 74, adjustedMs: 0}}
+const turned = (percent, at) => ({...quiet, volume: {percent, adjustedMs: at}})
+let v = T.advance(p(quiet, 50000), 50000, {}, 1000, true)
+eq(v.visible, false, 'A known volume alone stays quiet')
+v = T.advance(p(turned(50, 50100), 50100), 50100, {}, 1000, true)
+eq([v.visible, v.phase, v.volume, v.battery], [true, 'volume', 50, 93], 'An adjustment on the pods shows the volume')
+const volumeEpisode = v.episode
+v = T.advance(p(turned(42, 51500), 51500), 51500, {episode: volumeEpisode}, 1000, true)
+eq([v.visible, v.volume, v.episode === volumeEpisode], [true, 42, true], 'Further adjustment updates the same card')
+v = T.advance(p(turned(42, 51500), 53600), 53600, {episode: volumeEpisode}, 1000, true)
+eq(v.visible, false, 'The card leaves two seconds after the last change')
+v = T.advance(p(turned(40, 60000), 60000), 60000, {}, 1000, true)
+v = T.advance(p(turned(40, 60000), 60600), 60600, {episode: v.episode, dismissed: true}, 1000, true)
+eq(v.visible, false, 'Dismissal hides that adjustment')
+v = T.advance(p(turned(38, 61000), 61000), 61000, {}, 1000, true)
+eq(v.visible, true, 'The next adjustment shows again')
+eq(T.advance(p(turned(30, 70000), 70000), 70000, {}, 1000, false).visible, false, 'Disabled notifications stay quiet')
+T.reset()
+v = T.advance(p({...linking, volume: {percent: 30, adjustedMs: 80000}}, 80000), 80000, {}, 1000, true)
+eq(v.phase, 'connecting', 'A connection in progress keeps the card')

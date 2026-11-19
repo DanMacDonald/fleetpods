@@ -255,16 +255,18 @@ impl Accessory {
         })
     }
 
-    /// Placement gates playback even if Bluetooth stays connected. Max 2
-    /// must positively report a worn cup: an incomplete off-head report must
-    /// not let a browser seek take audio back from the speakers.
+    /// Placement gates playback even if Bluetooth stays connected: pods
+    /// that report being off the head or out of both ears, as when they lie
+    /// on a desk, never take it. Max 2 must positively report a worn cup: an
+    /// incomplete off-head report must not let a browser seek take audio
+    /// back from the speakers. Buds with no ear report stay available.
     pub fn playback_blocked(&self) -> bool {
         self.stowed()
             || self.both_docked()
             || if self.model == Model::AirPodsMax2 {
                 self.head_worn() != Some(true)
             } else {
-                self.model.is_headset() && self.head_worn() == Some(false)
+                self.wearing() == Some(false)
             }
     }
 
@@ -393,6 +395,22 @@ mod tests {
         accessory.note_control_head_wear(Some(false), None, MonoMs(1));
         assert_eq!(accessory.head_worn(), None, "unknown second cup is not full removal");
         assert!(accessory.playback_blocked(), "unknown wear cannot take speaker playback");
+    }
+
+    #[test]
+    fn buds_out_of_both_ears_cannot_take_playback() {
+        let mut accessory = Accessory::new();
+        accessory.set_identity("AirPods Pro", "A3064");
+        assert!(!accessory.playback_blocked(), "no ear report leaves the buds available");
+        for (left, right, blocked) in [
+            (Some(false), Some(false), true),
+            (Some(true), Some(false), false),
+            (Some(false), None, false),
+        ] {
+            accessory.note_placement(false, left, Some(false), MonoMs(0));
+            accessory.note_placement(true, right, Some(false), MonoMs(0));
+            assert_eq!(accessory.playback_blocked(), blocked, "left={left:?} right={right:?}");
+        }
     }
 
     #[test]

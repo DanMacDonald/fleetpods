@@ -1605,6 +1605,13 @@ fn on_notice(
                 let _ = reports.send(Input::Transport { active });
             }
         }
+        Notice::Volume { device, level } => {
+            if let Some(accessory) =
+                device.filter(|_| device == live.accessory || device == configured)
+            {
+                let _ = reports.send(Input::Volume { accessory, level });
+            }
+        }
         Notice::Patch(patch) => {
             observe_pairing(bus, live, patch.apple.as_deref());
             report_advertisement(
@@ -3914,6 +3921,7 @@ mod advertisement_tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             }));
             deliver(Input::Player {

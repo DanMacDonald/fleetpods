@@ -16,6 +16,7 @@ Item {
   readonly property int artworkDuration: Motion.duration(Style, 1000)
 
   function preview() { Toast.preview(Date.now()); return "Connection preview queued; audio is unchanged" }
+  function previewVolume() { Toast.previewVolume(Date.now()); tick(); return "Volume preview queued; volume is unchanged" }
   function probe() { return JSON.stringify(Toast.diagnostic) }
   function tick() {
     if (!ready || !Toast.acquire(publisher)) return

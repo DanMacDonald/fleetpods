@@ -1627,12 +1627,15 @@ impl Daemon {
                     && graph.sinks.iter().any(|sink| sink.name == previous.default_sink)
             });
         if changed_between_present_outputs {
+            // The router's own restore after a failed route is not a choice.
+            let own = self.output.own_default(&graph.default_sink);
             if self.session.manual_output && selected_pods {
                 eprintln!("fleetpodsd: AirPods selected as output; resuming playback claims");
                 self.claim_seat_user(now);
             } else if self.output.wants_output()
                 && self.audio.routed()
                 && !self.output.recovering()
+                && !own
                 && !selected_pods
                 && self.last_graph.as_ref().is_some_and(|previous| {
                     previous.sinks.iter().any(|sink| {
@@ -1693,6 +1696,16 @@ impl Daemon {
         if let Some(failure) = outcome.failure {
             self.output_recovery_failed(failure, now);
         }
+        let pods = self.config.accessory.and_then(|address| {
+            graph.sinks.iter().find(|sink| sink.address == Some(address)).map(|sink| &sink.name)
+        });
+        self.output.trace_unrouted(
+            outcome.routed,
+            &format!(
+                "grant_wait={waiting_for_grant} resume_on_grant={} default={:?} pods={pods:?}",
+                self.session.resume_output_on_grant, graph.default_sink
+            ),
+        );
         self.audio.set_routed(outcome.routed);
     }
 
@@ -2231,6 +2244,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
             cards: vec![],
         };
@@ -2283,6 +2297,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked,
+                    pinned: false,
                 }];
                 let result = daemon.step(Input::Audio(graph.clone()), at(1000 + i as u64 * 2000));
                 assert!(result.effects.iter().any(|effect| matches!(effect,
@@ -2370,6 +2385,28 @@ mod tests {
     }
 
     #[test]
+    fn the_routers_own_speaker_restore_is_not_a_manual_output_choice() {
+        let (mut daemon, mut graph) = manual_output_fixture();
+        let now = clock().mono;
+        // A route that gave up puts the speakers back as the default.
+        daemon.output.release();
+        daemon.output.return_to_speakers();
+        daemon.output.on_graph(Some(addr(3)), &graph, false, now);
+        // Playback is claimed again before that change is observed.
+        daemon.output.claim();
+        let on_pods = graph.clone();
+        graph.default_sink = "speakers".into();
+        daemon.observe_audio_graph(&graph, clock());
+        assert!(!daemon.session.manual_output);
+        assert!(daemon.output.wants_output());
+        // One change answers one request: the same switch made later in an
+        // output picker is still the user's choice.
+        daemon.last_graph = Some(on_pods);
+        daemon.observe_audio_graph(&graph, clock());
+        assert!(daemon.session.manual_output);
+    }
+
+    #[test]
     fn output_loss_initial_routing_and_recovery_are_not_manual_output_choices() {
         for scenario in ["missing", "acquiring", "recovering", "unknown default"] {
             let (mut daemon, mut graph) = manual_output_fixture();
@@ -2405,7 +2442,7 @@ mod tests {
             profile: Some("a2dp-sink".into()),
             state,
             muted: false,
-            audible_volume: true,
+            volume_percent: 100.0,
         }
     }
 
@@ -2541,6 +2578,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             }),
             now,
@@ -3609,6 +3647,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             };
             daemon.step(Input::Audio(graph.clone()), now);
@@ -3759,6 +3798,71 @@ mod tests {
     }
 
     #[test]
+    fn a_new_stream_routed_through_owned_pods_reaches_streaming() {
+        use crate::audio::health::Output;
+        use crate::audio::route::{Graph, LiveStream, Sink};
+        use crate::pods::observe::Observation;
+        use crate::step::Input;
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        daemon.set_local_address(Some(addr(2)));
+        ready_link(&mut daemon, now);
+        daemon.step(Input::Players(Vec::new()), now);
+        let mut graph = Graph {
+            default_sink: "speakers".into(),
+            sinks: vec![
+                Sink {
+                    name: "pods".into(),
+                    address: Some(addr(3)),
+                    profile: Some("a2dp-sink".into()),
+                },
+                Sink { name: "speakers".into(), address: None, profile: None },
+            ],
+            cards: Vec::new(),
+            streams: Vec::new(),
+        };
+        daemon.step(Input::Audio(graph.clone()), now);
+        daemon.step(Input::Observation(Observation::Ownership(true)), now);
+        graph.streams.push(LiveStream {
+            id: 1,
+            generation: 10,
+            sink: "speakers".into(),
+            role: String::new(),
+            node: "orbit360".into(),
+            mute: false,
+            temporarily_muted: false,
+            volume: 1.0,
+            corked: false,
+            pinned: false,
+        });
+        daemon.step(Input::Audio(graph.clone()), at(10));
+        graph.streams[0].temporarily_muted = true;
+        daemon.step(Input::Audio(graph.clone()), at(20));
+        graph.default_sink = "pods".into();
+        daemon.step(Input::Audio(graph.clone()), at(30));
+        graph.streams[0].sink = "pods".into();
+        daemon.step(Input::Audio(graph.clone()), at(40));
+        graph.streams[0].temporarily_muted = false;
+        daemon.step(Input::Audio(graph.clone()), at(50));
+        daemon.step(
+            Input::Outputs(vec![Output {
+                name: "pods".into(),
+                index: 1,
+                address: Some(addr(3)),
+                profile: Some("a2dp-sink".into()),
+                state: 0,
+                muted: false,
+                volume_percent: 50.0,
+            }]),
+            at(60),
+        );
+        daemon.step(Input::Transport { active: true }, at(70));
+        daemon.step(Input::Tick, at(1_000));
+        assert_eq!(daemon.status_value(at(1_000))["connection_lifecycle"]["state"], "streaming");
+    }
+
+    #[test]
     fn output_verification_retries_only_missing_playback_within_the_live_claim() {
         use crate::audio::route::{Graph, LiveStream, Sink};
         use crate::pods::observe::Observation;
@@ -3802,6 +3906,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             };
             let mut parked = playing.clone();
@@ -3962,6 +4067,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             };
             daemon.step(Input::Audio(graph.clone()), now);
@@ -4021,6 +4127,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             };
             let mut parked = playing.clone();
@@ -4156,6 +4263,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
         };
         daemon.step(Input::Audio(graph.clone()), now);
@@ -4472,6 +4580,7 @@ mod tests {
                     temporarily_muted: false,
                     volume: 1.0,
                     corked: false,
+                    pinned: false,
                 }],
             };
             if old_output {
@@ -4578,6 +4687,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
+                        pinned: false,
                     }],
                 }),
                 Clock::new(now.mono.0 + 60, now.unix.0 + 60),
@@ -4604,6 +4714,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
+                        pinned: false,
                     }],
                 }),
                 Clock::new(now.mono.0 + 2_700, now.unix.0 + 2_700),
@@ -4635,6 +4746,7 @@ mod tests {
                         temporarily_muted: false,
                         volume: 1.0,
                         corked: false,
+                        pinned: false,
                     }],
                 }),
                 now,

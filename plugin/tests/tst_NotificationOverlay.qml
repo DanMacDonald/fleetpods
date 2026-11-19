@@ -158,4 +158,25 @@ TestCase {
     card.destroy()
     tryCompare(test, "destroyedOverlays", destroyed + 1)
   }
+  function test_volumeCardShowsChargeOnTheArtworkRing() {
+    var card = createTemporaryObject(cardComponent, test)
+    var controller = createTemporaryObject(controllerComponent, test, {phase: "playing"})
+    var cover = createTemporaryObject(overlayComponent, card,
+      {source: controller, width: card.width, height: card.height})
+    var level = findChild(cover, "notificationVolume")
+    var fill = findChild(cover, "notificationVolumeFill")
+    verify(!level.visible, "a connection card shows no volume")
+    cover.presentation = {phase: "volume", artworkProgress: 1, variant: "max", name: "AirPods Max 2",
+      battery: 92, volume: 25, text: {detail: ""}}
+    verify(level.visible)
+    var charge = findChild(cover, "notificationBattery")
+    var ring = findChild(cover, "notificationRing")
+    verify(!charge.visible, "the volume bar takes the battery ring's place")
+    compare(ring.ringColor, charge.fillColor, "the artwork's ring turns the battery green")
+    fuzzyCompare(ring.doneSweep, Math.PI * 2 * 0.92, 0.001)
+    verify(!cover.motionState().running, "the ring rests while volume shows")
+    tryCompare(fill, "width", fill.parent.width * 0.25)
+    cover.presentation = Object.assign({}, cover.presentation, {volume: 100})
+    tryCompare(fill, "width", fill.parent.width)
+  }
 }

@@ -340,6 +340,7 @@ Panel {
     function status(): string { return Model.noiseModeName(pods.noiseMode) }
     function connecting(): bool { return root.showConnecting }
     function connectionToastPreview(): string { return connectionNotification.preview() }
+    function volumeToastPreview(): string { return connectionNotification.previewVolume() }
     function connectionToastState(): string { return connectionNotification.probe() }
     function iconState(): string {
       return JSON.stringify({ connected: pods.view.hasAirPods, audioHere: pods.view.audioHere,

@@ -31,6 +31,9 @@ pub struct LiveStream {
     pub temporarily_muted: bool,
     pub volume: f64,
     pub corked: bool,
+    /// The application bound this stream to one output and the server will
+    /// not move it (`node.dont-reconnect`, `node.dont-move`).
+    pub pinned: bool,
 }
 
 /// A BlueZ card the audio server reported, with the profile names it offered.
@@ -388,6 +391,9 @@ pub struct Router {
     restores: Vec<StreamSnap>,
     handoff: Option<Handoff>,
     handoff_quiet: Vec<StreamTarget>,
+    /// The default output this router last asked for and has not yet seen.
+    asked_sink: Option<String>,
+    traced: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -405,7 +411,41 @@ impl Router {
             restores: Vec::new(),
             handoff: None,
             handoff_quiet: Vec::new(),
+            asked_sink: None,
+            traced: String::new(),
         }
+    }
+
+    /// Say why a wanted route is not complete, once per distinct reason. A
+    /// route that stays incomplete while audio plays leaves no other record.
+    pub fn trace_unrouted(&mut self, routed: bool, context: &str) {
+        let text = if routed || !self.state.want {
+            String::new()
+        } else {
+            format!(
+                "{context} from={:?} held={} quieted={} takeover={} asked_default={} recovery={:?}",
+                self.state.from,
+                self.state.held.len(),
+                self.state.quieted.len(),
+                self.state.takeover_started.is_some(),
+                self.state.asked_default.is_some(),
+                self.state.recovery,
+            )
+        };
+        if text != self.traced {
+            if !text.is_empty() {
+                eprintln!("fleetpodsd: stream route incomplete: {text}");
+            }
+            self.traced = text;
+        }
+    }
+
+    /// The default output changed. True when this router asked for that
+    /// output, as when a timed-out route puts the speakers back: the change
+    /// is then its own, not a choice made in an output picker. One change
+    /// answers one request.
+    pub fn own_default(&mut self, sink: &str) -> bool {
+        self.asked_sink.take().is_some_and(|asked| asked == sink)
     }
 
     pub fn claim(&mut self) {
@@ -466,6 +506,7 @@ impl Router {
         self.restores.clear();
         self.handoff = None;
         self.handoff_quiet.clear();
+        self.asked_sink = None;
     }
 
     pub fn begin_recovery(
@@ -614,6 +655,7 @@ impl Router {
             work.push(Work::Start(start));
         }
         if let Some(name) = action.set_default {
+            self.asked_sink = Some(name.clone());
             work.push(Work::SetDefault(name));
         }
         if let Some(moves) = action.move_streams {
@@ -702,7 +744,7 @@ fn hold_for_takeover(
     let mut quiet = Vec::new();
     for stream in graph.streams.iter().filter(|stream| {
         managed(stream)
-            && !is_speaker_chain(stream)
+            && !fixed(stream)
             && follows_seat(&stream.sink, state.from.as_deref())
             && pods.is_none_or(|sink| stream.sink != sink.name)
     }) {
@@ -1019,7 +1061,7 @@ fn on_sink<'a>(graph: &'a Graph, sink: Option<&str>) -> Vec<&'a LiveStream> {
     graph
         .streams
         .iter()
-        .filter(|stream| stream.sink == sink && managed(stream) && !is_speaker_chain(stream))
+        .filter(|stream| stream.sink == sink && managed(stream) && !fixed(stream))
         .collect()
 }
 
@@ -1088,7 +1130,7 @@ fn find_held<'a>(graph: &'a Graph, saved: &StreamSnap) -> Option<&'a LiveStream>
 fn streams_to_move(state: &RouteState, graph: &Graph, accessory: &str) -> Vec<StreamTarget> {
     let mut moving = still_on(state, graph);
     for stream in &graph.streams {
-        if !managed(stream) || stream.sink == accessory || is_speaker_chain(stream) {
+        if !managed(stream) || stream.sink == accessory || fixed(stream) {
             continue;
         }
         if !follows_seat(&stream.sink, state.from.as_deref()) {
@@ -1125,7 +1167,7 @@ pub fn playback_started(
     let pods = sink_for(graph, accessory);
     graph.streams.iter().any(|stream| {
         managed(stream)
-            && !is_speaker_chain(stream)
+            && !fixed(stream)
             && (pods.is_some_and(|sink| stream.sink == sink.name)
                 || follows_seat(&stream.sink, from))
             && !previous.streams.iter().any(|old| {
@@ -1138,15 +1180,16 @@ pub fn playback_started(
 
 /// Audible playback on the laptop speakers, which putting the pods in moves.
 pub fn playing_on_speakers(graph: &Graph, from: Option<&str>) -> bool {
-    graph.streams.iter().any(|stream| {
-        managed(stream) && !is_speaker_chain(stream) && follows_seat(&stream.sink, from)
-    })
+    graph
+        .streams
+        .iter()
+        .any(|stream| managed(stream) && !fixed(stream) && follows_seat(&stream.sink, from))
 }
 
 /// Park all application streams, including corked and notification streams:
 /// leaving one pinned to the pods can interrupt their remote owner on uncork.
 fn returnable(stream: &LiveStream) -> bool {
-    !is_speaker_chain(stream)
+    !fixed(stream)
 }
 
 /// The laptop speakers when no claim recorded where playback came from.
@@ -1165,8 +1208,11 @@ fn speaker_sink(graph: &Graph, accessory: Option<&Sink>) -> Option<String> {
     found.map(|sink| sink.name.clone())
 }
 
-fn is_speaker_chain(stream: &LiveStream) -> bool {
-    stream.node.contains("omarchy_speaker_tuning")
+/// Not ours to route: a stream the server refuses to move, or the speaker
+/// filter's own output. A pinned stream stays where its application put it,
+/// so it neither starts a claim nor holds a route open waiting to arrive.
+fn fixed(stream: &LiveStream) -> bool {
+    stream.pinned || stream.node.contains("omarchy_speaker_tuning")
 }
 
 fn still_on(state: &RouteState, graph: &Graph) -> Vec<StreamTarget> {
@@ -1277,6 +1323,7 @@ mod tests {
             temporarily_muted: false,
             volume: 1.0,
             corked: false,
+            pinned: false,
         }
     }
 
@@ -1303,6 +1350,26 @@ mod tests {
             gone.state.held.is_empty(),
             "a closed browser node cannot block the next output restart"
         );
+    }
+
+    #[test]
+    fn a_stream_its_application_pinned_to_the_speakers_is_left_alone() {
+        let pods = address();
+        let mut picture = graph(
+            "speakers",
+            vec![sink("pods", Some(pods), None), sink("speakers", None, None)],
+            vec![stream(1, 8, "speakers", "music", false)],
+        );
+        picture.streams[0].pinned = true;
+        assert!(!playing_on_speakers(&picture, None), "nothing here can follow the pods");
+        let first = plan(claiming(), Some(pods), &picture, MonoMs(0));
+        assert!(first.quiet.is_empty(), "muting it would silence it for nothing");
+        assert_eq!(first.set_default.as_deref(), Some("pods"));
+        picture.default_sink = "pods".into();
+        let routed = plan(first.state, Some(pods), &picture, MonoMs(100));
+        assert!(routed.routed);
+        assert!(routed.move_streams.is_none(), "the server refuses to move it");
+        assert!(routed.state.held.is_empty());
     }
 
     #[test]

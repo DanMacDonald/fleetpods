@@ -100,10 +100,23 @@ internals change, the fallback is an ordinary headphones notification with a
 30-second native timeout; custom artwork, immediate dismissal and dismissal
 tracking can be unavailable. Capability checks contain this dependency here.
 
+## Volume
+
+Turning the volume on the pods themselves shows the same card for two seconds
+after the last change, with a labelled volume bar in place of the battery ring. The ring around the
+artwork takes the battery's green and sweeps to the charge instead. The daemon reports `pods_volume` (`percent`,
+`adjusted_ms`) from the A2DP transport's absolute volume. PipeWire mirrors the
+laptop's own slider to that transport, so a level the output already shows was
+set here and leaves `adjusted_ms` alone; only a level the output has not yet
+reached counts as adjusted on the accessory. A connection toast in progress
+keeps the card, and dismissing quiets that one adjustment. The
+`connectionNotifications` setting disables both.
+
 Preview without affecting audio:
 
 ```sh
 omarchy-shell fleetpods connectionToastPreview
+omarchy-shell fleetpods volumeToastPreview
 omarchy-shell fleetpods connectionToastState
 ```
 

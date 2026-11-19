@@ -11,7 +11,7 @@ use crate::pods::reports::Pod;
 use crate::pods::setup::{self, Place};
 use crate::types::{Address, Battery, Clock, Generation, MonoMs};
 
-use crate::daemon::{host_id, Daemon};
+use crate::daemon::{host_id, Daemon, PodsVolume};
 
 /// Something the platform observed, or one command from the panel.
 pub enum Input {
@@ -28,6 +28,11 @@ pub enum Input {
     /// The accessory's A2DP transport started (`active`) or stopped streaming.
     Transport {
         active: bool,
+    },
+    /// The accessory's A2DP transport changed its absolute volume (0..=127).
+    Volume {
+        accessory: Address,
+        level: u8,
     },
     Command(Command),
     Tick,
@@ -315,6 +320,27 @@ impl Daemon {
                 self.transport_active = active;
                 None
             }
+            Input::Volume { accessory, level } => {
+                // PipeWire mirrors the output's slider to the transport, so a
+                // level the output already shows was set on this laptop.
+                // Before the output exists this is the transport's opening
+                // report. Anything else was adjusted on the accessory.
+                let on_accessory = self
+                    .output_health
+                    .outputs
+                    .iter()
+                    .find(|output| output.address == Some(accessory))
+                    .is_some_and(|output| {
+                        (output.volume_percent * 1.27).round() != f64::from(level)
+                    });
+                let adjusted = if on_accessory {
+                    Some(now.unix)
+                } else {
+                    self.pods_volume.and_then(|volume| volume.adjusted)
+                };
+                self.pods_volume = Some(PodsVolume { level, adjusted });
+                None
+            }
             Input::OutputRestarted { id, ok } => {
                 self.output_restarted(id, ok, now);
                 None
@@ -390,6 +416,7 @@ impl Daemon {
                     // cannot still be streaming, whatever the last transport
                     // report said.
                     self.transport_active = false;
+                    self.pods_volume = None;
                 }
                 self.note_acl(up, now.unix);
                 self.note_bluez(up);
@@ -504,6 +531,7 @@ impl Daemon {
             }
             Input::BluezLost => {
                 self.transport_active = false;
+                self.pods_volume = None;
                 self.interrupt("bluez", now);
                 None
             }

@@ -15,7 +15,8 @@ pub struct Output {
     /// Raw Pulse ABI value. PipeWire also reports -2 (init) and -3 (unlinked).
     pub state: i32,
     pub muted: bool,
-    pub audible_volume: bool,
+    /// Pulse's slider scale (100 = unity), loudest channel.
+    pub volume_percent: f64,
 }
 
 #[derive(Default)]
@@ -73,7 +74,7 @@ impl Health {
             eligible
                 && matches!(output.state, -3..=-1 | 1..=2)
                 && !output.muted
-                && output.audible_volume
+                && output.volume_percent > 0.0
                 && graph.is_some_and(|graph| {
                     graph.streams.iter().any(|stream| {
                         stream.sink == output.name
@@ -125,7 +126,7 @@ mod tests {
                 profile: Some("a2dp-sink".into()),
                 state,
                 muted: false,
-                audible_volume: true,
+                volume_percent: 100.0,
             }],
             ..Health::default()
         };
@@ -143,6 +144,7 @@ mod tests {
                 temporarily_muted: false,
                 volume: 1.0,
                 corked: false,
+                pinned: false,
             }],
         };
         (health, address, graph)
@@ -225,7 +227,7 @@ mod tests {
                 "temporarily_muted" => graph.streams[0].temporarily_muted = true,
                 "zero" => graph.streams[0].volume = 0.0,
                 "sink_muted" => health.outputs[0].muted = true,
-                "sink_zero" => health.outputs[0].audible_volume = false,
+                "sink_zero" => health.outputs[0].volume_percent = 0.0,
                 _ => {}
             }
             for now in [0, 3_000, 60_000] {
