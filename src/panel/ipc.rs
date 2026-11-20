@@ -27,6 +27,11 @@ pub enum Command {
     FleetReset,
     Activity,
     ActivityAt(UnixMs),
+    /// The shell's idle monitor: the desk went idle, or woke, at this time.
+    DeskIdle {
+        idle: bool,
+        at: UnixMs,
+    },
     Connect,
     AudioReset,
     Disconnect,
@@ -127,6 +132,7 @@ pub fn cli_waits(command: &str) -> bool {
     command == "fleet"
         || command.starts_with("select:")
         || command.starts_with("desktop-activity:")
+        || command.starts_with("desktop-idle:")
         || SIMPLE.iter().any(|verb| verb.wire == command && verb.waits)
 }
 
@@ -143,9 +149,14 @@ pub fn push(bytes: &[u8]) -> Incoming {
 }
 
 fn framed_prefix(bytes: &[u8]) -> bool {
-    for prefix in
-        [b"playback:".as_slice(), b"priority:", b"incoming:", b"fleet:", b"desktop-activity:"]
-    {
+    for prefix in [
+        b"playback:".as_slice(),
+        b"priority:",
+        b"incoming:",
+        b"fleet:",
+        b"desktop-activity:",
+        b"desktop-idle:",
+    ] {
         if bytes.starts_with(prefix) || prefix.starts_with(bytes) {
             return true;
         }
@@ -160,6 +171,17 @@ fn parse_text(text: &str) -> Command {
             .ok()
             .map(|at| Command::ActivityAt(UnixMs(at)))
             .unwrap_or(Command::Unknown);
+    }
+    if let Some(report) = text.strip_prefix("desktop-idle:") {
+        let parsed = report.split_once(':').and_then(|(idle, at)| {
+            let idle = match idle {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            Some(Command::DeskIdle { idle, at: UnixMs(at.parse().ok()?) })
+        });
+        return parsed.unwrap_or(Command::Unknown);
     }
     if let Some(json) = text.strip_prefix("fleet:") {
         return Command::Fleet(parse_fleet(json));
@@ -342,6 +364,17 @@ mod tests {
         );
         assert_eq!(push(b"desktop-activity:nope\n"), Incoming::Ready(Command::Unknown));
         assert!(cli_waits("desktop-activity:123"));
+        assert_eq!(push(b"desktop-idle:1:123"), Incoming::NeedMore);
+        assert_eq!(
+            push(b"desktop-idle:1:123\n"),
+            Incoming::Ready(Command::DeskIdle { idle: true, at: UnixMs(123) })
+        );
+        assert_eq!(
+            push(b"desktop-idle:0:456\n"),
+            Incoming::Ready(Command::DeskIdle { idle: false, at: UnixMs(456) })
+        );
+        assert_eq!(push(b"desktop-idle:yes:1\n"), Incoming::Ready(Command::Unknown));
+        assert!(cli_waits("desktop-idle:1:123"));
         assert_eq!(push(b"input"), Incoming::Ready(Command::Unknown));
     }
 

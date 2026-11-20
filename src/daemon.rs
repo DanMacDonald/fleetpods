@@ -622,6 +622,7 @@ impl Daemon {
             Command::FleetReset => Response::line("error: fleet reset requires the keyring worker"),
             Command::Activity => self.activity(None, now),
             Command::ActivityAt(at) => self.activity(Some(at), now),
+            Command::DeskIdle { idle, at } => self.desk_idle(idle, at, now),
             Command::Connect => self.connect(now),
             Command::AudioReset => self.reset_audio_output(),
             Command::ReconnectPeer => self.reconnect_peer(now),
@@ -7547,6 +7548,62 @@ mod tests {
                     || matches!(effect, Effect::MuteStreams(_))
             }));
             assert!(daemon.audio.local_playing());
+        }
+    }
+
+    #[test]
+    fn the_crown_of_a_removed_headset_cannot_start_playback_at_an_idle_desk() {
+        use crate::panel::ipc::Command;
+        use crate::step::{Effect, Input};
+        // XPS, 2026-11-20 07:30: the Max came off the head during a call,
+        // the desk went idle, and a crown press 4 s later started a paused
+        // YouTube tab on the speakers.
+        let brave = "org.mpris.MediaPlayer2.brave";
+        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
+        let paused = |effects: &[Effect]| {
+            effects.iter().any(
+                |e| matches!(e, Effect::PausePlayers(players) if players == &[brave.to_string()]),
+            )
+        };
+        // (worn, desk report before the play, desk report after the play)
+        for (worn, before, after) in [
+            (false, Some(true), None),
+            (false, Some(true), Some(false)),
+            (false, Some(false), None),
+            (false, None, None),
+            (true, Some(true), None),
+        ] {
+            let mut daemon = Daemon::new("xps");
+            let now = clock();
+            let at = |ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+            daemon.set_identity("Max", "A3454");
+            ready_link(&mut daemon, now);
+            let generation = daemon.connection().generation();
+            let wear = if worn { ears(0, 0) } else { ears(1, 1) };
+            daemon.step(Input::Accessory { generation, packet: wear }, now);
+            daemon.step(Input::Players(Vec::new()), now);
+            if let Some(idle) = before {
+                daemon.step(
+                    Input::Command(Command::DeskIdle { idle, at: at(1_000).unix }),
+                    at(1_000),
+                );
+            }
+            daemon.step(Input::Player { service: brave.into(), playing: Some(true) }, at(3_000));
+            if let Some(idle) = after {
+                daemon.step(
+                    Input::Command(Command::DeskIdle { idle, at: at(2_950).unix }),
+                    at(3_200),
+                );
+            }
+            let early = daemon.step(Input::Tick, at(3_400)).effects;
+            assert!(!paused(&early), "the play waits out the grace for desk input");
+            let settled = daemon.step(Input::Tick, at(4_000)).effects;
+            let expect = !worn && before == Some(true) && after.is_none();
+            assert_eq!(
+                paused(&settled),
+                expect,
+                "worn={worn} before={before:?} after={after:?}: {settled:?}"
+            );
         }
     }
 

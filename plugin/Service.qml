@@ -42,7 +42,30 @@ Item {
     id: desk
     timeout: 2
     respectInhibitors: false
-    onIsIdleChanged: console.log("fleetpods-activity idle=" + isIdle)
+    onIsIdleChanged: {
+      console.log("fleetpods-activity idle=" + isIdle)
+      root.reportDesk(isIdle)
+    }
+  }
+
+  // Both idle edges go to the daemon unconditionally: it tells a play
+  // started at an idle desk (the pods' own button) from a click or key.
+  property string deskPending: ""
+  function reportDesk(idle) {
+    var report = "desktop-idle:" + (idle ? "1" : "0") + ":" + Date.now().toFixed(0)
+    if (deskProcess.running) deskPending = report
+    else { deskProcess.report = report; deskProcess.running = true }
+  }
+  Process {
+    id: deskProcess
+    property string report: ""
+    command: [root.ctlPath, report]
+    onExited: {
+      if (!root.deskPending) return
+      report = root.deskPending
+      root.deskPending = ""
+      running = true
+    }
   }
 
   ActivityGate {

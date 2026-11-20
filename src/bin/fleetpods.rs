@@ -64,7 +64,7 @@ fn main() {
         std::process::exit(1);
     };
     let mut wire = command.clone();
-    if command.starts_with("desktop-activity:") {
+    if command.starts_with("desktop-activity:") || command.starts_with("desktop-idle:") {
         wire.push('\n');
     }
     if let Some(address) = remove {

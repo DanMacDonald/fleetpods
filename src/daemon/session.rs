@@ -88,6 +88,13 @@ pub(super) struct Session {
     stem_paused: Option<(String, MonoMs)>,
     /// Deadline at which a peer blip becomes a resume of `stem_paused`.
     stem_resume_at: Option<MonoMs>,
+    /// The shell's latest idle-monitor report: whether the desk is idle,
+    /// and since when. None until the shell reports.
+    desk: Option<(bool, MonoMs)>,
+    /// A player that started while the desk was idle and the pods were
+    /// off the body, and when. The pods' own button most likely toggled
+    /// it; it is paused unless desk input turns up within the grace.
+    unworn_play: Option<(String, MonoMs)>,
 }
 
 /// One admission, identity and cancellation owner for takeover, watchdog and
@@ -255,6 +262,11 @@ const STEM_CONTEST_MAX_CLAIMS: u8 = 3;
 /// blip: a genuine takeover claims ownership well inside this beat, while
 /// a stem toggle delivered to the peer is re-paused almost immediately.
 const STEM_RESUME_DELAY_MS: u64 = 600;
+/// How long a play that started at an idle desk waits for the shell's
+/// input report before it is blamed on the off-body pods. A click or key
+/// press wakes the desk before the browser reports Playing, and the
+/// report reaches the daemon within a few hundred milliseconds.
+const UNWORN_PLAY_GRACE_MS: u64 = 800;
 
 /// Why an opening attempt must be retired.
 enum ConnectionHold {
@@ -315,6 +327,7 @@ impl Daemon {
         self.tick_ears(now.mono);
         self.follow_insertion(now);
         self.route_owned_playback(false, now);
+        self.pause_unworn_play(now);
         // Fleet admission expiry can change connection intent. Collect it
         // before the final route/setup decision, then publish the final state.
         let mut effects = self.collect_background_effects(now);
@@ -532,6 +545,67 @@ impl Daemon {
         }
     }
 
+    /// The shell's idle monitor: the desk went idle (no input for two
+    /// seconds) or someone touched it again. Reports can arrive out of
+    /// order; an older one never overrides a newer one.
+    pub(super) fn desk_idle(&mut self, idle: bool, observed_at: UnixMs, now: Clock) -> Response {
+        let Some(age) = now.unix.0.checked_sub(observed_at.0) else {
+            return Response::line("ignored");
+        };
+        if age > INPUT_INTENT_MS || age > now.mono.0 {
+            return Response::line("ignored");
+        }
+        self.note_desk(idle, MonoMs(now.mono.0 - age));
+        Response::line("ok")
+    }
+
+    fn note_desk(&mut self, idle: bool, at: MonoMs) {
+        if self.session.desk.is_none_or(|(_, seen)| at >= seen) {
+            self.session.desk = Some((idle, at));
+        }
+    }
+
+    /// Nobody has touched the desk since before `at`.
+    fn desk_idle_at(&self, at: MonoMs) -> bool {
+        self.session.desk.is_some_and(|(idle, since)| idle && since <= at)
+    }
+
+    /// A player that starts while the linked pods are off the body and
+    /// nobody is at the desk was started by the pods' own button: a
+    /// crown or stem press toggles play on the host. Those pods must not
+    /// start anything; the check waits out the grace for desk input.
+    fn note_unworn_play(&mut self, service: &str, now: Clock) {
+        if self.connection.stage() == Stage::Ready
+            && self.accessory.wearing() == Some(false)
+            && self.desk_idle_at(now.mono)
+        {
+            self.session.unworn_play = Some((service.to_string(), now.mono));
+        }
+    }
+
+    fn pause_unworn_play(&mut self, now: Clock) {
+        let Some((_, at)) = &self.session.unworn_play else {
+            return;
+        };
+        if now.mono.saturating_since(*at) < UNWORN_PLAY_GRACE_MS {
+            return;
+        }
+        let Some((player, at)) = self.session.unworn_play.take() else {
+            return;
+        };
+        if !self.desk_idle_at(at)
+            || self.accessory.wearing() != Some(false)
+            || !self.audio.player_playing(&player)
+        {
+            return;
+        }
+        eprintln!(
+            "fleetpodsd: player {player:?} started by the {} off the body at an idle desk; pausing it",
+            self.accessory.model.display_name()
+        );
+        self.effects.pause_players.push(player);
+    }
+
     fn wake_can_open(&self, now: Clock) -> bool {
         self.preferred_connection_allowed()
             && self.config.accessory.is_some()
@@ -557,6 +631,7 @@ impl Daemon {
             return Response::line("ignored");
         }
         self.session.last_input_at = Some(input);
+        self.note_desk(false, input);
         // Input that preceded the handoff cannot authorize undoing it, even
         // if delivery finishes after the handoff.
         if reported && self.session.yield_pause_at.is_some_and(|yielded| input <= yielded) {
@@ -1808,6 +1883,7 @@ impl Daemon {
             eprintln!("fleetpodsd: player {service:?} reported new Playing state (after_yield={after_yield})");
             self.remember_activity(now);
             self.claim_playback(now);
+            self.note_unworn_play(&service, now);
             self.effects.announce_dirty = true;
         }
         if playing == Some(false) && was_playing && !self.audio.local_playing() {

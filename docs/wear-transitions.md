@@ -20,6 +20,7 @@ requires recent positive evidence before acquiring a disconnected accessory.
 | Insertion while speakers play | `Daemon::note_wearing`, `follow_insertion` | Shared aggregate wear transition and takeover gates; removal clears pending insertion. |
 | Manual Play while removed | `claim_playback`, `route_owned_playback` | Fixed: both player events and new/uncorked audio streams return to speakers even with a ready Bluetooth link. |
 | Deferred Play / snapshot restoration | Session | Shared playback block prevents reclaim while removed; worn evidence enables the existing acquisition path. |
+| Pods button while removed | `note_unworn_play`, `pause_unworn_play` | A player that starts while the linked accessory reports it is not worn and the desk is idle was toggled by the crown or stem. It is paused unless desk input arrives within 800 ms. Unknown wear, or no idle report from the shell, never pauses. |
 | Idle desktop activity claims ownership | `claim_idle_on_activity` | Fixed: off-head wear blocks an idle claim just as docking does. |
 | Publish takeover intent | `roster_intent` | Fixed: a deferred speaker play cannot ask another host to yield while the selected accessory is removed. |
 | Publish playing state | `introduce_peers`, `Seat::resolve` | Fixed: confirmed removal suppresses stale playing observations without discarding the connected owner. |

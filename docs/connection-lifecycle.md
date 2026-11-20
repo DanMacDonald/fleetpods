@@ -90,6 +90,9 @@ Repeated unsolicited player starts do not become takeover intent; fresh input
 expires after 15 seconds. Bare CLI `activity` remains an explicit request made now.
 The timestamped verb has a distinct prefix and requires a newline; any partial
 read waits for the complete message instead of turning it into fresh activity.
+The shell also sends each idle-monitor edge, ungated, as `desktop-idle:1|0:UNIX_MS`.
+It only tells a play started by a removed accessory's own button (an idle desk)
+from one started at the keyboard or mouse; it never claims or opens anything.
 
 Startup player snapshots supply observations, never new takeover intent. For a
 worn headset, the existing owned-playback routing path can restore playback only
