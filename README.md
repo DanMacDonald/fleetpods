@@ -77,6 +77,15 @@ On Omarchy with shell plugin support, install Rust and Cargo and the [build depe
 
 This builds FleetPods, installs its user service and microphone support, and enables the plugin in the bar. Open the FleetPods icon to get started. Pair your AirPods through Bluetooth if this is their first connection to the machine.
 
+Setup does not need `sudo`. Everything is installed for your user only:
+
+- the binaries go to `~/.local/bin`;
+- the daemon becomes a `systemctl --user` service;
+- the plugin goes to `~/.config/omarchy/plugins`;
+- the microphone support goes to your WirePlumber config under `~/.local/share` and `~/.config`.
+
+Nothing is written to `/etc` or `/usr`, and there are no udev rules, group changes, or file capabilities. The daemon uses Bluetooth, PipeWire, media players, and the keyring with your session's normal permissions. You need `sudo` only to install a missing build dependency with `pacman`. `./setup --bin-dir DIRECTORY` installs already-built binaries and skips the build and its dependency checks.
+
 See the [installation guide](docs/installation.md) for cloning, first pairing, joining a fleet, and upgrades. AirPods Pro 3 is the current tested hardware; see [support and known limitations](docs/support.md) for compatibility and troubleshooting.
 
 ## Remove
