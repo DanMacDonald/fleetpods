@@ -97,23 +97,41 @@ fn main() {
 
 struct Boot {
     started: Instant,
+    /// Wall time minus monotonic time, in whole milliseconds.
+    offset: std::cell::Cell<Option<i64>>,
 }
+
+/// A measured offset this close to the held one is read noise or a slow
+/// NTP slew, not sleep or a clock step.
+const OFFSET_TOLERANCE_MS: i64 = 20;
 
 impl Boot {
     fn now() -> Self {
-        Self { started: Instant::now() }
+        Self { started: Instant::now(), offset: std::cell::Cell::new(None) }
     }
 
     /// `Instant` stops while the machine sleeps, so wall time is read fresh
     /// rather than derived from it. Otherwise every published timestamp and
     /// every cross-host freshness check would lag by the time spent asleep.
+    /// The two clocks are read separately, so truncating each to
+    /// milliseconds made their difference wobble by 1 ms: every converted
+    /// timestamp in the status changed on every tick, and the status file
+    /// was rewritten about ten times a second. The offset is held instead
+    /// and re-measured only when it really moves.
     fn clock(&self) -> Clock {
-        let mono = self.started.elapsed().as_millis() as u64;
-        let unix = SystemTime::now()
+        let mono_us = self.started.elapsed().as_micros() as i64;
+        let unix_us = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
+            .map(|duration| duration.as_micros() as i64)
             .unwrap_or(0);
-        Clock::new(mono, unix)
+        let mono = mono_us / 1_000;
+        let measured = (unix_us - mono_us + 500) / 1_000;
+        let offset = match self.offset.get() {
+            Some(held) if (measured - held).abs() <= OFFSET_TOLERANCE_MS => held,
+            _ => measured,
+        };
+        self.offset.set(Some(offset));
+        Clock::new(mono as u64, (mono + offset).max(0) as u64)
     }
 }
 
@@ -166,8 +184,10 @@ fn publish(path: &Path, body: &str, previous: &mut String) -> io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     let mut file = File::create(&tmp)?;
+    // No fsync: the rename alone keeps readers from seeing a partial file,
+    // and the daemon republishes on start. Syncing every status change
+    // was a disk flush several times a second.
     file.write_all(body.as_bytes())?;
-    file.sync_all()?;
     fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     fs::rename(&tmp, path)?;
     *previous = body.to_string();

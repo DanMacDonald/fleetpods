@@ -4288,14 +4288,18 @@ mod tests {
         daemon.accessory.note_advertisement(MonoMs(9_000), 0);
         let mut max = Accessory::new();
         max.set_identity("AirPods Max", "A3454");
-        max.note_advertisement(MonoMs(8_000), 0);
+        max.note_advertisement(MonoMs(6_000), 0);
         daemon.tracked.insert(second, max);
         let status = daemon.status_value(now);
         let entries = status["accessories"].as_array().unwrap();
         let selected = entries.iter().find(|a| a["address"] == first.display()).unwrap();
         let tracked = entries.iter().find(|a| a["address"] == second.display()).unwrap();
-        assert_eq!(selected["last_advertisement_ms"], 99_000);
-        assert_eq!(tracked["last_advertisement_ms"], 98_000);
+        // Published at 2 s resolution, so every frame does not rewrite the status.
+        assert_eq!(selected["last_advertisement_ms"], 98_000);
+        assert_eq!(status["last_advertisement_ms"], 98_000);
+        assert_eq!(tracked["last_advertisement_ms"], 96_000);
+        daemon.accessory.note_advertisement(MonoMs(9_900), 0);
+        assert_eq!(daemon.status_value(now)["last_advertisement_ms"], 98_000);
         assert_eq!(tracked["is_headset"], true);
         daemon.tracked.remove(&second);
         let status = daemon.status_value(now);

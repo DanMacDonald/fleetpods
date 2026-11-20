@@ -32,7 +32,7 @@ Legacy sentinels exist only in this projection. `None` for BlueZ becomes JSON `f
 | `lid_state` | Fresh lid report, otherwise `2`. A stale report does not stay "live" |
 | `last_known_lid_state` | Last lid value actually observed, otherwise `2` |
 | `lid_updated_ms` | Time of the latest lid observation. `0` if none. A missing advertisement does not invent a lid |
-| `last_advertisement_ms` | Time of the latest accepted proximity advertisement. `0` if none. Independent of whether that frame carried a lid |
+| `last_advertisement_ms` | Time of the latest accepted proximity advertisement, rounded down to 2 s so each frame does not rewrite the status. `0` if none. Independent of whether that frame carried a lid |
 | `ble_connection_state` | Connection byte from that advertisement, or `255` until one is accepted |
 | `case_confirmed_docked` | Both buds freshly reported in the case |
 | `nearby_airpods` | Separate unpaired advertiser records: address, optional name/RSSI, model, observed placement/lid, report age and selected setup candidate. Equal names and models never merge records. Private address rotation cannot be resolved without pairing keys |

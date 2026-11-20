@@ -221,7 +221,10 @@ pub fn accessory_entry(
     object.insert("selected".into(), json!(selected));
     object.insert("keys_ready".into(), json!(keys_ready));
     object.insert("is_headset".into(), json!(accessory.model.is_headset()));
-    object.insert("last_advertisement_ms".into(), json!(unix_at(now, accessory.advertised_at)));
+    object.insert(
+        "last_advertisement_ms".into(),
+        json!(advertised_unix(now, accessory.advertised_at)),
+    );
     object.insert("ble_connection_state".into(), json!(accessory.ble_connection.unwrap_or(255)));
     let live = match &accessory.lid.latest {
         Evidence::Fresh { value, .. } => value.wire(),
@@ -316,7 +319,7 @@ fn insert_presence(status: &mut Map<String, Value>, snapshot: &Snapshot<'_>) {
     status.insert("lid_updated_ms".into(), json!(unix_at(snapshot.clock, lid.latest.at())));
     status.insert(
         "last_advertisement_ms".into(),
-        json!(unix_at(snapshot.clock, snapshot.accessory.advertised_at)),
+        json!(advertised_unix(snapshot.clock, snapshot.accessory.advertised_at)),
     );
     status.insert(
         "ble_connection_state".into(),
@@ -640,6 +643,17 @@ fn bit(value: Option<bool>) -> i64 {
 
 fn unix_at(clock: Clock, at: Option<crate::types::MonoMs>) -> u64 {
     at.map(|at| clock.unix_at(at).0).unwrap_or(0)
+}
+
+/// Resolution of published advertisement times. AirPods advertise several
+/// times a second; at full resolution every frame rewrote the status file
+/// and woke the panel (about 9 times a second), filling the shell's logs.
+/// Readers judge freshness over 20 s or more.
+const ADVERTISEMENT_RESOLUTION_MS: u64 = 2_000;
+
+fn advertised_unix(clock: Clock, at: Option<crate::types::MonoMs>) -> u64 {
+    let ms = unix_at(clock, at);
+    ms - ms % ADVERTISEMENT_RESOLUTION_MS
 }
 
 /// Read the owner's actual states; there is no diagnostic task graph.
