@@ -7,12 +7,18 @@
 use super::REOPEN_HOLD_MS;
 use crate::types::MonoMs;
 
+/// How long desk input leaves a playing outside device's slot alone.
+pub(super) const OUTSIDE_PLAYING_HOLD_MS: u64 = 10 * 60_000;
+
 #[derive(Debug, Default)]
 pub(super) struct ReopenHold {
     /// An Apple device took the slot this laptop had been sitting in.
     /// A failed route, a closed case, and an idle link do not set this.
     /// It has no deadline: only input, a case cycle or a new link ends it.
     pub(super) displaced: bool,
+    /// The device that took the slot was playing. It takes the slot back
+    /// when input reopens this laptop beside it, so input waits until then.
+    pub(super) outside_playing_until: Option<MonoMs>,
     /// A slot was yielded or lost; the incoming device gets until then to
     /// finish connecting without being displaced.
     pub(super) slot_until: Option<MonoMs>,
@@ -32,6 +38,7 @@ impl ReopenHold {
     /// took its slot. The owner-first order is a separate agreement.
     pub(super) fn clear_slot_loss(&mut self) {
         self.displaced = false;
+        self.outside_playing_until = None;
         self.slot_until = None;
     }
 
@@ -72,6 +79,15 @@ impl ReopenHold {
         }
         self.owner_landed();
         false
+    }
+
+    /// Desk input while displaced by a playing phone or Mac. Rejoining beside
+    /// it only takes a connection that device reclaims a minute later, which
+    /// evicts this laptop again (xps, 2026-11-22: 20 rejoins in 40 minutes
+    /// beside a playing iPhone and Mac). After the window one rejoin may
+    /// try again; another eviction while that device plays re-arms it.
+    pub(super) fn outside_playing_blocks_input(&self, now: MonoMs) -> bool {
+        self.displaced && self.outside_playing_until.is_some_and(|until| now.0 < until.0)
     }
 
     /// Openings nobody asked for: worn advertisements and ACL attachment.

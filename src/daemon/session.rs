@@ -392,7 +392,7 @@ impl Daemon {
             {
                 self.hold.hold_slot(now.saturating_add(DISPLACEMENT_HOLD_MS));
             }
-            self.consider_apple_displacement();
+            self.consider_apple_displacement(now);
             self.consider_reopen_order();
         }
         if self.connection.note_socket(up, generation) {
@@ -663,10 +663,18 @@ impl Daemon {
             eprintln!("fleetpodsd: activity ignored while a device outside the fleet plays on the AirPods");
             return Response::line("ignored");
         }
+        // The playing device that took this laptop's slot would only take it
+        // back. Play, Connect and a case cycle still reconnect at once.
+        if self.hold.outside_playing_blocks_input(now.mono) {
+            eprintln!(
+                "fleetpodsd: activity ignored while the playing device that took this laptop's connection holds it"
+            );
+            return Response::line("ignored");
+        }
         // Input on an established link can claim idle audio immediately. Input
         // after a slot loss must not evict the device still taking that slot.
-        // Activity honors the timed holds but not displacement: fresh input is
-        // exactly what a displaced laptop waits for.
+        // Activity honors the timed holds but not idle displacement: fresh
+        // input is exactly what a displaced laptop waits for.
         if self.hold.slot_held(now.mono) {
             eprintln!("fleetpodsd: activity ignored while a yielded slot is held");
             return Response::line("ignored");

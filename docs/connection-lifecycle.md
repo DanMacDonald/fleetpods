@@ -111,12 +111,20 @@ selecting another accessory can progress through the existing admission paths.
 `ReopenHold` (`src/daemon/reopen.rs`) is the one record of why this laptop is
 not reopening on its own: displacement, the timed slot hold and the owner-first
 order. Passive openings ask `passive_blocked`; activity honors only the two
-timed holds, since fresh input is what displacement waits for. A ready link or
+timed holds, since fresh input is what displacement waits for. The exception is
+displacement by a device that reported itself playing when the link ended: for
+ten minutes input does not rejoin beside it, because that phone or Mac takes
+the slot straight back and evicts this laptop again. Play, Connect and a case
+cycle still reconnect at once; after the window one rejoin may try again. A ready link or
 an accessory switch clears the record; explicit Connect and Play never read it.
 
 Fleet advertisement intent belongs to the Linux radio worker. Pairing temporarily
 blocks registration without clearing that intent, including a first request
-received during pairing. One reconciler registers or retires the BlueZ object.
+received during pairing. While a registration is unanswered the worker neither
+changes the payload nor withdraws the advertisement: BlueZ 5.88 crashes when an
+advertisement changed mid-registration is then freed. A change made meanwhile
+is sent once the registration succeeds; withdrawal waits for the reply or the
+call's timeout. One reconciler registers or retires the BlueZ object.
 Its `retry::Task` allows five registration attempts, with 5/10/20/40-second waits;
 the worker schedules those deadlines even without scan or socket traffic. Payload
 updates and pairing holds preserve a failed attempt's budget. Explicit release

@@ -988,6 +988,8 @@ struct Air {
     current: Vec<u8>,
     /// True only after RegisterAdvertisement has succeeded.
     registered: bool,
+    /// The payload changed while a registration was unanswered.
+    update_after_registration: bool,
     wanted: bool,
     /// The daemon asked discovery to stay up.
     want_scan: bool,
@@ -1017,6 +1019,7 @@ impl Default for Air {
         Self {
             current: Vec::new(),
             registered: false,
+            update_after_registration: false,
             wanted: false,
             want_scan: false,
             scanned: false,
@@ -1081,6 +1084,20 @@ impl Air {
         self.wanted = true;
     }
 
+    /// BlueZ refreshes an advertisement on every property change, and a
+    /// refresh replaces the controller request it tracks for that
+    /// advertisement. Changed during registration and then withdrawn, the
+    /// advertisement is freed while the earlier request is still answered,
+    /// and bluetoothd crashes on the reply (bluez 5.88,
+    /// `add_adv_params_callback`; xps, 2026-11-22). BlueZ reads the current
+    /// payload when it registers, so a change waits for the answer.
+    fn can_update_advertisement(&self, calls: &[PendingCall]) -> bool {
+        self.registered
+            && !calls.iter().any(|call| {
+                matches!(call.kind, CallKind::Advertise { .. } | CallKind::Unadvertise { .. })
+            })
+    }
+
     fn release_advertisement(&mut self) {
         self.wanted = false;
         self.advertisement.reset();
@@ -1096,8 +1113,13 @@ impl Air {
         if calls.iter().any(|call| matches!(call.kind, CallKind::Unadvertise { .. })) {
             return None;
         }
-        let registering = calls.iter().any(|call| matches!(call.kind, CallKind::Advertise { .. }));
-        if (!self.wanted || self.pairing_paused(now)) && (self.registered || registering) {
+        // Withdrawing an unanswered registration is the other half of the
+        // bluetoothd crash above. Its reply retires it if it is no longer
+        // wanted; an unanswered call is retired when it times out.
+        if calls.iter().any(|call| matches!(call.kind, CallKind::Advertise { .. })) {
+            return None;
+        }
+        if (!self.wanted || self.pairing_paused(now)) && self.registered {
             self.retire_advertisement();
         }
         let at = self.monotonic(now);
@@ -1106,7 +1128,7 @@ impl Air {
                 .launch(&mut self.requests, Generation(0), at)
                 .map(AdvertisementAction::Unregister);
         }
-        if !self.wanted || self.pairing_paused(now) || self.registered || registering {
+        if !self.wanted || self.pairing_paused(now) || self.registered {
             return None;
         }
         self.advertisement
@@ -1395,7 +1417,11 @@ fn handle_job(
         }
         Job::Advertise(bytes) => {
             live.air.request_advertisement(bytes);
-            let _ = emit_service_data(bus, &live.air.current);
+            if live.air.can_update_advertisement(&live.calls) {
+                let _ = emit_service_data(bus, &live.air.current);
+            } else {
+                live.air.update_after_registration = true;
+            }
             ensure_scan(bus, live);
             true
         }
@@ -1800,6 +1826,11 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 }
             };
             live.air.advertisement_reply(id, accepted, Instant::now());
+            if std::mem::take(&mut live.air.update_after_registration)
+                && live.air.can_update_advertisement(&live.calls)
+            {
+                let _ = emit_service_data(bus, &live.air.current);
+            }
         }
         CallKind::Unadvertise { id } => {
             let removed = matches!(&result, CallResult::Done)
@@ -3330,6 +3361,40 @@ mod advertisement_tests {
     }
 
     #[test]
+    fn payload_changes_wait_for_an_answered_registration() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        assert!(!air.can_update_advertisement(&[]), "nothing registered yet");
+        let id = launch_advertisement(&mut air, now).unwrap();
+        let mut calls =
+            vec![PendingCall { serial: 1, kind: CallKind::Advertise { id }, sent: now }];
+        air.request_advertisement(vec![2]);
+        assert!(!air.can_update_advertisement(&calls), "registration unanswered");
+        air.advertisement_reply(id, true, now);
+        calls.clear();
+        assert!(air.can_update_advertisement(&calls));
+        calls.push(PendingCall { serial: 2, kind: CallKind::Unadvertise { id }, sent: now });
+        assert!(!air.can_update_advertisement(&calls), "withdrawal unanswered");
+    }
+
+    #[test]
+    fn released_intent_retires_a_registration_once_answered() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut air, now).unwrap();
+        let calls = vec![PendingCall { serial: 1, kind: CallKind::Advertise { id }, sent: now }];
+        air.release_advertisement();
+        assert!(air.advance_advertisement(now, &calls).is_none());
+        air.advertisement_reply(id, true, now);
+        assert!(matches!(
+            air.advance_advertisement(now, &[]),
+            Some(AdvertisementAction::Unregister(_))
+        ));
+    }
+
+    #[test]
     fn pairing_retires_inflight_registration_before_resuming() {
         let mut air = Air::default();
         let now = air.clock_origin;
@@ -3338,17 +3403,21 @@ mod advertisement_tests {
         let mut calls =
             vec![PendingCall { serial: 1, kind: CallKind::Advertise { id }, sent: now }];
         air.pairing_until = Some(now + Duration::from_secs(5));
+        assert!(
+            air.advance_advertisement(now, &calls).is_none(),
+            "an unanswered registration is not withdrawn (bluetoothd crash)"
+        );
+        air.advertisement_reply(id, true, now);
+        calls.clear();
         let Some(AdvertisementAction::Unregister(cleanup)) = air.advance_advertisement(now, &calls)
         else {
-            panic!("pairing must retire the pending registration");
+            panic!("pairing must retire the registration once it is answered");
         };
         calls.push(PendingCall {
             serial: 2,
             kind: CallKind::Unadvertise { id: cleanup },
             sent: now,
         });
-        air.advertisement_reply(id, true, now);
-        calls.remove(0);
         assert!(
             air.advance_advertisement(now + Duration::from_secs(6), &calls).is_none(),
             "pairing ending cannot race pending cleanup"

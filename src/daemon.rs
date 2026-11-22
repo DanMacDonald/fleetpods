@@ -764,7 +764,7 @@ impl Daemon {
 
     /// The pods ended the link while this laptop and one Apple device were the pair.
     /// A fleet laptop in that pair is a handoff, not a playback wait.
-    fn consider_apple_displacement(&mut self) {
+    fn consider_apple_displacement(&mut self, now: MonoMs) {
         if self.hold.displaced || self.seat.held() || self.routing.phase().busy() {
             return;
         }
@@ -773,6 +773,10 @@ impl Daemon {
         };
         if !self.membership.contains(other) {
             self.hold.displaced = true;
+            // The device's own media report, still held until the reports drop.
+            let playing = self.peer_playback.get(&other).is_some_and(|(playing, _)| *playing);
+            self.hold.outside_playing_until =
+                playing.then(|| now.saturating_add(reopen::OUTSIDE_PLAYING_HOLD_MS));
         }
     }
 
@@ -7947,6 +7951,54 @@ mod tests {
         daemon.note_pod(true, away, now.mono);
         daemon.note_lid(false, now.mono);
         assert_eq!(daemon.status_value(now)["waiting_for_playback"], false);
+    }
+
+    /// xps, 2026-11-22: a playing iPhone and Mac shared a Max. Each burst of
+    /// desk input reopened the XPS beside them, the pods dropped the other
+    /// Apple device for it, and that device took the slot back a minute
+    /// later: 20 evictions in 40 minutes.
+    #[test]
+    fn input_does_not_rejoin_beside_the_playing_device_that_took_the_slot() {
+        let local = addr(2);
+        let phone = Address::parse("F0:2F:4B:14:DE:29").unwrap();
+        let settled = |now: Clock, ms: u64| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        for playing in [true, false] {
+            let mut daemon = Daemon::new("omarchy-xps");
+            let now = clock();
+            ready_link(&mut daemon, now);
+            daemon.set_local_address(Some(local));
+            daemon.note_pod_peers(vec![phone, local], now.unix);
+            daemon.note_peer_playback(phone, playing, now);
+            daemon.note_socket(false, daemon.connection().generation(), now.mono);
+            assert!(daemon.hold.displaced);
+            let later = settled(now, DISPLACEMENT_HOLD_MS + 60_000);
+            let expected = if playing { "ignored\n" } else { "accepted\n" };
+            assert_eq!(
+                daemon.handle(Command::Activity, later).body.as_deref(),
+                Some(expected),
+                "input beside a device with playing={playing}"
+            );
+            if !playing {
+                continue;
+            }
+            let expired = settled(now, reopen::OUTSIDE_PLAYING_HOLD_MS);
+            assert_eq!(
+                daemon.handle(Command::Activity, expired).body.as_deref(),
+                Some("accepted\n"),
+                "one rejoin may try again once the window passes"
+            );
+        }
+
+        let mut daemon = Daemon::new("omarchy-xps");
+        let now = clock();
+        ready_link(&mut daemon, now);
+        daemon.set_local_address(Some(local));
+        daemon.note_pod_peers(vec![phone, local], now.unix);
+        daemon.note_peer_playback(phone, true, now);
+        daemon.note_socket(false, daemon.connection().generation(), now.mono);
+        let later = settled(now, DISPLACEMENT_HOLD_MS + 60_000);
+        assert_eq!(daemon.handle(Command::Connect, later).body.as_deref(), Some("accepted\n"));
+        assert!(!daemon.hold.outside_playing_blocks_input(later.mono));
     }
 
     #[test]

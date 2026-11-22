@@ -247,3 +247,32 @@ A separate clock check found Gram approximately 16 seconds ahead of XPS,
 exceeding the fleet's five-second future-clock allowance. Refreshing Gram's
 systemd-timesyncd service over SSH required a sudo password and was not applied.
 This remains a potential cause of rejected fleet advertisements.
+
+## 2026-11-22: XPS evicted beside a playing iPhone and Mac
+
+From 14:41 an iPhone and a MacBook Pro shared the AirPods Max 2, one of them
+playing throughout. In 40 minutes the XPS rejoined 20 times and was evicted 22
+times (13 `Connection reset by peer`, 9 `Connection timed out`). Every rejoin
+was desk activity reopening the background connection. The pods dropped the
+other Apple device for it, and that device took the slot back 10 s to 2 min
+later. The Gram was not on the pods.
+
+Activity no longer rejoins for ten minutes when the device that took the slot
+had reported itself playing; Play, Connect and a case cycle still reconnect.
+Regression: `input_does_not_rejoin_beside_the_playing_device_that_took_the_slot`.
+
+bluetoothd 5.88 segfaulted three times in the same window, each 4 to 6 s after
+a timed-out drop and right after two `Failed to complete registration` replies
+to the fleet advertisement. The core dump (symbolized from Arch's debuginfod)
+crashes in `add_adv_params_callback` (`src/advertising.c:1478`) on a freed
+advertisement client. `refresh_extended_adv` overwrites the client's single
+tracked request id when a property change refreshes it during registration,
+so `client_free` cancels only the newer request and the older reply arrives
+after the free. FleetPods supplied both halves: it emitted `PropertiesChanged`
+on every payload change, and withdrew an unanswered registration. Both now
+wait for the registration's reply. Regressions:
+`payload_changes_wait_for_an_answered_registration`,
+`released_intent_retires_a_registration_once_answered`, and the updated
+`pairing_retires_inflight_registration_before_resuming`. The BlueZ bug itself
+remains: two property changes in quick succession on a registered
+advertisement, followed by its removal, can still lose a request id.
