@@ -274,5 +274,9 @@ wait for the registration's reply. Regressions:
 `payload_changes_wait_for_an_answered_registration`,
 `released_intent_retires_a_registration_once_answered`, and the updated
 `pairing_retires_inflight_registration_before_resuming`. The BlueZ bug itself
-remains: two property changes in quick succession on a registered
-advertisement, followed by its removal, can still lose a request id.
+remains in 5.73 to 5.88: two property changes in quick succession on a
+registered advertisement, followed by its removal, can still lose a request id.
+A BlueZ build with AddressSanitizer reproduced that in 1 to 38 rounds, so a
+withdrawal now also waits one second after the last payload change, by which
+time BlueZ has answered every refresh. Regression:
+`withdrawal_waits_for_the_last_payload_change_to_settle`.

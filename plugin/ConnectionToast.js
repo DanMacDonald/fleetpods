@@ -92,6 +92,9 @@ function project(status, reachable, now) {
   if (state === "failed" || (!busy && !success && (native.failure || route.phase === "failed"))) phase = "failed"
   else if (state === "interrupted" || (!busy && !success)) phase = "cancelled"
   if (!reachable) phase = "offline"
+  // An attempt ended by another device playing on the pods names that device.
+  var taker = phase === "cancelled" && Model.playingOn(s, "remote")
+    ? Model.peerInfo(s.remoteSourceAddress, s.localAddress, s.localName, s.devices) : null
   var levels = (s.isHeadset ? [s.headset] : [s.left, s.right]).filter(function(p) {
     return p && typeof p.level === "number" && p.level >= 0 && p.level <= 100
   }).map(function(p) { return p.level })
@@ -101,6 +104,7 @@ function project(status, reachable, now) {
   var target = reachable && state ? (busy || (s.ownershipIntent === "claim" && success) ? key : "") : null
   var volume = s.volume || {}
   return { key: key, target: target, busy: busy, phase: phase, name: label(s.modelName || s.deviceName),
+    takenBy: taker && taker.kind !== "unknown" ? label(taker.label) : "",
     volume: typeof volume.percent === "number" ? volume.percent : -1, volumeAt: volume.adjustedMs || 0,
     variant: s.isHeadset ? "max" : "pro", battery: fresh && levels.length ? Math.min.apply(Math, levels) : -1 }
 }
@@ -158,7 +162,8 @@ function text(input) {
     cancelled: "connection ended" }
   var body = input.phase === "waiting" ? "Waiting for audio" : input.phase === "playing" ? "Audio is playing on your pods"
       : input.phase === "failed" || input.phase === "offline" ? "Check FleetPods for details"
-      : input.phase === "cancelled" ? "Audio connection cancelled" : "Connecting audio"
+      : input.phase === "cancelled" ? (input.takenBy ? input.takenBy + " took them back" : "Audio connection cancelled")
+      : "Connecting audio"
   return { summary: (input.name || "AirPods") + " " + (suffix[input.phase] || "connecting…"), body: body,
     detail: ({connecting: "Connecting…", preparing: "Preparing audio…", routing: "Routing audio…",
       playing: "Playing"})[input.phase] || body }

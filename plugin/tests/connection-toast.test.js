@@ -2,7 +2,7 @@
 const source = Deno.readTextFileSync(new URL('../ConnectionToast.js', import.meta.url))
   .replace(/^\.(?:pragma|import)[^\n]*\n/gm, '')
 const modelSource = Deno.readTextFileSync(new URL('../Model.js', import.meta.url))
-const Model = new Function(modelSource + '; return {parseStatus,routeRequesting,acquiringPlayback}')()
+const Model = new Function(modelSource + '; return {parseStatus,routeRequesting,acquiringPlayback,playingOn,peerInfo}')()
 const T = new Function('Model', source + '; return {initial,step,project,presentation,text,label,acquire,release,advance,preview,reset,LIMIT_MS}')(Model)
 function eq(actual, expected, message) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) throw Error(message + ': ' + JSON.stringify(actual))
@@ -309,3 +309,14 @@ eq(T.advance(p(turned(30, 70000), 70000), 70000, {}, 1000, false).visible, false
 T.reset()
 v = T.advance(p({...linking, volume: {percent: 30, adjustedMs: 80000}}, 80000), 80000, {}, 1000, true)
 eq(v.phase, 'connecting', 'A connection in progress keeps the card')
+
+// An attempt that another playing device ends names it, from the daemon's labels only.
+s = T.step(T.initial(), p(linking), 1000)
+const reclaimed = {...idle, ownershipIntent:'claim', audioOwner:{holder:'remote', playing:true},
+  remoteSourceAddress:'F0:2F:4B:14:DE:29', devices:{'F0:2F:4B:14:DE:29':{label:'MacBook Pro', kind:'apple'}}}
+s = T.step(s, p(reclaimed), 2000)
+eq([s.phase, T.text(s.input).body], ['cancelled', 'MacBook Pro took them back'], 'A reclaiming device is named')
+eq(T.text(p({...reclaimed, devices:{}})).body, 'Audio connection cancelled', 'An unknown device is not named')
+eq(T.text(p({...reclaimed, audioOwner:{holder:'remote', playing:false}})).body, 'Audio connection cancelled',
+  'A device that is not playing did not end the attempt')
+console.log('Reclaim naming checks passed')

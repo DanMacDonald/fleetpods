@@ -971,6 +971,9 @@ fn connect_profile(
 
 /// How often a scan believed to be running is confirmed with BlueZ.
 const SCAN_CHECK: Duration = Duration::from_secs(30);
+/// How long a withdrawal waits after the last payload change. BlueZ answers
+/// the refreshes a change starts within milliseconds.
+const UPDATE_SETTLE: Duration = Duration::from_secs(1);
 /// Five attempts per advertisement lifetime, waiting 5/10/20/40 seconds.
 const ADVERTISEMENT_POLICY: Policy = Policy {
     delay: Delay::Staged(&[5_000, 10_000, 20_000, 40_000]),
@@ -990,6 +993,8 @@ struct Air {
     registered: bool,
     /// The payload changed while a registration was unanswered.
     update_after_registration: bool,
+    /// When the payload was last sent to BlueZ as a property change.
+    updated_at: Option<Instant>,
     wanted: bool,
     /// The daemon asked discovery to stay up.
     want_scan: bool,
@@ -1020,6 +1025,7 @@ impl Default for Air {
             current: Vec::new(),
             registered: false,
             update_after_registration: false,
+            updated_at: None,
             wanted: false,
             want_scan: false,
             scanned: false,
@@ -1086,16 +1092,25 @@ impl Air {
 
     /// BlueZ refreshes an advertisement on every property change, and a
     /// refresh replaces the controller request it tracks for that
-    /// advertisement. Changed during registration and then withdrawn, the
-    /// advertisement is freed while the earlier request is still answered,
-    /// and bluetoothd crashes on the reply (bluez 5.88,
-    /// `add_adv_params_callback`; xps, 2026-11-22). BlueZ reads the current
-    /// payload when it registers, so a change waits for the answer.
+    /// advertisement. An advertisement withdrawn while an overtaken request
+    /// is unanswered is freed before that reply, and bluetoothd crashes on
+    /// it (bluez 5.73 to 5.88, `add_adv_params_callback`; xps, 2026-11-22).
+    /// BlueZ reads the current payload when it registers, so a change waits
+    /// for the answer, and a withdrawal waits for changes to settle.
     fn can_update_advertisement(&self, calls: &[PendingCall]) -> bool {
         self.registered
             && !calls.iter().any(|call| {
                 matches!(call.kind, CallKind::Advertise { .. } | CallKind::Unadvertise { .. })
             })
+    }
+
+    fn note_update_sent(&mut self, now: Instant) {
+        self.updated_at = Some(now);
+    }
+
+    /// When the refreshes BlueZ started for the last change have answered.
+    fn updates_settle_at(&self, now: Instant) -> Option<Instant> {
+        self.updated_at.map(|at| at + UPDATE_SETTLE).filter(|until| now < *until)
     }
 
     fn release_advertisement(&mut self) {
@@ -1121,6 +1136,9 @@ impl Air {
         }
         if (!self.wanted || self.pairing_paused(now)) && self.registered {
             self.retire_advertisement();
+        }
+        if self.removal.is_some() && self.updates_settle_at(now).is_some() {
+            return None;
         }
         let at = self.monotonic(now);
         if let Some(removal) = &mut self.removal {
@@ -1175,13 +1193,14 @@ impl Air {
 
     fn advertisement_wake(&self, now: Instant) -> Option<Instant> {
         if let Some(removal) = &self.removal {
-            return match removal.state() {
+            let due = match removal.state() {
                 TaskState::Backoff { until } | TaskState::Deferred { until } => {
-                    Some(self.clock_origin + Duration::from_millis(until.0))
+                    self.clock_origin + Duration::from_millis(until.0)
                 }
-                TaskState::Idle => Some(now),
-                _ => None,
+                TaskState::Idle => now,
+                _ => return None,
             };
+            return Some(self.updates_settle_at(now).map_or(due, |settle| due.max(settle)));
         }
         if !self.wanted {
             return None;
@@ -1417,9 +1436,7 @@ fn handle_job(
         }
         Job::Advertise(bytes) => {
             live.air.request_advertisement(bytes);
-            if live.air.can_update_advertisement(&live.calls) {
-                let _ = emit_service_data(bus, &live.air.current);
-            } else {
+            if !update_advertisement(bus, live) {
                 live.air.update_after_registration = true;
             }
             ensure_scan(bus, live);
@@ -1826,10 +1843,8 @@ fn on_reply(bus: &Bus, reports: &Sender<Input>, live: &mut Live, serial: u32, re
                 }
             };
             live.air.advertisement_reply(id, accepted, Instant::now());
-            if std::mem::take(&mut live.air.update_after_registration)
-                && live.air.can_update_advertisement(&live.calls)
-            {
-                let _ = emit_service_data(bus, &live.air.current);
+            if std::mem::take(&mut live.air.update_after_registration) {
+                update_advertisement(bus, live);
             }
         }
         CallKind::Unadvertise { id } => {
@@ -2555,6 +2570,16 @@ fn register_advertisement(bus: &Bus, live: &mut Live, id: RequestId) {
             live.air.advertisement_reply(id, false, now);
         }
     }
+}
+
+/// Sends the current payload to BlueZ, if a registered advertisement can take a change now.
+fn update_advertisement(bus: &Bus, live: &mut Live) -> bool {
+    if !live.air.can_update_advertisement(&live.calls) {
+        return false;
+    }
+    let _ = emit_service_data(bus, &live.air.current);
+    live.air.note_update_sent(Instant::now());
+    true
 }
 
 fn emit_service_data(bus: &Bus, payload: &[u8]) -> Result<(), String> {
@@ -3390,6 +3415,28 @@ mod advertisement_tests {
         air.advertisement_reply(id, true, now);
         assert!(matches!(
             air.advance_advertisement(now, &[]),
+            Some(AdvertisementAction::Unregister(_))
+        ));
+    }
+
+    #[test]
+    fn withdrawal_waits_for_the_last_payload_change_to_settle() {
+        let mut air = Air::default();
+        let now = air.clock_origin;
+        air.request_advertisement(vec![1]);
+        let id = launch_advertisement(&mut air, now).unwrap();
+        air.advertisement_reply(id, true, now);
+        air.request_advertisement(vec![2]);
+        air.note_update_sent(now);
+        air.release_advertisement();
+        let soon = now + UPDATE_SETTLE / 2;
+        assert!(
+            air.advance_advertisement(soon, &[]).is_none(),
+            "withdrawn beside an unanswered refresh (bluetoothd crash)"
+        );
+        assert_eq!(air.advertisement_wake(soon), Some(now + UPDATE_SETTLE));
+        assert!(matches!(
+            air.advance_advertisement(now + UPDATE_SETTLE, &[]),
             Some(AdvertisementAction::Unregister(_))
         ));
     }
