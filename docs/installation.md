@@ -56,10 +56,18 @@ For calls or recording, choose your AirPods as the input device in the applicati
 
 ## Upgrade
 
-From the checkout, run:
+From a checkout that follows `master`, run:
 
 ```sh
 git pull --ff-only
+./setup
+```
+
+A checkout of a release tag, such as one cloned with `--branch v0.2.0`, has no branch to pull. Check out the newer tag instead:
+
+```sh
+git fetch --tags
+git checkout v0.2.0
 ./setup
 ```
 

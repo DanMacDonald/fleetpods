@@ -121,9 +121,9 @@ an accessory switch clears the record; explicit Connect and Play never read it.
 Fleet advertisement intent belongs to the Linux radio worker. Pairing temporarily
 blocks registration without clearing that intent, including a first request
 received during pairing. While a registration is unanswered the worker neither
-changes the payload nor withdraws the advertisement: BlueZ 5.73 to 5.88 crash
-when an advertisement is freed while a refresh it started is unanswered. A
-change made meanwhile is sent once the registration succeeds; withdrawal waits
+changes the payload nor withdraws the advertisement, so only one advertisement
+operation is in flight. A change made meanwhile is sent once the registration
+succeeds; withdrawal waits
 for the reply or the call's timeout, and for one second after the last payload
 change. One reconciler registers or retires the BlueZ object.
 Its `retry::Task` allows five registration attempts, with 5/10/20/40-second waits;

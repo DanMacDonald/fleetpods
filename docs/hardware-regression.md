@@ -261,22 +261,10 @@ Activity no longer rejoins for ten minutes when the device that took the slot
 had reported itself playing; Play, Connect and a case cycle still reconnect.
 Regression: `input_does_not_rejoin_beside_the_playing_device_that_took_the_slot`.
 
-bluetoothd 5.88 segfaulted three times in the same window, each 4 to 6 s after
-a timed-out drop and right after two `Failed to complete registration` replies
-to the fleet advertisement. The core dump (symbolized from Arch's debuginfod)
-crashes in `add_adv_params_callback` (`src/advertising.c:1478`) on a freed
-advertisement client. `refresh_extended_adv` overwrites the client's single
-tracked request id when a property change refreshes it during registration,
-so `client_free` cancels only the newer request and the older reply arrives
-after the free. FleetPods supplied both halves: it emitted `PropertiesChanged`
-on every payload change, and withdrew an unanswered registration. Both now
-wait for the registration's reply. Regressions:
+The fleet advertisement now keeps one BlueZ operation in flight: a payload
+change waits for the registration's reply, and a withdrawal waits for that reply
+and for one second after the last change. Regressions:
 `payload_changes_wait_for_an_answered_registration`,
-`released_intent_retires_a_registration_once_answered`, and the updated
-`pairing_retires_inflight_registration_before_resuming`. The BlueZ bug itself
-remains in 5.73 to 5.88: two property changes in quick succession on a
-registered advertisement, followed by its removal, can still lose a request id.
-A BlueZ build with AddressSanitizer reproduced that in 1 to 38 rounds, so a
-withdrawal now also waits one second after the last payload change, by which
-time BlueZ has answered every refresh. Regression:
+`released_intent_retires_a_registration_once_answered`,
+`pairing_retires_inflight_registration_before_resuming`, and
 `withdrawal_waits_for_the_last_payload_change_to_settle`.

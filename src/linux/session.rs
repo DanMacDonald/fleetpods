@@ -1090,13 +1090,10 @@ impl Air {
         self.wanted = true;
     }
 
-    /// BlueZ refreshes an advertisement on every property change, and a
-    /// refresh replaces the controller request it tracks for that
-    /// advertisement. An advertisement withdrawn while an overtaken request
-    /// is unanswered is freed before that reply, and bluetoothd crashes on
-    /// it (bluez 5.73 to 5.88, `add_adv_params_callback`; xps, 2026-11-22).
-    /// BlueZ reads the current payload when it registers, so a change waits
-    /// for the answer, and a withdrawal waits for changes to settle.
+    /// BlueZ starts a controller refresh for every property change. The
+    /// worker keeps one advertisement operation in flight: BlueZ reads the
+    /// current payload when it registers, so a change waits for the answer,
+    /// and a withdrawal waits for changes to settle.
     fn can_update_advertisement(&self, calls: &[PendingCall]) -> bool {
         self.registered
             && !calls.iter().any(|call| {
@@ -1128,9 +1125,9 @@ impl Air {
         if calls.iter().any(|call| matches!(call.kind, CallKind::Unadvertise { .. })) {
             return None;
         }
-        // Withdrawing an unanswered registration is the other half of the
-        // bluetoothd crash above. Its reply retires it if it is no longer
-        // wanted; an unanswered call is retired when it times out.
+        // Nor is an unanswered registration withdrawn. Its reply retires it
+        // if it is no longer wanted; an unanswered call is retired when it
+        // times out.
         if calls.iter().any(|call| matches!(call.kind, CallKind::Advertise { .. })) {
             return None;
         }
@@ -3432,7 +3429,7 @@ mod advertisement_tests {
         let soon = now + UPDATE_SETTLE / 2;
         assert!(
             air.advance_advertisement(soon, &[]).is_none(),
-            "withdrawn beside an unanswered refresh (bluetoothd crash)"
+            "withdrawn beside an unanswered refresh"
         );
         assert_eq!(air.advertisement_wake(soon), Some(now + UPDATE_SETTLE));
         assert!(matches!(
@@ -3452,7 +3449,7 @@ mod advertisement_tests {
         air.pairing_until = Some(now + Duration::from_secs(5));
         assert!(
             air.advance_advertisement(now, &calls).is_none(),
-            "an unanswered registration is not withdrawn (bluetoothd crash)"
+            "an unanswered registration is not withdrawn"
         );
         air.advertisement_reply(id, true, now);
         calls.clear();
