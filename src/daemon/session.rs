@@ -43,7 +43,10 @@ pub(super) struct Session {
     claim: PlaybackClaim,
     /// A manual output choice overrides automatic playback claims until the
     /// user selects the pods again or explicitly requests a connection/takeover.
-    manual_output: bool,
+    pub(super) manual_output: bool,
+    /// Taking the pods off moved the output to the speakers; putting them
+    /// back on takes it back even with nothing playing.
+    pub(super) moved_off_ear: bool,
     /// When this laptop last sent a claim on the control link.
     claim_sent_at: Option<MonoMs>,
     /// A remote report arrived just after a claim or during setup settle;
@@ -326,6 +329,7 @@ impl Daemon {
         self.claim_idle_on_activity(now);
         self.tick_ears(now.mono);
         self.follow_insertion(now);
+        self.follow_removal(now);
         self.route_owned_playback(false, now);
         self.pause_unworn_play(now);
         // Fleet admission expiry can change connection intent. Collect it
@@ -1162,7 +1166,11 @@ impl Daemon {
             Release::AwaitAvailability => return, // Keep local intent for the deferred claim.
             _ => self.seat.step_back(now),
         };
-        let players = self.audio.yield_playback();
+        let players = if matches!(how, Release::Speakers) {
+            self.audio.step_aside()
+        } else {
+            self.audio.yield_playback()
+        };
         if pause && !players.is_empty() {
             self.session.yield_paused.clone_from(&players);
             self.effects.pause_players = players;
@@ -1217,9 +1225,9 @@ impl Daemon {
         }
     }
 
-    /// Removal pauses without rerouting. A subsequent play while the pods
-    /// are docked or a headset is off-head belongs on the speakers; re-wearing
-    /// can take them back through the existing insertion/deferred claim path.
+    /// A play while the pods are docked or a headset is off-head belongs on
+    /// the speakers, as does audio that kept playing through a removal.
+    /// Re-wearing takes them back through the insertion/deferred claim path.
     fn return_to_speakers(&mut self, now: Clock) {
         eprintln!(
             "fleetpodsd: {} cannot take playback (wear={:?}); playing on the speakers",
@@ -1227,6 +1235,26 @@ impl Daemon {
             self.accessory.wearing()
         );
         self.release_playback(Release::Speakers, now);
+    }
+
+    /// The output follows wear. Once a full removal has settled, playback
+    /// moves to the speakers and keeps going: what one bud out paused resumes
+    /// there, and what the user paused stays paused. Putting the pods back on
+    /// brings the output back (`follow_insertion`).
+    pub(crate) fn follow_removal(&mut self, now: Clock) {
+        const REMOVAL_SETTLE_MS: u64 = 1_000;
+        let settled = matches!(self.worn, Some((false, since))
+            if now.mono.saturating_since(since) >= REMOVAL_SETTLE_MS);
+        if !settled || !self.accessory.playback_blocked() || !self.output.wants_output() {
+            return;
+        }
+        self.session.moved_off_ear = true;
+        self.return_to_speakers(now);
+        let players = self.audio.release_ear_pause();
+        if !players.is_empty() {
+            eprintln!("fleetpodsd: resuming {players:?} on the speakers");
+            self.effects.resume_players.extend(players);
+        }
     }
 
     pub(crate) fn claim_playback(&mut self, now: Clock) {
@@ -2298,6 +2326,13 @@ impl Daemon {
             self.session.resumed_players.clone_from(&players);
             effects.push(Effect::ResumePlayers(players));
         }
+        // After the retirement above: a resume on the speakers does not wait
+        // for the pods' output, and must still read as ours when it plays.
+        let players = std::mem::take(&mut self.effects.resume_players);
+        if !players.is_empty() {
+            self.session.resumed_players.clone_from(&players);
+            effects.push(Effect::ResumePlayers(players));
+        }
     }
 }
 #[cfg(test)]
@@ -2463,6 +2498,58 @@ mod tests {
             assert!(!daemon.session.manual_output);
             assert!(daemon.output.wants_output());
         }
+    }
+
+    #[test]
+    fn putting_the_pods_back_on_overrides_a_manual_speaker_choice() {
+        use crate::step::Input;
+        // XPS, 2026-11-24 09:53: the pods went back on after a manual switch
+        // to the speakers, and the output stayed on the speakers.
+        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
+        let (mut daemon, mut graph) = manual_output_fixture();
+        let now = clock();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::Accessory { generation, packet: ears(0, 0) }, now);
+        graph.default_sink = "speakers".into();
+        daemon.step(Input::Audio(graph.clone()), at(100));
+        graph.streams[0].sink = "speakers".into();
+        daemon.step(Input::Audio(graph.clone()), at(150));
+        assert!(daemon.session.manual_output);
+        // Nothing is left playing on the speakers.
+        daemon.step(Input::Player { service: "brave".into(), playing: Some(false) }, at(200));
+        graph.streams[0].corked = true;
+        daemon.step(Input::Audio(graph.clone()), at(300));
+
+        daemon.step(Input::Accessory { generation, packet: ears(1, 1) }, at(1_000));
+        daemon.step(Input::Tick, at(2_000));
+        assert!(daemon.session.manual_output, "taking them off alone keeps the choice");
+        assert!(!daemon.output.wants_output());
+        daemon.step(Input::Accessory { generation, packet: ears(0, 0) }, at(3_000));
+        let worn = daemon.step(Input::Tick, at(3_500));
+        assert!(!daemon.session.manual_output);
+        assert!(daemon.output.wants_output(), "{:?}", worn.effects);
+    }
+
+    #[test]
+    fn a_manual_choice_made_while_wearing_the_pods_survives_until_they_come_off() {
+        use crate::step::Input;
+        // Wearing the pods without a removal is not a new decision.
+        let ears = |left: u8, right: u8| vec![0x04, 0x00, 0x04, 0x00, 0x06, 0x00, left, right];
+        let (mut daemon, mut graph) = manual_output_fixture();
+        let now = clock();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let generation = daemon.connection().generation();
+        daemon.step(Input::Accessory { generation, packet: ears(0, 0) }, now);
+        graph.default_sink = "speakers".into();
+        daemon.step(Input::Audio(graph.clone()), at(100));
+        assert!(daemon.session.manual_output);
+        // One bud out and back in is not taking the pods off.
+        daemon.step(Input::Accessory { generation, packet: ears(1, 0) }, at(1_000));
+        daemon.step(Input::Accessory { generation, packet: ears(0, 0) }, at(3_000));
+        daemon.step(Input::Tick, at(3_500));
+        assert!(daemon.session.manual_output);
+        assert!(!daemon.output.wants_output());
     }
 
     #[test]

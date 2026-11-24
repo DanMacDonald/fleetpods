@@ -15,9 +15,10 @@ requires recent positive evidence before acquiring a disconnected accessory.
 | --- | --- | --- |
 | Decode placement | `pods::setup`, `pods::air`, `step::apply_observation` | AACP headset wear preserves both cup readings; verified Max 2 BLE wear remains an aggregate fallback. No invented bud or case readings. |
 | Choose authoritative wear | `Accessory` | Control wear outranks BLE until link loss or accessory switch; BLE expires independently. |
-| Removal pauses playback | `Audio::ears` / `settle` | Same player ownership and resume list; headset removal settles after 100 ms, buds after 400 ms. |
+| Partial removal pauses playback | `Audio::ears` / `settle` | One bud out or one cup up, with `PauseOne`. Same player ownership and resume list; headset removal settles after 100 ms, buds after 400 ms. A full removal never pauses. |
 | Re-wear resumes our pause | `Audio::settle` | Shared resume policy; no resume of a player we did not pause. |
-| Insertion while speakers play | `Daemon::note_wearing`, `follow_insertion` | Shared aggregate wear transition and takeover gates; removal clears pending insertion. |
+| Full removal plays on the speakers | `follow_removal`, `Release::Speakers` | A full removal (no bud worn, both docked, or the Max fully off) that has settled for 1 s moves the output to the speakers, whatever is playing. Players a partial removal paused resume there (`Audio::release_ear_pause`); players the user paused stay paused. |
+| Insertion while speakers play | `Daemon::note_wearing`, `follow_insertion` | Shared aggregate wear transition and takeover gates; removal clears pending insertion. An insertion also clears a manual output choice, and after either that or an off-ear move it takes the output back with nothing playing. |
 | Manual Play while removed | `claim_playback`, `route_owned_playback` | Fixed: both player events and new/uncorked audio streams return to speakers even with a ready Bluetooth link. |
 | Deferred Play / snapshot restoration | Session | Shared playback block prevents reclaim while removed; worn evidence enables the existing acquisition path. |
 | Pods button while removed | `note_unworn_play`, `pause_unworn_play` | A player that starts while the linked accessory reports it is not worn and the desk is idle was toggled by the crown or stem. It is paused unless desk input arrives within 800 ms. Unknown wear, or no idle report from the shell, never pauses. |
@@ -56,7 +57,8 @@ removal and checks both watchdog and explicit repair behavior.
   remains unchanged. Compatibility tests are synthetic, not older-model captures.
 - Explicit connection/priority commands and pending recovery/rejoin lifetimes
   are not converted into physical disconnections on removal. These paths are
-  shared with buds; removal itself still pauses rather than changing outputs.
+  shared with buds. A full removal moves the output to the speakers; it does not
+  disconnect.
 
 ## Remaining parity gaps
 

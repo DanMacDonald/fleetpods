@@ -59,9 +59,10 @@ An established AirPods route yields to an external default-output change while
 both outputs remain present. Session records this manual output preference and
 uses the existing non-pausing release to retire routing, recovery and queued
 player work; the output picker owns its stream moves. Player starts, new streams,
-wear and desktop activity cannot automatically reclaim playback. Selecting the
-AirPods output again, or an explicit FleetPods connection/takeover, clears the
-preference. It survives audio-server reconnection within the daemon session.
+continued wear and desktop activity cannot automatically reclaim playback.
+Selecting the AirPods output again, an explicit FleetPods connection/takeover, or
+putting the AirPods back on after taking them off clears the preference; the
+last one also takes the output back even with nothing playing. It survives audio-server reconnection within the daemon session.
 Initial acquisition, disappearing outputs and the router's own recovery parking
 are not interpreted as manual choices.
 
