@@ -331,6 +331,9 @@ Panel {
         // The bar fits every icon's measured ink to the same size, so the buds, wide and short, read
         // small beside the others. The bar measures the box below, `grow` times smaller than the art.
         readonly property real grow: 1.1
+        // Centred on its ink, a wide, short glyph (the case, the buds) still reads high: its base sits above
+        // the taller icons' bases. Drop it by a quarter of the height it lacks; a tall glyph like the Max stays put.
+        readonly property real drop: Math.max(0, barPods.inkBox.width - barPods.inkBox.height) / 4
         AirPodsIcon {
           id: barPods
           anchors.centerIn: parent
@@ -359,7 +362,8 @@ Panel {
           width: barPods.inkBox.width / parent.grow
           height: barPods.inkBox.height / parent.grow
           x: barPods.x + barPods.inkBox.x + (barPods.inkBox.width - width) / 2
-          y: barPods.y + barPods.inkBox.y + (barPods.inkBox.height - height) / 2
+          // The bar centres this box, so raising it lowers the drawing.
+          y: barPods.y + barPods.inkBox.y + (barPods.inkBox.height - height) / 2 - parent.drop
         }
       }
     }
