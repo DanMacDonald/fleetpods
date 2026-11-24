@@ -3752,6 +3752,14 @@ impl Daemon {
         }
     }
 
+    /// The pods name a media source when it starts and never report that it
+    /// stopped. Without a desktop player to ask, this laptop's idle media
+    /// transport says a chime or clip has ended. Calls do not use it.
+    fn media_ended_here(&self) -> bool {
+        !self.transport_active
+            && self.accessory.source.known().is_some_and(|source| source.kind == 2)
+    }
+
     fn resolved(&self, now: Clock) -> Resolved {
         let fleet = self.config.accessory.and_then(|address| self.peers.fresh(now, address));
         self.seat.resolve(
@@ -3763,7 +3771,10 @@ impl Daemon {
                 local_address: self.local_address,
                 local_playing: self.audio.local_playing(),
                 routed_here: self.audio.routed(),
-                observed_local: self.audio.observed_playback(),
+                observed_local: self
+                    .audio
+                    .observed_playback()
+                    .or(self.media_ended_here().then_some(false)),
                 playback_blocked: self.accessory.playback_blocked(),
             },
             &|peer| self.remote_playback(peer, now).map(|(observed, _)| observed),
@@ -4158,6 +4169,25 @@ mod tests {
                 .iter()
                 .any(|entry| entry["headset"]["worn"] == true));
         }
+    }
+
+    #[test]
+    fn a_chime_stops_counting_as_playback_once_this_laptops_transport_idles() {
+        use crate::pods::observe::Observation;
+        use crate::step::Input;
+        let mut daemon = Daemon::new("xps");
+        let now = clock();
+        let at = |ms| Clock::new(now.mono.0 + ms, now.unix.0 + ms);
+        let source =
+            |kind| Input::Observation(Observation::Source { local: true, kind, remote: None });
+        daemon.step(Input::Transport { active: true }, now);
+        daemon.step(source(2), now);
+        assert_eq!(daemon.resolved(now).holder, Holder::Local { playing: true });
+        daemon.step(Input::Transport { active: false }, at(6_000));
+        assert_eq!(daemon.resolved(at(6_000)).holder, Holder::Local { playing: false });
+        // A call keeps its source without the media transport.
+        daemon.step(source(1), at(7_000));
+        assert_eq!(daemon.resolved(at(7_000)).holder, Holder::Local { playing: true });
     }
 
     #[test]
@@ -9813,6 +9843,7 @@ mod tests {
             daemon.note_pod(true, worn, now.mono);
             daemon.note_lid(true, now.mono);
             daemon.note_ownership(local, now.mono);
+            daemon.transport_active = local;
             daemon.note_source(local, 2, now.mono);
             daemon.note_remote(addr(4), now.mono);
             let holder = if local { "local" } else { "remote" };
@@ -10724,6 +10755,7 @@ mod tests {
         daemon.note_socket(true, generation, now.mono);
         assert!(reach_stage(&mut daemon.connection, Stage::Notifications, generation, now.mono));
         assert!(daemon.connection.mark_ready(generation));
+        daemon.transport_active = true;
         daemon.note_source(true, 2, now.mono);
         daemon.note_remote(phone, now.mono);
 
