@@ -1,12 +1,10 @@
-<p align="center"><img src="docs/images/fleetpods-logo.svg" alt="FleetPods logo" width="128"></p>
-
 # FleetPods <sup>beta v0.2.0</sup>
 
 **Your AirPods, on every computer you own.**
 
 ![FleetPods showing iPhone audio playback and an Omarchy machine connected to the AirPods](docs/images/fleetpods-connections.png)
 
-**FleetPods is in beta.** AirPods Pro 3 is the current tested hardware. Broader hardware support, magic pairing, and complete fleet roster management are the goals for version 1.0.
+**FleetPods is in beta.** It is tested with AirPods Pro 3 and AirPods Max 2, and also works with AirPods Pro 2. Fleet roster management, the rest of the AirPods catalog, and a cleaner animation core are the goals for version 1.0.
 
 ## The Problem
 
@@ -29,40 +27,73 @@ The Omarchy plugin shows the state of play: which devices currently hold the two
 > [!NOTE]
 > **Known issue on macOS:** macOS does not report media pauses to the AirPods right away. After you pause on a Mac, the plugin may keep showing the Mac as playing for 5–10 seconds before the pause clears. Pauses on an iPhone clear almost immediately. FleetPods displays the state as soon as the AirPods report it; the delay is in macOS's reporting, not in the plugin.
 
+## Supported AirPods
+
+![FleetPods showing AirPods Max 2 connected to an iPhone and an Omarchy machine](docs/images/fleetpods-airpods-max.png)
+
+FleetPods keeps track of every pair of AirPods you have paired and follows the one you are using. Putting a pair on, or pressing play on it, makes it the active pair. Each pair keeps its own listening settings.
+
+| AirPods | Status | Panel artwork |
+| --- | --- | --- |
+| AirPods Pro 3 | Tested: switching, battery, listening controls, high-resolution microphone | Dot-mesh earbuds and case |
+| AirPods Max 2 | Tested: switching, wear detection on each cup, high-resolution microphone | Dot-mesh headset |
+| AirPods Pro 2 | Works, with less testing; high-resolution microphone checked on the Lightning model | Dot-mesh earbuds and case |
+| Other AirPods | Not yet validated; discovery and some controls may work | Outline icon |
+
+See [support and known limitations](docs/support.md) for the details of what was tested.
+
+## Features
+
+- **Automatic AirPods switching:** Press play on any machine in your fleet and the AirPods move there. The machine giving them up mutes and pauses first, so nothing plays through the wrong speakers.
+- **Activity takes an idle seat:** When two fleet machines are connected and nothing is playing, using one makes it the audio owner without dropping either connection.
+- **Works alongside Apple devices:** FleetPods does not pull the AirPods away from an iPhone or Mac that is playing, and if one takes them back while this machine connects, the notification names it. **Reconnect** on the Apple seat briefly releases the Omarchy connections so an Apple device can get back on, then reconnects this machine.
+- **Encrypted fleet protocol:** Machines in your fleet find each other and coordinate over encrypted, authenticated Bluetooth Low Energy advertisements. New machines join with a six-digit pairing code.
+- **Multiple pairs of AirPods:** Several pairs are tracked at once, with the pair you are wearing or playing on taking over.
+- **Listening controls:** Noise control (Off, Noise Cancellation, Transparency, Adaptive) with the adaptive level, Conversation Awareness, single-bud noise cancellation, and what happens when you take the AirPods off, as each model supports them.
+- **Ear detection:** Playback pauses when you take a bud out or lift a Max cup, and resumes when you put it back. FleetPods resumes only playback it paused itself.
+- **High-resolution microphone:** The AirPods microphone records at 64 kHz on AirPods Pro 3, Pro 2 (Lightning), and Max 2, while playback stays in stereo.
+- **Live connection view:** See which devices hold each of the AirPods' two connections, which one is playing, nearby fleet machines, and battery for each bud, the case, or the headset.
+- **Notifications:** A notification follows each connection from start to playing, and one shows volume changes made on the AirPods.
+- **Audio recovery:** If playback goes silent while this machine owns the AirPods, FleetPods reopens the audio output automatically; `fleetpods audio reset` does the same on demand.
+
 ## Road to 1.0
 
 Version 1.0 targets:
 
-- **Magic pairing:** Pair the AirPods with one device in the fleet, and every other member can take the connection and hand off audio without pairing again.
-- **Full AirPods hardware support:** Support the full Apple AirPods catalog, including AirPods, AirPods Pro, and AirPods Max, with each model tested on real hardware.
-- **Matching artwork:** Model-specific artwork for every supported AirPods device.
 - **Fleet roster management:** A clear view of fleet membership, with controls for adding and removing devices and leaving a fleet.
+- **Full AirPods hardware support:** Support the full Apple AirPods catalog, including AirPods, AirPods Pro, and AirPods Max, with each model tested on real hardware.
+- **Matching artwork:** Model-specific artwork for standard AirPods, which still show an outline icon.
 - **An explicit animation state machine:** Boil the plugin's accumulated animation rules down to a clear set of seat and connection states, with named actions for the transitions between them, replacing the transition logic that grew rule by rule.
+
+**On hold: magic pairing.** Pairing the AirPods with one fleet machine so that every other member can use them without pairing again would mean installing a plugin into the system Bluetooth service, which needs root. FleetPods installs for your user only, without `sudo`, so this is paused. The investigation is kept on the `fleet-pairing` branch.
 
 Future versions may also include a macOS daemon that brings Apple computers into the FleetPods protocol, so every machine in the fleet can request and yield the AirPods the same way.
 
 FleetPods includes a Rust daemon and an Omarchy plugin. Behavior is specified in [REQUIREMENTS.md](REQUIREMENTS.md).
 
-## Features
-
-- **Automatic AirPods switching:** Move audio between Omarchy machines in your fleet when you press play.
-- **Encrypted fleet protocol:** Omarchy machines that have joined your fleet discover nearby members and coordinate connection and audio routing over Bluetooth.
-- **High-resolution microphone support:** Use the AirPods Pro 3 microphone for calls and recording.
-- **Live connection view:** See the state of your AirPods, which devices occupy each of their two connections, and which device is playing audio.
-
 ## Layout
 
 ```
-src/           the Rust daemon
-  types/       shared words: addresses, clocks, evidence, model data
-  pods/        this machine's AirPods: link, reports, saved preferences
-  fleet/       the other computers: nearby hosts, enrollment, members, routes
-  audio/       this machine's sound: playback, microphone, who is playing
-  panel/       the socket verbs and the status snapshot
-  linux/       signals, paths, BlueZ, and the control socket
-  daemon.rs    the one struct; sends each command to one module
-  bin/         fleetpodsd, fleetpods
-plugin/        the Quickshell panel
+src/             the Rust daemon
+  types/         shared words: addresses, clocks, evidence, model data
+  pods/          this machine's AirPods: link, reports, saved preferences
+  fleet/         the other computers: nearby hosts, enrollment, members, routes
+  audio/         this machine's sound: playback, microphone, who is playing
+  panel/         the socket verbs and the status snapshot
+  linux/         signals, paths, BlueZ, and the control socket
+  daemon.rs      the one struct; sends each command to one module
+  daemon/        the connection session and when to reopen it
+  step.rs        one input, one clock, a list of effects
+  retry.rs       shared retry timing, budgets, and stale-reply rejection
+  handshake.rs   the pairing-code exchange that admits a new member
+  devices.rs     names of the Apple devices the AirPods have connected to
+  bin/           fleetpodsd, fleetpods
+plugin/          the Quickshell panel and its dot-mesh artwork
+wireplumber/     the microphone hooks for WirePlumber 0.5
+packaging/       the systemd user service
+tests/           acceptance scenarios, run with `cargo xtask test`
+tools/artwork/   the artwork pipeline, previews, and logo
+docs/            guides, design notes, and validation reports
 ```
 
 `plugin/` holds the QML and `Model.js`. The Omarchy manifest at this repository root points at `plugin/Panel.qml`. The panel reads the status file and runs `fleetpods`. It does not import the crate. `src/panel/` is the daemon side of that same contract.
@@ -90,7 +121,7 @@ Setup does not need `sudo`. Everything is installed for your user only:
 
 Nothing is written to `/etc` or `/usr`, and there are no udev rules, group changes, or file capabilities. The daemon uses Bluetooth, PipeWire, media players, and the keyring with your session's normal permissions. You need `sudo` only to install a missing build dependency with `pacman`. `./setup --bin-dir DIRECTORY` installs already-built binaries and skips the build and its dependency checks.
 
-See the [installation guide](docs/installation.md) for cloning, first pairing, joining a fleet, and upgrades. AirPods Pro 3 is the current tested hardware; see [support and known limitations](docs/support.md) for compatibility and troubleshooting.
+See the [installation guide](docs/installation.md) for cloning, first pairing, joining a fleet, and upgrades. See [support and known limitations](docs/support.md) for compatibility and troubleshooting.
 
 ## Remove
 

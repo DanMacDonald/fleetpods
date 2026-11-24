@@ -2,7 +2,7 @@
 
 ## Tested hardware
 
-FleetPods 0.2.0 currently targets AirPods Pro 3 on Omarchy.
+FleetPods 0.2.0 currently targets AirPods Pro 3 and AirPods Max 2 on Omarchy.
 
 | Device or platform | Validation |
 | --- | --- |
@@ -11,6 +11,7 @@ FleetPods 0.2.0 currently targets AirPods Pro 3 on Omarchy.
 | LG Gram 17Z990 | Tested on Omarchy 4.0.4, including a fresh install and first pairing |
 | Other Omarchy computers | Not yet hardware-tested; require the dependencies and Bluetooth capabilities in the [installation guide](installation.md) |
 | AirPods Max 2 (A3454) | Head-wear advertisements, control-report removal/re-wear pause/resume, and high-resolution microphone capture tested on XPS; desktop input meter and short voice recording/playback checked; long calls untested |
+| AirPods Pro 2 (A2698) | Tracked beside other pairs and switched between them; high-resolution microphone checked with a test tone ([hardware notes](multi-accessory.md#hardware-notes-2026-11-01)); not yet validated for release |
 | Other AirPods Pro models, standard AirPods, and earlier AirPods Max | Not yet validated for release support; some discovery and controls may work |
 | macOS and iOS | Apple connections can appear in the plugin. These devices do not run the FleetPods daemon or join its fleet |
 
