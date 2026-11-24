@@ -1,4 +1,8 @@
+<p align="center"><img src="docs/images/fleetpods-logo.svg" alt="FleetPods logo" width="128"></p>
+
 # FleetPods <sup>beta v0.2.0</sup>
+
+**Your AirPods, on every computer you own.**
 
 ![FleetPods showing iPhone audio playback and an Omarchy machine connected to the AirPods](docs/images/fleetpods-connections.png)
 

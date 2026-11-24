@@ -6,7 +6,7 @@
   "author": "DMac",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/DanMacDonald/fleetpods",
-  "description": "AirPods switching that works past two devices. FleetPods lets your Omarchy machines request and yield the AirPods' two connections like Apple devices do, shows live seats, playback, and battery in the bar, and supports the high-resolution AirPods microphone for calls and recording. Tested with AirPods Pro 3 and AirPods Max 2; includes a companion user daemon.",
+  "description": "Your AirPods, on every computer you own. FleetPods lets your Omarchy machines request and yield the AirPods' two connections like Apple devices do, shows live seats, playback, and battery in the bar, and supports the high-resolution AirPods microphone for calls and recording. Tested with AirPods Pro 3 and AirPods Max 2; includes a companion user daemon.",
   "kinds": [
     "bar-widget"
   ],
