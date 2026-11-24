@@ -301,7 +301,7 @@ Item {
     commandProcess.running = true
   }
 
-  // Guards the keyboard and the bar's right click too, not just the panel rows.
+  // Guards the bar's right click and the IPC cycle too.
   function setNoiseMode(mode) {
     if (availableModes().indexOf(mode) < 0) return
     _send(Model.noiseModeVerb(mode), "noiseMode", mode)
@@ -318,27 +318,6 @@ Item {
     var at = modes.indexOf(noiseMode)
     // An unknown current mode has no next one, so start at the head instead of past it.
     setNoiseMode(at < 0 ? modes[0] : modes[(at + 1) % modes.length])
-  }
-
-  function setAdaptiveNoiseLevel(level) {
-    var clamped = Math.max(0, Math.min(100, Math.round(level)))
-    _send("adaptive:" + clamped, "adaptiveNoiseLevel", clamped)
-  }
-
-  function setConversationalAwareness(enabled) {
-    _send(enabled ? "ca:on" : "ca:off", "conversationalAwareness", enabled)
-  }
-
-  function setOneBudANC(enabled) {
-    _send(enabled ? "onebud:on" : "onebud:off", "oneBudANC", enabled)
-  }
-
-  function setEarDetectionBehavior(behavior) {
-    _send(Model.earDetectionVerb(behavior), "earDetectionBehavior", behavior)
-  }
-
-  function cycleEarDetection() {
-    setEarDetectionBehavior((earDetectionBehavior + 1) % Model.EAR_BEHAVIOR_COUNT)
   }
 
   // Daemon timestamps are wall-clock ms. Tests use small counters.

@@ -2,7 +2,7 @@
 
 ## Tested hardware
 
-FleetPods 0.1.0 currently targets AirPods Pro 3 on Omarchy.
+FleetPods 0.2.0 currently targets AirPods Pro 3 on Omarchy.
 
 | Device or platform | Validation |
 | --- | --- |

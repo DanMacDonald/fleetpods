@@ -128,7 +128,6 @@ Panel {
   property int cursorIndex: 0
   property bool cursorActive: false
 
-  readonly property bool hideWhenDisconnected: setting("hideWhenDisconnected", true) === true
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color urgent: bar ? bar.urgent : Commons.Color.urgent
   readonly property color dim: Qt.darker(foreground, 1.55)
@@ -138,33 +137,6 @@ Panel {
   readonly property bool guidanceVisible: pods.statusLogState.guidanceVisible === true && !pods.schemaUnsupported
   readonly property bool pairingRequired: pods.statusLogState.pairingRequired === true
 
-  property int phraseIndex: 0
-
-  readonly property int lowBatteryPercent: 20
-  readonly property int adaptiveStepPercent: 5
-  readonly property int phraseIntervalMs: 2800
-
-  // Ten, matching the stock panels.
-  readonly property var activePhrases: [
-    "All gone Pete Tong",
-    "Essential Selection",
-    "Genius Bar stumped",
-    "Warming the decks",
-    "Hands in the air",
-    "Ibiza incoming",
-    "Rinsing the low end",
-    "Big tune loading",
-    "Cued and counting in",
-    "Ecosystem escaped"
-  ]
-  readonly property string heroPhraseText: activePhrases[phraseIndex % activePhrases.length]
-
-  readonly property bool adaptiveVisible: pods.view.hasAirPods && pods.view.supportsAdaptive && pods.noiseMode === Model.NOISE_ADAPTIVE
-  // Three separate capabilities, because a Max 2 has Conversation Awareness and no second bud.
-  readonly property bool modesVisible: pods.view.hasAirPods && modes.length > 0
-  readonly property bool caVisible: pods.view.hasAirPods && pods.view.supportsConversationalAwareness
-  readonly property bool oneBudVisible: pods.view.hasAirPods && pods.view.supportsOneBudANC
-  readonly property string lidLabel: Model.lidText(pods.view.lidState)
   readonly property bool podsInCase: {
     var _ = nearbyTick
     return !Model.budsOut(pods.view.lidState, pods.view.leftPod, pods.view.rightPod, pods.view.lastAdvertisementMs, Date.now(), pods.view.connected, 20000, pods.view.caseBattery)
@@ -203,9 +175,6 @@ Panel {
       pods.view.bleConnectionState, pods.view.lastAdvertisementMs, Date.now(), pods.view.disconnectedMs,
       pods.view.bluezConnected)
   }
-
-  // The daemon decides which modes this device has, so no row is drawn that the hardware ignores.
-  readonly property var modes: pods.availableModes()
 
   // Rebuilt whenever a section appears, so j and k never land on a hidden control.
   property int nearbyTick: 0
@@ -254,10 +223,6 @@ Panel {
     ? ""
     : cursorRows[Math.max(0, Math.min(cursorIndex, cursorRows.length - 1))]
 
-  function rowHasCursor(name) {
-    return cursorActive && cursorRow === name
-  }
-
   function moveCursor(dy) {
     cursorActive = true
     if (cursorRows.length === 0) return
@@ -274,13 +239,6 @@ Panel {
   function activateCursor() {
     if (cursorRow === "apple") seats.activateApple()
     else if (cursorRow === "omarchy") beginOmarchyClaim("keyboard Enter")
-  }
-
-  function focusRow(name) {
-    var at = cursorRows.indexOf(name)
-    if (at < 0) return
-    cursorActive = true
-    cursorIndex = at
   }
 
   visible: true
@@ -772,291 +730,6 @@ Panel {
             }
           }
         }
-      }
-    }
-  }
-
-  component PodRow: Item {
-    id: podRow
-    property string label: ""
-    property var pod: Model.defaultPod()
-    property string meta: ""
-
-    readonly property string metaText: meta !== "" ? meta : Model.podMeta(pod)
-    readonly property bool low: pod.level !== Model.LEVEL_UNKNOWN
-      && pod.level <= root.lowBatteryPercent && !pod.charging
-
-    implicitHeight: podLayout.implicitHeight
-
-    RowLayout {
-      id: podLayout
-      anchors.left: parent.left
-      anchors.right: parent.right
-      spacing: Style.space(8)
-
-      Text {
-        textFormat: Text.PlainText
-        text: podRow.label
-        color: root.foreground
-        opacity: 0.6
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        // Style.space(44) was cut for Left, Right and Case, so a longer label takes the room it needs.
-        Layout.preferredWidth: Math.max(Style.space(44), implicitWidth + Style.space(10))
-      }
-
-      Rectangle {
-        id: meterTrack
-        Layout.fillWidth: true
-        Layout.alignment: Qt.AlignVCenter
-        implicitHeight: Style.space(6)
-        radius: height / 2
-        color: Qt.darker(root.foreground, 3.2)
-
-        Rectangle {
-          width: meterTrack.width * Model.levelFraction(podRow.pod.level)
-          height: parent.height
-          radius: parent.radius
-          color: podRow.low ? root.urgent : root.foreground
-        }
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        text: Model.levelText(podRow.pod.level)
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        horizontalAlignment: Text.AlignRight
-        Layout.preferredWidth: Style.space(38)
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        text: podRow.metaText
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        elide: Text.ElideRight
-        Layout.preferredWidth: Style.space(56)
-      }
-    }
-  }
-
-  component ModeRow: CursorSurface {
-    id: modeRow
-    property int mode: 0
-
-    readonly property string rowName: "mode:" + mode
-    readonly property bool selected: pods.noiseMode === mode
-
-    hasCursor: root.rowHasCursor(rowName)
-    foreground: root.foreground
-    implicitHeight: modeLabel.implicitHeight + Style.spacing.rowPaddingX
-
-    MouseArea {
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onEntered: root.focusRow(modeRow.rowName)
-      onClicked: pods.setNoiseMode(modeRow.mode)
-    }
-
-    RowLayout {
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      spacing: Style.space(8)
-
-      Text {
-        textFormat: Text.PlainText
-        id: modeLabel
-        Layout.fillWidth: true
-        text: Model.noiseModeName(modeRow.mode)
-        color: root.foreground
-        opacity: modeRow.selected ? 1.0 : 0.75
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        elide: Text.ElideRight
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        Layout.alignment: Qt.AlignVCenter
-        text: Model.GLYPH_CHECK
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.icon
-        opacity: modeRow.selected ? 1.0 : 0.0
-      }
-    }
-  }
-
-  component ToggleRow: CursorSurface {
-    id: toggleRow
-    property string rowName: ""
-    property string label: ""
-    property string caption: ""
-    property bool checked: false
-
-    signal toggled()
-
-    hasCursor: root.rowHasCursor(rowName)
-    foreground: root.foreground
-    implicitHeight: toggleContent.implicitHeight + Style.spacing.rowPaddingX
-
-    MouseArea {
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onEntered: root.focusRow(toggleRow.rowName)
-      onClicked: toggleRow.toggled()
-    }
-
-    RowLayout {
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      spacing: Style.space(8)
-
-      ColumnLayout {
-        id: toggleContent
-        Layout.fillWidth: true
-        spacing: Style.space(1)
-
-        Text {
-          textFormat: Text.PlainText
-          Layout.fillWidth: true
-          text: toggleRow.label
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          elide: Text.ElideRight
-        }
-
-        Text {
-          textFormat: Text.PlainText
-          Layout.fillWidth: true
-          text: toggleRow.caption
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
-        }
-      }
-
-      ToggleSwitch {
-        Layout.alignment: Qt.AlignVCenter
-        checked: toggleRow.checked
-        busy: pods.busy
-        hasCursor: toggleRow.hasCursor
-        foreground: root.foreground
-        onToggled: toggleRow.toggled()
-      }
-    }
-  }
-
-  component ValueRow: CursorSurface {
-    id: valueRow
-    property string rowName: ""
-    property string label: ""
-    property string value: ""
-
-    hasCursor: root.rowHasCursor(rowName)
-    foreground: root.foreground
-    implicitHeight: valueLabel.implicitHeight + Style.spacing.rowPaddingX
-
-    MouseArea {
-      anchors.fill: parent
-      hoverEnabled: true
-      cursorShape: Qt.PointingHandCursor
-      onEntered: root.focusRow(valueRow.rowName)
-      onClicked: pods.cycleEarDetection()
-    }
-
-    RowLayout {
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.verticalCenter: parent.verticalCenter
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      spacing: Style.space(8)
-
-      Text {
-        textFormat: Text.PlainText
-        id: valueLabel
-        Layout.fillWidth: true
-        text: valueRow.label
-        color: root.foreground
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        elide: Text.ElideRight
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        text: valueRow.value
-        color: root.dim
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        elide: Text.ElideRight
-      }
-    }
-  }
-
-  component SliderRow: Item {
-    id: sliderRow
-    implicitHeight: sliderColumn.implicitHeight
-
-    Column {
-      id: sliderColumn
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.leftMargin: Style.space(10)
-      anchors.rightMargin: Style.space(10)
-      spacing: Style.space(4)
-
-      Row {
-        width: parent.width
-        spacing: Style.space(8)
-
-        Text {
-          textFormat: Text.PlainText
-          text: "Adaptive noise"
-          color: root.foreground
-          opacity: 0.6
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-        }
-
-        Item {
-          width: Math.max(0, parent.width - parent.children[0].implicitWidth - parent.children[2].implicitWidth - parent.spacing * 2)
-          height: 1
-        }
-
-        Text {
-          textFormat: Text.PlainText
-          text: pods.adaptiveNoiseLevel + "%"
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.bodySmall
-        }
-      }
-
-      PanelSlider {
-        width: parent.width
-        bar: root.bar
-        minimum: 0
-        maximum: 100
-        step: root.adaptiveStepPercent
-        integer: true
-        tickCount: 5
-        value: pods.adaptiveNoiseLevel
-        onReleased: function (v) { pods.setAdaptiveNoiseLevel(v) }
       }
     }
   }
