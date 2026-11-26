@@ -1,6 +1,9 @@
-# FleetPods <sup>beta v0.2.0</sup>
+# FleetPods
 
 **Your AirPods, on every computer you own.**
+
+[![plugins.omarchy.org: listed](https://img.shields.io/badge/plugins.omarchy.org-listed-8957e5)](https://plugins.omarchy.org/plugin.html?id=io.github.danmacdonald.fleetpods)
+[![version](https://img.shields.io/github/v/release/DanMacDonald/fleetpods?include_prereleases&label=version&color=0a7bbb)](https://github.com/DanMacDonald/fleetpods/releases)
 
 ![FleetPods showing iPhone audio playback and an Omarchy machine connected to the AirPods](docs/images/fleetpods-connections.png)
 
